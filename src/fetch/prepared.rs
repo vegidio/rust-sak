@@ -6,39 +6,17 @@ use reqwest::header::HeaderMap;
 /// methods. The embedded [`reqwest::Client`] is a cheap clone of the reused client (it shares the underlying
 /// connection pool).
 pub(super) struct PreparedRequest {
-    client: reqwest::Client,
-    url: reqwest::Url,
-    method: reqwest::Method,
-    query: Vec<(String, String)>,
+    pub(super) client: reqwest::Client,
+    pub(super) url: reqwest::Url,
+    pub(super) method: reqwest::Method,
+    pub(super) query: Vec<(String, String)>,
     /// Per-request headers, applied at the request level so they override the client's default headers per-key.
-    headers: HeaderMap,
-    body: Option<serde_json::Value>,
+    pub(super) headers: HeaderMap,
+    pub(super) body: Option<serde_json::Value>,
     pub(super) retries: u32,
 }
 
 impl PreparedRequest {
-    /// Bundles the reused client with the fully resolved per-request settings.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        client: reqwest::Client,
-        url: reqwest::Url,
-        method: reqwest::Method,
-        query: Vec<(String, String)>,
-        headers: HeaderMap,
-        body: Option<serde_json::Value>,
-        retries: u32,
-    ) -> Self {
-        Self {
-            client,
-            url,
-            method,
-            query,
-            headers,
-            body,
-            retries,
-        }
-    }
-
     /// Assembles the [`reqwest::RequestBuilder`] for one attempt: method, query parameters, per-request header
     /// overrides, and the optional JSON body. Shared by [`Fetch::text`](super::Fetch::text),
     /// [`Fetch::json`](super::Fetch::json), and the download task so the request is built identically everywhere.

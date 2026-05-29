@@ -217,15 +217,15 @@ impl Fetch {
             0
         };
 
-        Ok(PreparedRequest::new(
+        Ok(PreparedRequest {
             client,
-            url.into_url()?,
+            url: url.into_url()?,
             method,
-            options.query,
-            options.headers,
-            options.body,
+            query: options.query,
+            headers: options.headers,
+            body: options.body,
             retries,
-        ))
+        })
     }
 
     /// Sends a request to `url` and returns the response body as a `String`.
