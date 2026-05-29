@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
-use super::{retry, PreparedRequest};
+use super::{PreparedRequest, retry};
 
 /// A snapshot of a download's progress, carried over the [`watch`] channel and returned by [`Download::progress`].
 #[derive(Debug, Clone, Default)]
@@ -74,27 +74,79 @@ impl Download {
         self.rx.changed().await
     }
 
-    /// Awaits completion and returns the download's final result. Consumes the handle.
+    /// Invokes `callback` for every progress update until the download finishes, then returns its final result.
+    /// Consumes the handle.
+    ///
+    /// The callback receives `(total, downloaded, progress)` from each [`Progress`] update — the same fields as
+    /// [`Progress::total`]/[`Progress::downloaded`]/[`Progress::progress`]. It is **not** called for the initial
+    /// zero-valued snapshot (only for updates produced by the transfer) and it **is** called for the final update.
+    ///
+    /// Because this consumes the [`Download`], you cannot [`cancel`](Download::cancel) a handle passed here; for
+    /// cancellable tracking, drive [`changed`](Download::changed)/[`cancel`](Download::cancel)/[`join`](Download::join)
+    /// directly instead.
     ///
     /// # Errors
     ///
-    /// Returns the [`DownloadError`] that ended the download — an HTTP/transport failure or a disk-write failure.
+    /// Returns the [`DownloadError`] that ended the download — an HTTP/transport failure, a disk-write failure, or
+    /// [`DownloadError::Cancelled`] if it was aborted via [`Download::cancel`].
     ///
     /// # Panics
     ///
     /// Panics if the background task panicked.
+    pub async fn track<F>(mut self, mut callback: F) -> Result<(), DownloadError>
+    where
+        F: FnMut(Option<u64>, u64, Option<f64>),
+    {
+        while self.rx.changed().await.is_ok() {
+            let progress = self.rx.borrow_and_update().clone();
+            callback(progress.total, progress.downloaded, progress.progress);
+        }
+        join_handle(self.handle).await
+    }
+
+    /// Cancels the download if it is still running; a no-op if it has already completed or errored.
+    ///
+    /// Aborts the background task. After cancelling, [`join`](Download::join)/[`track`](Download::track) return
+    /// [`DownloadError::Cancelled`]. Aborting mid-transfer leaves the partially written file on disk (no cleanup runs),
+    /// so callers that cancel should remove it themselves.
+    pub fn cancel(&self) {
+        self.handle.abort();
+    }
+
+    /// Awaits completion and returns the download's final result. Consumes the handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`DownloadError`] that ended the download — an HTTP/transport failure, a disk-write failure, or
+    /// [`DownloadError::Cancelled`] if it was aborted via [`Download::cancel`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background task panicked (a bug), as distinct from being cancelled.
     pub async fn join(self) -> Result<(), DownloadError> {
-        self.handle.await.expect("download task panicked")
+        join_handle(self.handle).await
     }
 }
 
-/// An error from a streaming download: either an HTTP/transport failure or a failure writing the file to disk.
+/// Awaits the download task, mapping a cancellation into [`DownloadError::Cancelled`] and re-raising a genuine task
+/// panic. Shared by [`Download::join`] and [`Download::track`].
+async fn join_handle(handle: tokio::task::JoinHandle<Result<(), DownloadError>>) -> Result<(), DownloadError> {
+    match handle.await {
+        Ok(result) => result,
+        Err(err) if err.is_cancelled() => Err(DownloadError::Cancelled),
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
+    }
+}
+
+/// An error from a streaming download: an HTTP/transport failure, a failure writing the file to disk, or cancellation.
 #[derive(Debug)]
 pub enum DownloadError {
     /// The request failed, returned an error status, or the response stream errored.
     Http(reqwest::Error),
     /// Writing the downloaded bytes to the disk failed.
     Io(std::io::Error),
+    /// The download was cancelled via [`Download::cancel`] before it finished.
+    Cancelled,
 }
 
 impl fmt::Display for DownloadError {
@@ -102,6 +154,7 @@ impl fmt::Display for DownloadError {
         match self {
             DownloadError::Http(err) => write!(f, "download request failed: {err}"),
             DownloadError::Io(err) => write!(f, "writing download to disk failed: {err}"),
+            DownloadError::Cancelled => write!(f, "download was cancelled"),
         }
     }
 }
@@ -111,6 +164,7 @@ impl std::error::Error for DownloadError {
         match self {
             DownloadError::Http(err) => Some(err),
             DownloadError::Io(err) => Some(err),
+            DownloadError::Cancelled => None,
         }
     }
 }
@@ -315,6 +369,88 @@ mod tests {
         assert!(matches!(err, DownloadError::Http(_)), "unexpected error: {err}");
         server.await.unwrap();
 
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn track_reports_progress_and_completes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let path = temp_path(addr.port());
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "200 OK", "hello track").await;
+        });
+
+        let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+        let mut ticks: Vec<(Option<u64>, u64, Option<f64>)> = Vec::new();
+        download
+            .track(|total, downloaded, progress| ticks.push((total, downloaded, progress)))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert!(!ticks.is_empty(), "callback was never invoked");
+        // The final update reports the full transfer.
+        assert_eq!(ticks.last().copied(), Some((Some(11), 11, Some(1.0))));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn track_returns_error_on_failed_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let path = temp_path(addr.port());
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, "500 Internal Server Error", "nope").await;
+        });
+
+        let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+        let err = download.track(|_, _, _| {}).await.unwrap_err();
+        assert!(matches!(err, DownloadError::Http(_)), "unexpected error: {err}");
+        server.await.unwrap();
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_and_join_returns_cancelled() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let path = temp_path(addr.port());
+
+        // The server advertises a large body but sends only a few bytes, then holds the connection open — so the
+        // download stays in-flight (it never errors and never completes) until we cancel it.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nhello")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            // Keep the stream alive so the body never finishes; the test aborts this task at the end.
+            std::future::pending::<()>().await;
+        });
+
+        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+        // Wait for the first real progress update so the transfer is genuinely in-flight before cancelling.
+        download.changed().await.unwrap();
+        assert!(!download.completed());
+
+        download.cancel();
+        let err = download.join().await.unwrap_err();
+        assert!(matches!(err, DownloadError::Cancelled), "unexpected error: {err}");
+
+        server.abort();
         let _ = tokio::fs::remove_file(&path).await;
     }
 

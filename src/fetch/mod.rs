@@ -27,24 +27,6 @@ use reqwest::header::HeaderMap;
 
 use prepared::PreparedRequest;
 
-/// Inserts `key`/`value` into `map`, converting both and panicking on invalid input. Shared by the `header` builder
-/// methods on [`Fetch`] and [`RequestOptions`].
-///
-/// # Panics
-///
-/// Panics if `key` is not a valid header name or `value` is not a valid header value.
-fn insert_header<K, V>(map: &mut HeaderMap, key: K, value: V)
-where
-    K: TryInto<reqwest::header::HeaderName>,
-    K::Error: std::fmt::Debug,
-    V: TryInto<reqwest::header::HeaderValue>,
-    V::Error: std::fmt::Debug,
-{
-    let key = key.try_into().expect("invalid header name");
-    let value = value.try_into().expect("invalid header value");
-    map.insert(key, value);
-}
-
 /// A configurable, reusable HTTP fetcher, built with a fluent (consuming) builder API.
 ///
 /// A `Fetch` holds the default configuration (headers, retries, HTTP/2 toggle, read timeout) and a lazily built,
@@ -353,6 +335,24 @@ impl Fetch {
         let handle = tokio::spawn(download::run(prepared, path, tx));
         Download::from_parts(rx, handle)
     }
+}
+
+/// Inserts `key`/`value` into `map`, converting both and panicking on invalid input. Shared by the `header` builder
+/// methods on [`Fetch`] and [`RequestOptions`].
+///
+/// # Panics
+///
+/// Panics if `key` is not a valid header name or `value` is not a valid header value.
+fn insert_header<K, V>(map: &mut HeaderMap, key: K, value: V)
+where
+    K: TryInto<reqwest::header::HeaderName>,
+    K::Error: std::fmt::Debug,
+    V: TryInto<reqwest::header::HeaderValue>,
+    V::Error: std::fmt::Debug,
+{
+    let key = key.try_into().expect("invalid header name");
+    let value = value.try_into().expect("invalid header value");
+    map.insert(key, value);
 }
 
 /// `true` for HTTP methods that are idempotent per RFC 9110 (so safe to retry automatically): `GET`, `HEAD`, `PUT`,
