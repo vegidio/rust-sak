@@ -4,9 +4,9 @@
 //! families:
 //!
 //! - **SHA-256** — [`sha256_bytes`] (byte slice), [`sha256_string`] (string data), [`sha256_file`] (streams a file's
-//! contents through the hasher, chunked, so it never loads the whole file).
+//!   contents through the hasher, chunked, so it never loads the whole file).
 //! - **XXH3 (64-bit)** — [`xxh3_bytes`], [`xxh3_string`], [`xxh3_file`]: the same trio backed by the fast,
-//! non-cryptographic XXH3 algorithm.
+//!   non-cryptographic XXH3 algorithm.
 //!
 //! ```
 //! use rust_sak::crypto::{sha256_string, xxh3_bytes, xxh3_string};
@@ -19,6 +19,7 @@
 //! assert_eq!(xxh3_bytes(b"abc"), xxh3_string("abc"));
 //! ```
 
+mod chunked_read;
 mod sha256_bytes;
 mod sha256_file;
 mod sha256_string;

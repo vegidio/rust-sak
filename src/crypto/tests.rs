@@ -1,4 +1,6 @@
 use std::fs;
+use std::io;
+use std::path::Path;
 use std::process;
 
 use super::*;
@@ -8,6 +10,16 @@ const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff
 
 const EMPTY_XXH3: &str = "2d06800538d394c2";
 const ABC_XXH3: &str = "78af5f94892f3950";
+
+/// Writes `content` to a uniquely-named temp file, hashes it with `hash`, removes the file, and
+/// returns the resulting digest.
+fn hash_temp_file(tag: &str, content: &[u8], hash: impl Fn(&Path) -> io::Result<String>) -> String {
+    let path = std::env::temp_dir().join(format!("rust_sak_crypto_{}_{}.bin", tag, process::id()));
+    fs::write(&path, content).unwrap();
+    let result = hash(&path);
+    fs::remove_file(&path).unwrap();
+    result.unwrap()
+}
 
 #[test]
 fn sha256_bytes_matches_known_vectors() {
@@ -30,13 +42,10 @@ fn sha256_string_agrees_with_bytes() {
 #[test]
 fn sha256_file_hashes_contents() {
     let content = b"the quick brown fox";
-    let path = std::env::temp_dir().join(format!("rust_sak_crypto_{}.bin", process::id()));
-    fs::write(&path, content).unwrap();
-
-    let result = sha256_file(&path);
-    fs::remove_file(&path).unwrap();
-
-    assert_eq!(result.unwrap(), sha256_bytes(content));
+    assert_eq!(
+        hash_temp_file("sha256", content, |p| sha256_file(p)),
+        sha256_bytes(content)
+    );
 }
 
 #[test]
@@ -66,13 +75,7 @@ fn xxh3_string_agrees_with_bytes() {
 #[test]
 fn xxh3_file_hashes_contents() {
     let content = b"the quick brown fox";
-    let path = std::env::temp_dir().join(format!("rust_sak_crypto_xxh3_{}.bin", process::id()));
-    fs::write(&path, content).unwrap();
-
-    let result = xxh3_file(&path);
-    fs::remove_file(&path).unwrap();
-
-    assert_eq!(result.unwrap(), xxh3_bytes(content));
+    assert_eq!(hash_temp_file("xxh3", content, |p| xxh3_file(p)), xxh3_bytes(content));
 }
 
 #[test]
