@@ -340,7 +340,7 @@ async fn stream_to_file(
         }
         let resuming = partial;
 
-        // Open the file only after a good response so a failed attempt never leaves a stray empty file (which would
+        // Open the file only after a good response, so a failed attempt never leaves a stray empty file (which would
         // corrupt the next attempt's offset).
         let (mut file, mut downloaded, total) = if resuming {
             // A `206` `Content-Length` reports the remaining bytes, so the total is `offset + remaining`.
