@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use futures_util::StreamExt;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -75,15 +76,17 @@ impl Download {
     }
 
     /// Invokes `callback` for every progress update until the download finishes, then returns its final result.
-    /// Consumes the handle.
+    /// Borrows the handle, so the [`Download`] remains usable afterward — e.g. to read the final
+    /// [`progress`](Download::progress) snapshot.
     ///
     /// The callback receives `(total, downloaded, progress)` from each [`Progress`] update — the same fields as
     /// [`Progress::total`]/[`Progress::downloaded`]/[`Progress::progress`]. It is **not** called for the initial
     /// zero-valued snapshot (only for updates produced by the transfer) and it **is** called for the final update.
     ///
-    /// Because this consumes the [`Download`], you cannot [`cancel`](Download::cancel) a handle passed here; for
-    /// cancellable tracking, drive [`changed`](Download::changed)/[`cancel`](Download::cancel)/[`join`](Download::join)
-    /// directly instead.
+    /// The background task is awaited exactly once; this method returns its final result, so do **not** call
+    /// [`join`](Download::join) afterward (it would re-await a finished task and panic). Reading
+    /// [`progress`](Download::progress)/[`completed`](Download::completed)/[`failed`](Download::failed) afterward is
+    /// fine.
     ///
     /// # Errors
     ///
@@ -93,7 +96,7 @@ impl Download {
     /// # Panics
     ///
     /// Panics if the background task panicked.
-    pub async fn track<F>(mut self, mut callback: F) -> Result<(), DownloadError>
+    pub async fn track<F>(&mut self, mut callback: F) -> Result<(), DownloadError>
     where
         F: FnMut(Option<u64>, u64, Option<f64>),
     {
@@ -101,7 +104,7 @@ impl Download {
             let progress = self.rx.borrow_and_update().clone();
             callback(progress.total, progress.downloaded, progress.progress);
         }
-        join_handle(self.handle).await
+        join_handle(&mut self.handle).await
     }
 
     /// Cancels the download if it is still running; a no-op if it has already completed or errored.
@@ -123,15 +126,18 @@ impl Download {
     /// # Panics
     ///
     /// Panics if the background task panicked (a bug), as distinct from being cancelled.
-    pub async fn join(self) -> Result<(), DownloadError> {
-        join_handle(self.handle).await
+    pub async fn join(mut self) -> Result<(), DownloadError> {
+        join_handle(&mut self.handle).await
     }
 }
 
 /// Awaits the download task, mapping a cancellation into [`DownloadError::Cancelled`] and re-raising a genuine task
-/// panic. Shared by [`Download::join`] and [`Download::track`].
-async fn join_handle(handle: tokio::task::JoinHandle<Result<(), DownloadError>>) -> Result<(), DownloadError> {
-    match handle.await {
+/// panic. Shared by [`Download::join`] and [`Download::track`]. Drives the handle through a mutable borrow (a
+/// [`JoinHandle`](tokio::task::JoinHandle) is [`Unpin`]) so `track` can keep the [`Download`] usable afterward.
+async fn join_handle(
+    handle: &mut tokio::task::JoinHandle<Result<(), DownloadError>>,
+) -> Result<(), DownloadError> {
+    match Pin::new(handle).await {
         Ok(result) => result,
         Err(err) if err.is_cancelled() => Err(DownloadError::Cancelled),
         Err(err) => std::panic::resume_unwind(err.into_panic()),
@@ -384,7 +390,7 @@ mod tests {
             write_response(&mut stream, "200 OK", "hello track").await;
         });
 
-        let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
         let mut ticks: Vec<(Option<u64>, u64, Option<f64>)> = Vec::new();
         download
             .track(|total, downloaded, progress| ticks.push((total, downloaded, progress)))
@@ -411,7 +417,7 @@ mod tests {
             write_response(&mut stream, "500 Internal Server Error", "nope").await;
         });
 
-        let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+        let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
         let err = download.track(|_, _, _| {}).await.unwrap_err();
         assert!(matches!(err, DownloadError::Http(_)), "unexpected error: {err}");
         server.await.unwrap();
