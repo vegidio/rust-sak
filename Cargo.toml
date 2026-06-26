@@ -4,14 +4,18 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
+avif = { package = "avif-rs", version = "26.6", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
+heif = { package = "heif-rs", version = "26.6", optional = true }
 hex = { version = "0.4.3", optional = true }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff"], optional = true }
 reqwest = { version = "0.13.4", features = ["query", "json", "stream"], optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.150", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 tokio = { version = "1.52.3", features = ["time", "rt-multi-thread", "macros", "fs", "io-util", "sync"], optional = true }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64", "alloc"], optional = true }
+webp = { package = "webp-rs", version = "26.6", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util", "net", "io-util"] }
@@ -20,6 +24,7 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util", "
 default = []
 crypto = ["dep:sha2", "dep:hex", "dep:twox-hash"]
 fetch = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:futures-util"]
+image = ["dep:image", "dep:webp", "dep:avif", "dep:heif"]
 
 [[bin]]
 name = "playground"
