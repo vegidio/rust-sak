@@ -21,8 +21,9 @@ image = { version = "0.25", default-features = false }
 ```rust
 use rust_sak::image::{
     decode_file, decode_bytes, decode_bytes_with_format, format_from_bytes,
+    probe_file, probe_bytes,
     encode_file, encode_writer,
-    ImageFormat, EncodeOptions, PngCompression, PngFilter, Preset, Chroma,
+    ImageFormat, ImageInfo, EncodeOptions, PngCompression, PngFilter, Preset, Chroma,
     ImageError, Result,
 };
 ```
@@ -41,11 +42,13 @@ All are synchronous and return `Result<T, ImageError>`.
 | `decode_bytes`             | `fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage>`                                  | Decodes in-memory bytes; format guessed from the **magic bytes**. `UnrecognizedFormat` if no signature matches. |
 | `decode_bytes_with_format` | `fn decode_bytes_with_format(bytes: &[u8], format: ImageFormat) -> Result<DynamicImage>` | Decodes in-memory bytes with an **explicit** format (no guessing).                                              |
 
-### Detecting (no decode)
+### Detecting & probing (no decode)
 
-| Function            | Signature                                                   | What it does                                                                                      |
-|---------------------|-------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
-| `format_from_bytes` | `fn format_from_bytes(bytes: &[u8]) -> Result<ImageFormat>` | Sniffs the format from magic bytes **without decoding pixels**. `UnrecognizedFormat` if no match. |
+| Function            | Signature                                                    | What it does                                                                                                              |
+|---------------------|--------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `format_from_bytes` | `fn format_from_bytes(bytes: &[u8]) -> Result<ImageFormat>`  | Sniffs the format from magic bytes **without decoding pixels**. `UnrecognizedFormat` if no match.                         |
+| `probe_bytes`       | `fn probe_bytes(bytes: &[u8]) -> Result<ImageInfo>`          | Reads metadata (dimensions, color type, bit depth) from the header; format guessed from **magic bytes**. No pixel decode. |
+| `probe_file`        | `fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo>` | Same, for a file; format from the **extension**. Reads the file bytes but never decodes pixels.                           |
 
 ### Encoding
 
@@ -66,6 +69,22 @@ For both encoders, pass `options: None` to use the format's defaults. A `Some(_)
 - `ImageFormat::from_path(impl AsRef<Path>) -> Option<Self>`
 - `ImageFormat::from_magic(&[u8]) -> Option<Self>` — signature sniff (incl. ISO-BMFF `ftyp` brand to tell avif from heif).
 - `ImageFormat::extension(self) -> &'static str` — canonical lowercase extension.
+
+### `ImageInfo`
+
+Returned by `probe_file` / `probe_bytes`. A plain `Copy` struct of header metadata:
+
+```rust
+pub struct ImageInfo {
+    pub format: ImageFormat,
+    pub width: u32,
+    pub height: u32,
+    pub color_type: image::ColorType, // the `image` crate's enum (channel layout + sample size)
+    pub bit_depth: u8,                // bits per channel (8/10/12/16/…)
+}
+```
+
+`bit_depth` carries the true per-channel depth — important for high-bit-depth AVIF/HEIF (10/12-bit), which `color_type` alone cannot tell apart from 16-bit.
 
 ### `EncodeOptions`
 

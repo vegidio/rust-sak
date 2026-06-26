@@ -10,6 +10,8 @@
 //! - [`decode_bytes`] — decode in-memory bytes, format guessed from the magic bytes.
 //! - [`decode_bytes_with_format`] — decode in-memory bytes with an explicitly given [`ImageFormat`].
 //! - [`format_from_bytes`] — detect the [`ImageFormat`] from magic bytes without decoding.
+//! - [`probe_bytes`] / [`probe_file`] — read an image's metadata ([`ImageInfo`]: dimensions, color type, bit
+//!   depth) from its header without decoding the pixels.
 //! - [`encode_file`] — encode and save to a path, format chosen from its extension.
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
 //!
@@ -47,7 +49,10 @@ mod encode_writer;
 mod error;
 mod format;
 mod format_from_bytes;
+mod info;
 mod options;
+mod probe_bytes;
+mod probe_file;
 
 pub use decode_bytes::decode_bytes;
 pub use decode_bytes_with_format::decode_bytes_with_format;
@@ -57,7 +62,10 @@ pub use encode_writer::encode_writer;
 pub use error::{ImageError, Result};
 pub use format::ImageFormat;
 pub use format_from_bytes::format_from_bytes;
+pub use info::ImageInfo;
 pub use options::{Chroma, EncodeOptions, PngCompression, PngFilter, Preset};
+pub use probe_bytes::probe_bytes;
+pub use probe_file::probe_file;
 
 #[cfg(test)]
 mod tests;

@@ -170,3 +170,74 @@ fn heif_round_trip() {
     let decoded = decode_bytes(&bytes).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (8, 8));
 }
+
+#[test]
+fn probe_bytes_reports_dimensions_and_format() {
+    let img = sample_image();
+    for format in [
+        ImageFormat::Png,
+        ImageFormat::Jpeg,
+        ImageFormat::Bmp,
+        ImageFormat::Gif,
+        ImageFormat::Tiff,
+    ] {
+        let bytes = encode(&img, format);
+        let info = probe_bytes(&bytes).unwrap();
+        assert_eq!(info.format, format, "format {format:?}");
+        assert_eq!((info.width, info.height), (8, 8), "format {format:?}");
+        assert_eq!(info.bit_depth, 8, "format {format:?}");
+    }
+}
+
+#[test]
+fn probe_matches_decode() {
+    let img = sample_image();
+    let bytes = encode(&img, ImageFormat::Png);
+    let info = probe_bytes(&bytes).unwrap();
+    let decoded = decode_bytes(&bytes).unwrap();
+    assert_eq!((info.width, info.height), (decoded.width(), decoded.height()));
+}
+
+#[test]
+fn probe_file_reads_metadata() {
+    let img = sample_image();
+    let path = std::env::temp_dir().join(format!("rust_sak_probe_{}.png", std::process::id()));
+    encode_file(&img, &path, None).unwrap();
+    let info = probe_file(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(info.format, ImageFormat::Png);
+    assert_eq!((info.width, info.height), (8, 8));
+    assert_eq!(info.bit_depth, 8);
+}
+
+#[test]
+fn probe_bytes_handles_dedicated_codecs() {
+    // AV1 encoders need a non-tiny frame, so AVIF uses a larger sample.
+    for (format, img) in [
+        (ImageFormat::WebP, sample_image()),
+        (ImageFormat::Avif, sample_image_sized(64, 64)),
+        (ImageFormat::Heif, sample_image()),
+    ] {
+        let bytes = encode(&img, format);
+        let info = probe_bytes(&bytes).unwrap();
+        assert_eq!(info.format, format, "format {format:?}");
+        assert_eq!(
+            (info.width, info.height),
+            (img.width(), img.height()),
+            "format {format:?}"
+        );
+    }
+}
+
+#[test]
+fn probe_unknown_extension_errors() {
+    assert!(matches!(probe_file("/tmp/file.xyz"), Err(ImageError::UnknownExtension)));
+}
+
+#[test]
+fn probe_unrecognized_bytes_error() {
+    assert!(matches!(
+        probe_bytes(&[0, 1, 2, 3]),
+        Err(ImageError::UnrecognizedFormat)
+    ));
+}

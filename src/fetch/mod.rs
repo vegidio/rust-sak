@@ -29,10 +29,11 @@ use prepared::PreparedRequest;
 
 /// A configurable, reusable HTTP fetcher, built with a fluent (consuming) builder API.
 ///
-/// A `Fetch` holds the default configuration (headers, retries, HTTP/2 toggle, read timeout, download mode) and a lazily built,
-/// reusable [`reqwest::Client`]. The client — and its connection pool — is constructed on the first request and reused
-/// across later requests, so a `Fetch` is meant to be configured once and shared (the request methods take `&self`).
-/// Mutating the configuration via the builder methods resets the cached client so it is rebuilt with the new settings.
+/// A `Fetch` holds the default configuration (headers, retries, HTTP/2 toggle, read timeout, download mode) and a
+/// lazily built, reusable [`reqwest::Client`]. The client — and its connection pool — is constructed on the first
+/// request and reused across later requests, so a `Fetch` is meant to be configured once and shared (the request
+/// methods take `&self`). Mutating the configuration via the builder methods resets the cached client so it is rebuilt
+/// with the new settings.
 ///
 /// ```
 /// use rust_sak::fetch::Fetch;
