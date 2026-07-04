@@ -121,9 +121,9 @@ dependencies = [
 
 [[package]]
 name = "avif-rs"
-version = "26.6.1"
+version = "26.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06339938dbb460f9af3228ea8a5f6273618cfa7f201ad29a6c65e153b7dfd2e8"
+checksum = "e94cae7159eb4e4100b100fe1406902894ec80da4af8780b0ff32e015f010297"
 dependencies = [
  "bindgen",
  "image",
@@ -686,9 +686,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heif-rs"
-version = "26.6.1"
+version = "26.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d499e82ab20429be471d265bd0e4e3d8b8f9fd60d28ca432163327e996736e7"
+checksum = "1864e5d0f2f9e82db410c2be5bdfd419909d9018ed82702481603a879a33a6d4"
 dependencies = [
  "bindgen",
  "image",
@@ -2434,9 +2434,9 @@ dependencies = [
 
 [[package]]
 name = "webp-rs"
-version = "26.6.1"
+version = "26.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "542c365fd6cc5c6627360ac8b240476193eb3224e85974b09c1c433f1af9212b"
+checksum = "bfc275210242b7fafedcc21100a97ba21f8c9a4e5000a52c7293f390073d4624"
 dependencies = [
  "bindgen",
  "image",
