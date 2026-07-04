@@ -1,0 +1,9 @@
+# Convenience aliases for code coverage (see scripts/coverage.sh). Both require
+# `cargo-llvm-cov`:
+#   rustup component add llvm-tools-preview && cargo install cargo-llvm-cov
+#
+# `--ignore-filename-regex` drops `src/main.rs` — the scratch `playground` binary, which is
+# an experimentation harness with no tests, so counting it would understate real coverage.
+[alias]
+cov = "llvm-cov --all-features --ignore-filename-regex src/main\\.rs --html --open"
+cov-lcov = "llvm-cov --all-features --ignore-filename-regex src/main\\.rs --lcov --output-path target/coverage/lcov.info"
