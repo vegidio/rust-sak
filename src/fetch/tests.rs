@@ -60,10 +60,7 @@ async fn text_returns_body() {
         write_response(&mut stream, "200 OK", "hello world").await;
     });
 
-    let body = Fetch::new()
-        .text(format!("http://{addr}"), RequestOptions::new())
-        .await
-        .unwrap();
+    let body = Fetch::new().text(format!("http://{addr}")).await.unwrap();
 
     assert_eq!(body, "hello world");
     server.await.unwrap();
@@ -83,7 +80,7 @@ async fn text_sends_configured_headers() {
 
     let body = Fetch::new()
         .header("X-Custom", "abc123")
-        .text(format!("http://{addr}"), RequestOptions::new())
+        .text(format!("http://{addr}"))
         .await
         .unwrap();
 
@@ -106,10 +103,7 @@ async fn text_errors_on_failure_status() {
         write_response(&mut stream, "500 Internal Server Error", "nope").await;
     });
 
-    let err = Fetch::new()
-        .text(format!("http://{addr}"), RequestOptions::new())
-        .await
-        .unwrap_err();
+    let err = Fetch::new().text(format!("http://{addr}")).await.unwrap_err();
 
     assert_eq!(err.status(), Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
     server.await.unwrap();
@@ -131,11 +125,7 @@ async fn text_retries_until_success() {
         write_response(&mut stream, "200 OK", "recovered").await;
     });
 
-    let body = Fetch::new()
-        .retries(1)
-        .text(format!("http://{addr}"), RequestOptions::new())
-        .await
-        .unwrap();
+    let body = Fetch::new().retries(1).text(format!("http://{addr}")).await.unwrap();
 
     assert_eq!(body, "recovered");
     server.await.unwrap();
@@ -154,7 +144,7 @@ async fn text_appends_query_params() {
     });
 
     let body = Fetch::new()
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new().query("a", "1").query("b", "2"),
         )
@@ -180,7 +170,7 @@ async fn text_uses_per_request_method() {
     });
 
     let body = Fetch::new()
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new().method(reqwest::Method::POST),
         )
@@ -206,7 +196,7 @@ async fn text_request_header_overrides_struct_header() {
 
     let body = Fetch::new()
         .header("X-Custom", "from-fetch")
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new().header("X-Custom", "from-request"),
         )
@@ -233,7 +223,7 @@ async fn text_merges_struct_and_request_headers() {
 
     let body = Fetch::new()
         .header("X-From-Fetch", "fetch")
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new().header("X-From-Request", "request"),
         )
@@ -265,7 +255,7 @@ async fn text_per_request_retries_override() {
     // The struct disables retries; the per-request override re-enables one.
     let body = Fetch::new()
         .retries(0)
-        .text(format!("http://{addr}"), RequestOptions::new().retries(1))
+        .text_with_options(format!("http://{addr}"), RequestOptions::new().retries(1))
         .await
         .unwrap();
 
@@ -288,7 +278,7 @@ async fn post_is_not_retried_by_default() {
 
     let err = Fetch::new()
         .retries(3)
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new().method(reqwest::Method::POST),
         )
@@ -317,7 +307,7 @@ async fn post_is_retried_when_opted_in() {
 
     let body = Fetch::new()
         .retries(1)
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new()
                 .method(reqwest::Method::POST)
@@ -344,7 +334,7 @@ async fn read_timeout_errors_on_idle_connection() {
 
     let err = Fetch::new()
         .read_timeout(Duration::from_millis(200))
-        .text(format!("http://{addr}"), RequestOptions::new())
+        .text(format!("http://{addr}"))
         .await
         .unwrap_err();
 
@@ -368,10 +358,7 @@ async fn json_deserializes_body() {
         write_response(&mut stream, "200 OK", r#"{"name":"rust-sak","stars":42}"#).await;
     });
 
-    let repo: Repo = Fetch::new()
-        .json(format!("http://{addr}"), RequestOptions::new())
-        .await
-        .unwrap();
+    let repo: Repo = Fetch::new().json(format!("http://{addr}")).await.unwrap();
 
     assert_eq!(repo.name, "rust-sak");
     assert_eq!(repo.stars, 42);
@@ -389,9 +376,7 @@ async fn json_errors_on_invalid_json() {
         write_response(&mut stream, "200 OK", "not json").await;
     });
 
-    let result = Fetch::new()
-        .json::<serde_json::Value>(format!("http://{addr}"), RequestOptions::new())
-        .await;
+    let result = Fetch::new().json::<serde_json::Value>(format!("http://{addr}")).await;
 
     assert!(result.is_err());
     server.await.unwrap();
@@ -420,7 +405,7 @@ async fn text_sends_request_body() {
     });
 
     let body = Fetch::new()
-        .text(
+        .text_with_options(
             format!("http://{addr}"),
             RequestOptions::new()
                 .method(reqwest::Method::POST)
@@ -465,7 +450,7 @@ async fn download_writes_file() {
         write_response(&mut stream, "200 OK", "hello download").await;
     });
 
-    let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let download = Fetch::new().download(format!("http://{addr}"), &path);
     download.join().await.unwrap();
     server.await.unwrap();
 
@@ -487,7 +472,7 @@ async fn download_reports_total_and_completes_to_full() {
         write_response(&mut stream, "200 OK", "0123456789").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -512,7 +497,7 @@ async fn download_without_content_length() {
         write_response_no_length(&mut stream, "no length body").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -539,7 +524,7 @@ async fn download_failed_status_sets_failed() {
         write_response(&mut stream, "500 Internal Server Error", "nope").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     while download.changed().await.is_ok() {}
     assert!(download.completed());
     assert!(download.failed());
@@ -563,7 +548,7 @@ async fn track_reports_progress_and_completes() {
         write_response(&mut stream, "200 OK", "hello track").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let mut ticks: Vec<(Option<u64>, u64, Option<f64>)> = Vec::new();
     download
         .track(|total, downloaded, progress| ticks.push((total, downloaded, progress)))
@@ -590,7 +575,7 @@ async fn track_returns_error_on_failed_status() {
         write_response(&mut stream, "500 Internal Server Error", "nope").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let err = download.track(|_, _, _| {}).await.unwrap_err();
     assert!(matches!(err, DownloadError::Http(_)), "unexpected error: {err}");
     server.await.unwrap();
@@ -620,7 +605,7 @@ async fn cancel_aborts_and_join_returns_cancelled() {
         std::future::pending::<()>().await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     // Wait for the first real progress update so the transfer is genuinely in-flight before cancelling.
     download.changed().await.unwrap();
     assert!(!download.completed());
@@ -650,7 +635,8 @@ async fn download_retries_until_success() {
         write_response(&mut stream, "200 OK", "recovered").await;
     });
 
-    let download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new().retries(1));
+    let download =
+        Fetch::new().download_with_options(format!("http://{addr}"), &path, RequestOptions::new().retries(1));
     download.join().await.unwrap();
     server.await.unwrap();
 
@@ -680,7 +666,7 @@ async fn resume_appends_from_offset() {
         write_partial_response(&mut stream, 4, 10, "456789").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -711,7 +697,7 @@ async fn resume_falls_back_when_server_ignores_range() {
         write_response(&mut stream, "200 OK", "full body").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -755,9 +741,7 @@ async fn resume_rejects_206_with_mismatched_content_range() {
         write_response(&mut stream, "200 OK", "0123456789").await;
     });
 
-    let mut download = Fetch::new()
-        .retries(1)
-        .download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().retries(1).download(format!("http://{addr}"), &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -782,7 +766,7 @@ async fn skip_when_file_exists() {
     let _ = tokio::fs::remove_file(&path).await;
     tokio::fs::write(&path, b"existing").await.unwrap();
 
-    let mut download = Fetch::new().download(
+    let mut download = Fetch::new().download_with_options(
         format!("http://{addr}"),
         &path,
         RequestOptions::new().download_mode(DownloadMode::Skip),
@@ -821,7 +805,7 @@ async fn overwrite_truncates_existing() {
         write_response(&mut stream, "200 OK", "fresh").await;
     });
 
-    let mut download = Fetch::new().download(
+    let mut download = Fetch::new().download_with_options(
         format!("http://{addr}"),
         &path,
         RequestOptions::new().download_mode(DownloadMode::Overwrite),
@@ -854,7 +838,7 @@ async fn resume_416_treated_as_complete() {
         write_range_not_satisfiable(&mut stream, 10).await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -886,7 +870,7 @@ async fn struct_download_mode_default_is_overridable() {
     });
 
     let fetch = Fetch::new().download_mode(DownloadMode::Overwrite);
-    let mut download = fetch.download(format!("http://{addr}"), &path, RequestOptions::new());
+    let mut download = fetch.download(format!("http://{addr}"), &path);
     drain(&mut download).await;
     server.await.unwrap();
     assert_eq!(tokio::fs::read(&path).await.unwrap(), b"fresh");
@@ -894,7 +878,7 @@ async fn struct_download_mode_default_is_overridable() {
     // ...and a per-request override (Skip) wins over the struct default.
     let _ = tokio::fs::remove_file(&path).await;
     tokio::fs::write(&path, b"kept").await.unwrap();
-    let mut download = fetch.download(
+    let mut download = fetch.download_with_options(
         format!("http://{addr}"),
         &path,
         RequestOptions::new().download_mode(DownloadMode::Skip),

@@ -232,6 +232,28 @@ impl Fetch {
         })
     }
 
+    /// Sends a `GET` request to `url` with default per-request options and returns the response body as a `String`.
+    ///
+    /// The [`Fetch`] struct's own configuration (headers, retry count, HTTP/2 setting) still applies. Use
+    /// [`Fetch::text_with_options`] to supply per-request overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// is not valid UTF-8 text.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// let body = Fetch::new().text("https://example.com").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn text(&self, url: impl reqwest::IntoUrl) -> Result<String, reqwest::Error> {
+        self.text_with_options(url, RequestOptions::default()).await
+    }
+
     /// Sends a request to `url` and returns the response body as a `String`.
     ///
     /// The struct's headers, retry count, and HTTP/2 setting provide the defaults; any field set on `options` takes
@@ -250,12 +272,16 @@ impl Fetch {
     /// use rust_sak::fetch::{Fetch, RequestOptions};
     ///
     /// let body = Fetch::new()
-    ///     .text("https://example.com", RequestOptions::new().query("q", "rust"))
+    ///     .text_with_options("https://example.com", RequestOptions::new().query("q", "rust"))
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn text(&self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<String, reqwest::Error> {
+    pub async fn text_with_options(
+        &self,
+        url: impl reqwest::IntoUrl,
+        options: RequestOptions,
+    ) -> Result<String, reqwest::Error> {
         let prepared = self.prepare(url, options)?;
         retry::with_fibonacci_backoff(prepared.retries, || async {
             prepared.request().send().await?.error_for_status()?.text().await
@@ -263,11 +289,42 @@ impl Fetch {
         .await
     }
 
+    /// Sends a `GET` request to `url` with default per-request options and deserializes the JSON response body into `T`.
+    ///
+    /// The [`Fetch`] struct's own configuration (headers, retry count, HTTP/2 setting) still applies. Use
+    /// [`Fetch::json_with_options`] to supply per-request overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// cannot be deserialized into `T`.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct Repo {
+    ///     name: String,
+    ///     stargazers_count: u32,
+    /// }
+    ///
+    /// let repo: Repo = Fetch::new()
+    ///     .header("Accept", "application/json")
+    ///     .json("https://api.github.com/repos/rust-lang/rust")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn json<T: serde::de::DeserializeOwned>(&self, url: impl reqwest::IntoUrl) -> Result<T, reqwest::Error> {
+        self.json_with_options(url, RequestOptions::default()).await
+    }
+
     /// Sends a request to `url` and deserializes the JSON response body into `T`.
     ///
-    /// Behaves exactly like [`Fetch::text`] — same header merging, query parameters, optional [`RequestOptions::body`],
-    /// method default, and Fibonacci-backoff retries — but parses the response body as JSON into any type implementing
-    /// [`serde::de::DeserializeOwned`] instead of returning the raw text.
+    /// Behaves exactly like [`Fetch::text_with_options`] — same header merging, query parameters, optional
+    /// [`RequestOptions::body`], method default, and Fibonacci-backoff retries — but parses the response body as JSON
+    /// into any type implementing [`serde::de::DeserializeOwned`] instead of returning the raw text.
     ///
     /// # Errors
     ///
@@ -286,12 +343,12 @@ impl Fetch {
     ///
     /// let repo: Repo = Fetch::new()
     ///     .header("Accept", "application/json")
-    ///     .json("https://api.github.com/repos/rust-lang/rust", RequestOptions::new())
+    ///     .json_with_options("https://api.github.com/repos/rust-lang/rust", RequestOptions::new())
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn json<T: serde::de::DeserializeOwned>(
+    pub async fn json_with_options<T: serde::de::DeserializeOwned>(
         &self,
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
@@ -311,9 +368,8 @@ impl Fetch {
     /// [`Download::progress`], and exposes the final outcome via [`Download::completed`], [`Download::failed`], and
     /// [`Download::join`].
     ///
-    /// The struct's headers, retry count, and HTTP/2 setting provide the defaults, with `options` overriding per the
-    /// same rules as [`Fetch::text`] (so non-idempotent methods are not retried unless
-    /// [`RequestOptions::retry_non_idempotent`] opts in).
+    /// This uses default per-request options; use [`Fetch::download_with_options`] to override the method, headers,
+    /// retries, or [`DownloadMode`] for a single transfer. The struct's own configuration still provides the defaults.
     ///
     /// When a file already exists at `path`, the resolved [`DownloadMode`] (the struct's
     /// [`download_mode`](Fetch::download_mode), overridable via [`RequestOptions::download_mode`]) decides the behavior:
@@ -336,13 +392,9 @@ impl Fetch {
     ///
     /// ```no_run
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_sak::fetch::{Fetch, RequestOptions};
+    /// use rust_sak::fetch::Fetch;
     ///
-    /// let mut download = Fetch::new().download(
-    ///     "https://example.com/big.bin",
-    ///     "/tmp/big.bin",
-    ///     RequestOptions::new(),
-    /// );
+    /// let mut download = Fetch::new().download("https://example.com/big.bin", "/tmp/big.bin");
     ///
     /// download
     ///     .track(|total, downloaded, progress| {
@@ -358,7 +410,34 @@ impl Fetch {
     ///
     /// For finer control you can instead poll [`Download::progress`] and await [`Download::changed`] in a loop, then
     /// await the final outcome with [`Download::join`].
-    pub fn download(
+    pub fn download(&self, url: impl reqwest::IntoUrl, path: impl AsRef<std::path::Path>) -> Download {
+        self.download_with_options(url, path, RequestOptions::default())
+    }
+
+    /// Streams a request to `url` into `path` with per-request `options`, returning a [`Download`] handle immediately.
+    ///
+    /// Behaves exactly like [`Fetch::download`] — same background streaming, progress tracking, and resume semantics —
+    /// but applies `options` (method, headers, query, retries, and [`RequestOptions::download_mode`]) on top of the
+    /// struct's configuration, per the same override rules as [`Fetch::text_with_options`].
+    ///
+    /// # Panics
+    ///
+    /// Must be called from within a Tokio runtime (it spawns a task); panics otherwise.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// use rust_sak::fetch::{DownloadMode, Fetch, RequestOptions};
+    ///
+    /// let download = Fetch::new().download_with_options(
+    ///     "https://example.com/big.bin",
+    ///     "/tmp/big.bin",
+    ///     RequestOptions::new().download_mode(DownloadMode::Overwrite),
+    /// );
+    /// download.join().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn download_with_options(
         &self,
         url: impl reqwest::IntoUrl,
         path: impl AsRef<std::path::Path>,

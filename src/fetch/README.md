@@ -39,13 +39,16 @@ These consume `self` and return `Self`, so chain them. Changing a client-build s
 
 ## `Fetch` — request methods
 
-All take `&self`. The struct's defaults apply; anything set on `options` overrides them for that one call. Retries use Fibonacci backoff (1s, 2s, 3s, 5s, 8s, … capped at 60s) and apply **only to idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS/TRACE) unless `RequestOptions::retry_non_idempotent(true)` opts in.
+All take `&self`. Each request method comes in two forms: a short form that uses default per-request options, and a `*_with_options` form that takes an explicit `RequestOptions`. The struct's defaults apply either way; anything set on `options` overrides them for that one call. Retries use Fibonacci backoff (1s, 2s, 3s, 5s, 8s, … capped at 60s) and apply **only to idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS/TRACE) unless `RequestOptions::retry_non_idempotent(true)` opts in.
 
-| Method     | Signature                                                                              | What it does                                                                                                                                                                                                                                    |
-|------------|----------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `text`     | `async fn text(&self, url, options) -> Result<String, reqwest::Error>`                 | Sends the request, returns the body as a `String`.                                                                                                                                                                                              |
-| `json`     | `async fn json<T: DeserializeOwned>(&self, url, options) -> Result<T, reqwest::Error>` | Same as `text` but deserializes the JSON body into `T`.                                                                                                                                                                                         |
-| `download` | `fn download(&self, url, path, options) -> Download`                                   | **Non-async, infallible.** Spawns a background task to stream the body to `path` and returns a `Download` handle immediately. Setup errors (bad URL, client build) surface through the handle. **Panics** if not called within a Tokio runtime. |
+| Method                  | Signature                                                                                 | What it does                                                                                                                                                                                                                                    |
+|-------------------------|-------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `text`                  | `async fn text(&self, url) -> Result<String, reqwest::Error>`                             | Sends a `GET` with default options, returns the body as a `String`.                                                                                                                                                                            |
+| `text_with_options`     | `async fn text_with_options(&self, url, options) -> Result<String, reqwest::Error>`       | Same as `text` but applies the per-request `options`.                                                                                                                                                                                           |
+| `json`                  | `async fn json<T: DeserializeOwned>(&self, url) -> Result<T, reqwest::Error>`             | Same as `text` but deserializes the JSON body into `T`.                                                                                                                                                                                         |
+| `json_with_options`     | `async fn json_with_options<T: DeserializeOwned>(&self, url, options) -> Result<T, …>`    | Same as `json` but applies the per-request `options`.                                                                                                                                                                                           |
+| `download`              | `fn download(&self, url, path) -> Download`                                               | **Non-async, infallible.** Spawns a background task to stream the body to `path` and returns a `Download` handle immediately. Setup errors (bad URL, client build) surface through the handle. **Panics** if not called within a Tokio runtime. |
+| `download_with_options` | `fn download_with_options(&self, url, path, options) -> Download`                         | Same as `download` but applies the per-request `options` (including `download_mode`).                                                                                                                                                          |
 
 ## `RequestOptions` — per-request overrides
 
@@ -105,20 +108,20 @@ let fetch = Fetch::new()
     .header("Accept", "application/json")
     .retries(3);
 
-// Plain text body.
-let html = fetch.text("https://example.com", RequestOptions::new()).await?;
+// Plain text body — no per-request options needed.
+let html = fetch.text("https://example.com").await?;
 
 // JSON into a typed value.
 #[derive(serde::Deserialize)]
 struct Repo { name: String, stargazers_count: u32 }
 
 let repo: Repo = fetch
-    .json("https://api.github.com/repos/rust-lang/rust", RequestOptions::new())
+    .json("https://api.github.com/repos/rust-lang/rust")
     .await?;
 
-// POST with a JSON body.
+// POST with a JSON body — per-request overrides via `*_with_options`.
 let echoed = fetch
-    .text(
+    .text_with_options(
         "https://httpbin.org/post",
         RequestOptions::new()
             .method(reqwest::Method::POST)
@@ -127,7 +130,7 @@ let echoed = fetch
     .await?;
 
 // Streaming download with live progress.
-let mut dl = fetch.download(
+let mut dl = fetch.download_with_options(
     "https://example.com/big.bin",
     "/tmp/big.bin",
     RequestOptions::new().download_mode(DownloadMode::Resume),

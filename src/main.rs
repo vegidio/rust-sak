@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo run --features fetch`
 
-use rust_sak::fetch::{Fetch, RequestOptions};
+use rust_sak::fetch::Fetch;
 
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
@@ -11,7 +11,7 @@ async fn main() -> Result<(), reqwest::Error> {
     let body = fetch
         .header("User-Agent", "rust-sak-playground")
         .retries(2)
-        .text("https://vinicius.io", RequestOptions::new())
+        .text("https://vinicius.io")
         .await?;
 
     println!("{body}");
