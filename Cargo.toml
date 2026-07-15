@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-avif = { package = "avif-rs", version = "26.7", optional = true }
+avif = { package = "avif-rs", version = "26.7.1", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 heif = { package = "heif-rs", version = "26.7", optional = true }
 hex = { version = "0.4.3", optional = true }

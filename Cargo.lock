@@ -121,9 +121,9 @@ dependencies = [
 
 [[package]]
 name = "avif-rs"
-version = "26.7.0"
+version = "26.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e94cae7159eb4e4100b100fe1406902894ec80da4af8780b0ff32e015f010297"
+checksum = "d03e6c65a29471c6d843e2eb6c36230e8291fb9e5570383304cf4695446a6e0d"
 dependencies = [
  "bindgen",
  "image",
