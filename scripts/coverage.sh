@@ -9,8 +9,8 @@
 #                                    # Cargo feature, tested in isolation
 #
 # rust-sak has no `default` feature set, so the full report uses `--all-features`. The HTML
-# index groups files by path, so `src/crypto`, `src/fetch`, `src/fs`, `src/image`, `src/o11y` and
-# `src/sysinfo` each show a per-directory subtotal in the combined report. `--by-feature` goes further and compiles +
+# index groups files by path, so `src/crypto`, `src/fetch`, `src/fs`, `src/image`, `src/memo`, `src/o11y`
+# and `src/sysinfo` each show a per-directory subtotal in the combined report. `--by-feature` goes further and compiles +
 # tests one feature at a time (`--no-default-features --features <f>`) so each summary
 # reflects only that feature's own tests.
 #
@@ -21,14 +21,15 @@
 # inherently partial off-Windows: the DXGI backend only compiles there, so only its parsers are
 # exercised elsewhere. The `fs` feature compiles xz from vendored C sources on first build, so a C compiler
 # is required. The `image` feature downloads prebuilt avif/heif/webp static binaries on first build
-# (internet required, or set the `*_BINARIES_DIR` env vars for offline builds).
+# (internet required, or set the `*_BINARIES_DIR` env vars for offline builds). The `memo` feature is listed with
+# `memo-async` so the per-feature run also covers the async method, which `memo` alone compiles out.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 # The scratch playground binary is not meaningfully coverable; keep it out of every report.
 IGNORE_REGEX='src/main\.rs'
-FEATURES=(crypto fetch fs image o11y sysinfo)
+FEATURES=(crypto fetch fs image memo,memo-async o11y sysinfo)
 
 # Ensure the LLVM coverage tooling is available.
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
@@ -47,7 +48,7 @@ case "${1:-}" in
     --by-feature)
         for feature in "${FEATURES[@]}"; do
             echo
-            echo "=== feature: $feature (src/$feature) ==="
+            echo "=== feature: $feature (src/${feature%%,*}) ==="
             cargo llvm-cov --no-default-features --features "$feature" \
                 --ignore-filename-regex "$IGNORE_REGEX" --summary-only
         done
