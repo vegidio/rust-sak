@@ -9,7 +9,7 @@
 #                                    # Cargo feature, tested in isolation
 #
 # rust-sak has no `default` feature set, so the full report uses `--all-features`. The HTML
-# index groups files by path, so `src/crypto`, `src/fetch` and `src/image` each show a
+# index groups files by path, so `src/crypto`, `src/fetch`, `src/image` and `src/o11y` each show a
 # per-directory subtotal in the combined report. `--by-feature` goes further and compiles +
 # tests one feature at a time (`--no-default-features --features <f>`) so each summary
 # reflects only that feature's own tests.
@@ -25,7 +25,7 @@ cd "$(dirname "$0")/.."
 
 # The scratch playground binary is not meaningfully coverable; keep it out of every report.
 IGNORE_REGEX='src/main\.rs'
-FEATURES=(crypto fetch image)
+FEATURES=(crypto fetch image o11y)
 
 # Ensure the LLVM coverage tooling is available.
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
