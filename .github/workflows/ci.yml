@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        # windows-latest defaults to pwsh, whose `>>` writes UTF-16LE and would corrupt $GITHUB_STEP_SUMMARY.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The avif/heif/webp crates run bindgen in their build scripts. Linux and macOS runners resolve libclang on
+      # their own; Windows needs to be told where it lives.
+      - name: Point bindgen at libclang
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # The crate has no default features, so a bare `cargo test` would compile nothing.
+      - name: Run unit tests
+        id: nextest
+        run: cargo nextest run --all-features --locked --no-fail-fast 2>&1 | tee nextest.log
+
+      # nextest cannot run doctests, and this crate has plenty; without this they stop being compiled at all.
+      - name: Run doctests
+        id: doctest
+        if: ${{ !cancelled() }}
+        run: cargo test --doc --all-features --locked 2>&1 | tee doctest.log
+
+      - name: Publish results to job summary
+        if: ${{ !cancelled() }}
+        run: |
+          # Swatinem/rust-cache exports CARGO_TERM_COLOR=always, so nextest colours its output even through `tee`.
+          # $'...' makes bash insert a literal ESC byte before sed sees it, which works on BSD sed (macOS) too.
+          strip_ansi() { sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' "$1" 2>/dev/null; }
+          # Best-effort: a missing log or an unmatched line must never fail the build. The authoritative pass/fail
+          # is the step outcome below, not the grep.
+          unit=$(strip_ansi nextest.log | grep -aE '^[[:space:]]*Summary \[' | tail -1 | sed -E 's/^[[:space:]]+//') || unit=""
+          doc=$(strip_ansi doctest.log | grep -aE '^test result:' | tail -1) || doc=""
+          {
+            printf '### %s\n\n' "${{ matrix.os }}"
+            printf '| Suite | Result | Detail |\n'
+            printf '| --- | --- | --- |\n'
+            printf '| unit (nextest) | %s | `%s` |\n' "${{ steps.nextest.outcome }}" "${unit:-no summary line produced}"
+            printf '| doctests | %s | `%s` |\n' "${{ steps.doctest.outcome }}" "${doc:-no summary line produced}"
+            printf '\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+          # cargo-llvm-cov relocates the target dir; the default `. -> target` would cache the wrong one.
+          workspaces: ". -> target/llvm-cov-target"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      # `--no-report` keeps the profdata so the four report formats below cost no rebuild and no second test run.
+      - name: Run instrumented tests
+        run: cargo llvm-cov nextest --all-features --locked --no-fail-fast --no-report
+
+      # `--ignore-filename-regex` drops src/main.rs — the untested `playground` binary — matching scripts/coverage.sh.
+      - name: Generate reports
+        id: reports
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+            --lcov --output-path target/coverage/lcov.info
+          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+            --html --output-dir target/coverage
+          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+            --json --summary-only --output-path target/coverage/summary.json
+          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+            --summary-only | tee target/coverage/summary.txt
+
+      - name: Publish coverage to job summary
+        if: ${{ steps.reports.outcome == 'success' }}
+        run: |
+          {
+            printf '## Coverage\n\n'
+            printf '`--all-features` on ubuntu-latest, `src/main.rs` excluded.\n\n'
+            jq -r '
+              def pct: if (.count // 0) > 0 then (.covered * 10000 / .count | round / 100) else 0 end;
+              .data[0].totals as $t
+              | "| Metric | Covered | Total | Coverage |",
+                "| --- | ---: | ---: | ---: |",
+                ( ["lines", "functions", "regions", "branches"][]
+                  | select(($t[.].count // 0) > 0)
+                  | "| \(.) | \($t[.].covered) | \($t[.].count) | \($t[.] | pct)% |" )
+            ' target/coverage/summary.json
+            printf '\n### By module\n\n'
+            jq -r --arg root "$GITHUB_WORKSPACE/" '
+              def pct: if (.count // 0) > 0 then (.covered * 10000 / .count | round / 100) else 0 end;
+              .data[0].files
+              | map({ module: ( (.filename | ltrimstr($root) | split("/"))
+                                | if length > 2 then "src/" + .[1] else "src" end ),
+                      covered: .summary.lines.covered,
+                      count: .summary.lines.count })
+              | group_by(.module)
+              | map({ module: .[0].module,
+                      covered: (map(.covered) | add),
+                      count: (map(.count) | add) })
+              | sort_by(.module)
+              | "| Module | Lines covered | Lines | Coverage |",
+                "| --- | ---: | ---: | ---: |",
+                (.[] | "| `\(.module)` | \(.covered) | \(.count) | \(. | pct)% |")
+            ' target/coverage/summary.json
+            printf '\n<details><summary>Per-file summary</summary>\n\n'
+            printf '```\n'
+            cat target/coverage/summary.txt
+            printf '```\n\n</details>\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov
+        if: ${{ steps.reports.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: target/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload HTML report
+        if: ${{ steps.reports.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html
+          path: target/coverage/html
+          if-no-files-found: error
+          retention-days: 30

@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 
@@ -226,6 +227,10 @@ fn write_card(drm: &Path, name: &str, attributes: &[(&str, &str)]) -> PathBuf {
 }
 
 /// Points a card's `device/driver` symlink at a driver of the given name, the way the driver core does on bind.
+///
+/// Unix-only: Windows symlink creation needs elevation or developer mode, so the two tests that bind a driver are
+/// gated alongside it.
+#[cfg(unix)]
 fn bind_driver(card: &Path, driver: &str) {
     let drivers = card.join("bus/pci/drivers");
     fs::create_dir_all(drivers.join(driver)).unwrap();
@@ -401,6 +406,7 @@ fn gpu_from_card_dir_skips_a_pci_device_with_no_readable_class() {
     assert_eq!(gpu_from_card_dir(&card, None), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn gpu_from_card_dir_identifies_a_soc_gpu_by_its_driver() {
     let dir = TempDir::new().unwrap();
@@ -414,6 +420,7 @@ fn gpu_from_card_dir_identifies_a_soc_gpu_by_its_driver() {
     assert_eq!(gpu.memory, None);
 }
 
+#[cfg(unix)]
 #[test]
 fn gpu_from_card_dir_skips_a_simpledrm_framebuffer() {
     let dir = TempDir::new().unwrap();
