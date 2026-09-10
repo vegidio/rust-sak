@@ -5,14 +5,28 @@
 //! [`TelemetryBuilder::geolocation(true)`](super::TelemetryBuilder::geolocation) was set.
 
 use std::io::Read;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use super::Result;
 
-/// How long the lookup may take before it is abandoned. Enrichment is never worth stalling on.
-const TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the lookup may take before it is abandoned, unless the caller says otherwise. Enrichment is never worth
+/// stalling on, but a self-hosted endpoint behind a VPN can legitimately need longer — see
+/// [`fetch_geolocation_with`].
+pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The HTTP client every lookup shares.
+///
+/// A blocking `reqwest::Client` is expensive to build: it loads the TLS root store and starts a tokio runtime with
+/// its own thread, all to make one sub-kilobyte GET. Building one per lookup meant paying that every time, so the
+/// process builds one and reuses it. It is module-private, so nothing outside can reconfigure it — which is the
+/// objection to `reqwest`'s process-wide default client, not to a static of our own.
+///
+/// It carries no timeout of its own; each request sets its own, which is what lets callers choose.
+static CLIENT: LazyLock<Option<reqwest::blocking::Client>> =
+    LazyLock::new(|| reqwest::blocking::Client::builder().build().ok());
 
 /// Caps the response body. The service answers in well under a kilobyte, so anything larger is either a
 /// misconfigured endpoint or a hostile one.
@@ -90,10 +104,42 @@ pub fn fetch_geolocation() -> Result<Geolocation> {
 /// # }
 /// ```
 pub fn fetch_geolocation_from(base_url: &str) -> Result<Geolocation> {
-    // A dedicated client rather than a shared global, which any other code in the process could reconfigure.
-    let client = reqwest::blocking::Client::builder().timeout(TIMEOUT).build()?;
+    fetch_geolocation_with(base_url, DEFAULT_TIMEOUT)
+}
+
+/// Looks the location up against `base_url`, allowing `timeout` for the whole request.
+///
+/// The one-second default the other two functions use suits a public service on a healthy connection. A self-hosted
+/// endpoint, one reached through a VPN or a proxy, or a deliberately slow test double may need longer.
+///
+/// ```no_run
+/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// use std::time::Duration;
+/// use rust_sak::o11y::fetch_geolocation_with;
+///
+/// let geo = fetch_geolocation_with("https://ipinfo.example.internal", Duration::from_secs(5))?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// As [`fetch_geolocation`].
+pub fn fetch_geolocation_with(base_url: &str, timeout: Duration) -> Result<Geolocation> {
+    // The shared client, or a throwaway one when it could not be built — only so the failure is reported rather
+    // than silently swallowed by the `LazyLock`.
+    let fallback;
+    let client = match CLIENT.as_ref() {
+        Some(client) => client,
+        None => {
+            fallback = reqwest::blocking::Client::builder().build()?;
+            &fallback
+        }
+    };
+
     let response = client
         .get(format!("{}/json", base_url.trim_end_matches('/')))
+        .timeout(timeout)
         .send()?
         .error_for_status()?;
 

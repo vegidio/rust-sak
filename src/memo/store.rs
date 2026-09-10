@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::Result;
@@ -8,7 +9,10 @@ use super::Result;
 #[derive(Clone, Debug)]
 pub(super) struct Entry {
     /// The raw value, exactly as the caller stored it.
-    pub(super) value: Vec<u8>,
+    ///
+    /// Reference-counted rather than owned so that a memory hit hands back a pointer copy. The bytes are immutable
+    /// once stored, so sharing them between the cache and every reader is safe.
+    pub(super) value: Arc<[u8]>,
     /// How much longer the entry may be served, or `None` for one with no deadline.
     pub(super) remaining: Option<Duration>,
 }
@@ -25,17 +29,14 @@ pub(super) trait Store: fmt::Debug + Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Entry>>;
 
     /// Writes `value` under `key`, to be served for at most `ttl`.
-    fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()>;
+    ///
+    /// Takes the bytes reference-counted so a store that keeps them in memory can retain the caller's allocation
+    /// instead of copying it, and a two-tier store can hand the same allocation to both tiers.
+    fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()>;
 
     /// Reclaims the space held by entries whose TTL has elapsed. Stores with nothing to reclaim return `Ok(())`.
     fn cleanup(&self) -> Result<()>;
 
     /// The directory backing this store, or `None` for one that keeps nothing on disk.
     fn path(&self) -> Option<&Path>;
-
-    /// Whether calls into this store block on I/O.
-    ///
-    /// The async path routes blocking stores through `spawn_blocking` and calls the others inline, because a
-    /// `spawn_blocking` round-trip costs more than a moka lookup does.
-    fn blocking(&self) -> bool;
 }

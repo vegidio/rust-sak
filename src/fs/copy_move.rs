@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,11 @@ where
     let dest_dir = dest_dir.as_ref();
     fs::create_dir_all(dest_dir)?;
 
+    // Every destination parent already created, so a run of files landing in one directory costs a single
+    // `create_dir_all` rather than one per file. `dest_dir` is seeded because it was just created, which is the
+    // whole set when `preserve_structure` is off.
+    let mut created: HashSet<PathBuf> = HashSet::from([dest_dir.to_path_buf()]);
+
     let mut summary = CopySummary::default();
     for source in sources {
         let source = source.as_ref();
@@ -33,10 +39,17 @@ where
         // `metadata` follows symlinks, so a link to a directory is walked as a directory and a link to a file is
         // copied as a file — matching what the caller sees when they look at the path themselves.
         if fs::metadata(source)?.is_dir() {
-            transfer_dir(source, dest_dir, options, remove_sources, &mut summary)?;
+            transfer_dir(source, dest_dir, options, remove_sources, &mut created, &mut summary)?;
         } else {
             let name = file_name(source)?;
-            transfer_file(source, &dest_dir.join(name), options, remove_sources, &mut summary)?;
+            transfer_file(
+                source,
+                &dest_dir.join(name),
+                options,
+                remove_sources,
+                &mut created,
+                &mut summary,
+            )?;
         }
     }
 
@@ -49,8 +62,11 @@ fn transfer_dir(
     dest_dir: &Path,
     options: &CopyOptions,
     remove_sources: bool,
+    created: &mut HashSet<PathBuf>,
     summary: &mut CopySummary,
 ) -> Result<()> {
+    // Deliberately unfiltered: the extension filter is applied in `transfer_file` instead, so that excluded files
+    // are seen and counted in `CopySummary::skipped`. Filtering them out of the walk would make that counter zero.
     let listing = ListOptions::new().recursive(options.recursive);
     for path in list_path(source, &listing)? {
         // `list_path` walked from `source`, so every path it returns is under it and the strip cannot fail.
@@ -61,7 +77,7 @@ fn transfer_dir(
             dest_dir.join(file_name(&path)?)
         };
 
-        transfer_file(&path, &dest, options, remove_sources, summary)?;
+        transfer_file(&path, &dest, options, remove_sources, created, summary)?;
     }
 
     Ok(())
@@ -73,6 +89,7 @@ fn transfer_file(
     dest: &Path,
     options: &CopyOptions,
     remove_sources: bool,
+    created: &mut HashSet<PathBuf>,
     summary: &mut CopySummary,
 ) -> Result<()> {
     if !options.accepts(source) {
@@ -87,8 +104,11 @@ fn transfer_file(
         return Ok(());
     }
 
-    if let Some(parent) = dest.parent() {
+    if let Some(parent) = dest.parent()
+        && !created.contains(parent)
+    {
         fs::create_dir_all(parent)?;
+        created.insert(parent.to_path_buf());
     }
 
     summary.bytes += fs::copy(source, dest)?;

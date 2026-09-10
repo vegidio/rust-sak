@@ -52,7 +52,7 @@ pub use builder::TelemetryBuilder;
 pub use environment::Environment;
 pub use error::{O11yError, Result};
 pub use event::Event;
-pub use geolocation::{Geolocation, fetch_geolocation, fetch_geolocation_from};
+pub use geolocation::{Geolocation, fetch_geolocation, fetch_geolocation_from, fetch_geolocation_with};
 pub use value::Value;
 
 use std::sync::Arc;
@@ -87,16 +87,24 @@ use enrichment::Enrichment;
 /// ```
 #[derive(Debug)]
 pub struct Telemetry {
-    /// The logger records are emitted through, and the provider that owns it. `None` when collection is disabled, in
-    /// which case every record is dropped on the floor.
-    logger: Option<SdkLogger>,
-    /// Kept so the batch processor can be flushed and shut down. `None` alongside `logger`.
-    provider: Option<SdkLoggerProvider>,
+    /// The export machinery, or `None` when collection is disabled — in which case every record is dropped on the
+    /// floor. Pairing the two in a struct is what makes "enabled" a single fact: a handle cannot report itself
+    /// enabled and then have nothing to flush.
+    active: Option<Active>,
     /// The attributes shared by every record. Shared with the background geolocation thread, if one was started.
     enrichment: Arc<Enrichment>,
     /// Guards against shutting the provider down twice, so `shutdown` stays idempotent under an explicit call
     /// followed by `Drop`.
     shut_down: AtomicBool,
+}
+
+/// The logger and the provider that owns it, which exist together or not at all.
+#[derive(Debug)]
+struct Active {
+    /// The logger records are emitted through.
+    logger: SdkLogger,
+    /// Kept so the batch processor can be flushed and shut down.
+    provider: SdkLoggerProvider,
 }
 
 impl Telemetry {
@@ -138,11 +146,13 @@ impl Telemetry {
     ///
     /// Private, but reachable from the sibling modules that make up `o11y`, which is exactly the intended scope.
     fn from_parts(provider: Option<SdkLoggerProvider>, enrichment: Arc<Enrichment>) -> Self {
-        let logger = provider.as_ref().map(|provider| provider.logger("rust-sak/o11y"));
+        let active = provider.map(|provider| Active {
+            logger: provider.logger("rust-sak/o11y"),
+            provider,
+        });
 
         Self {
-            logger,
-            provider,
+            active,
             enrichment,
             shut_down: AtomicBool::new(false),
         }
@@ -202,7 +212,7 @@ impl Telemetry {
 
     /// Whether this handle actually exports records.
     pub fn is_enabled(&self) -> bool {
-        self.logger.is_some()
+        self.active.is_some()
     }
 
     /// Exports every record buffered so far, blocking until the batch has been sent.
@@ -211,8 +221,8 @@ impl Telemetry {
     ///
     /// Returns [`O11yError::Sdk`] if the export fails or times out. Always `Ok` for a disabled handle.
     pub fn flush(&self) -> Result<()> {
-        match &self.provider {
-            Some(provider) => Ok(provider.force_flush()?),
+        match &self.active {
+            Some(active) => Ok(active.provider.force_flush()?),
             None => Ok(()),
         }
     }
@@ -230,8 +240,8 @@ impl Telemetry {
             return Ok(());
         }
 
-        match &self.provider {
-            Some(provider) => Ok(provider.shutdown()?),
+        match &self.active {
+            Some(active) => Ok(active.provider.shutdown()?),
             None => Ok(()),
         }
     }
@@ -241,13 +251,13 @@ impl Telemetry {
     /// An enrichment attribute whose key the record also sets is skipped, so the record's own value wins without
     /// either list being mutated.
     fn emit(&self, name: String, severity: Severity, fields: Vec<(Key, AnyValue)>) {
-        let Some(logger) = &self.logger else {
+        let Some(active) = &self.active else {
             return;
         };
 
         let enrichment = self.enrichment.attributes();
 
-        let mut record = logger.create_log_record();
+        let mut record = active.logger.create_log_record();
         record.set_timestamp(SystemTime::now());
         record.set_severity_number(severity);
         record.set_severity_text(severity.name());
@@ -261,7 +271,7 @@ impl Telemetry {
         );
         record.add_attributes(fields);
 
-        logger.emit(record);
+        active.logger.emit(record);
     }
 
     /// The enrichment attributes as a plain string map, for assertions.

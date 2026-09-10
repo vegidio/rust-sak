@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use super::composite_store::CompositeStore;
 use super::store::Store;
-use super::test_support::{ComputeFailed, CountingStore, FailingStore, LONG};
+use super::test_support::{ComputeFailed, CountingStore, FailingStore, LONG, bytes};
 use super::*;
 
 /// A TTL short enough to expire during a test, but long enough to survive a scheduler hiccup on a loaded machine.
@@ -301,7 +301,7 @@ fn a_disk_hit_is_promoted_into_memory() {
     let dir = TempDir::new().unwrap();
     let composite = CompositeStore::open(dir.path(), CacheOpts::new(), LONG).unwrap();
 
-    composite.disk.set("k", b"v", LONG).unwrap();
+    composite.disk.set("k", bytes(b"v"), LONG).unwrap();
     assert!(
         composite.memory.get("k").unwrap().is_none(),
         "the value should start out on disk only"
@@ -319,7 +319,7 @@ fn a_promote_ttl_of_zero_disables_promotion() {
     let dir = TempDir::new().unwrap();
     let composite = CompositeStore::open(dir.path(), CacheOpts::new(), Duration::ZERO).unwrap();
 
-    composite.disk.set("k", b"v", LONG).unwrap();
+    composite.disk.set("k", bytes(b"v"), LONG).unwrap();
     assert!(composite.get("k").unwrap().is_some());
 
     assert!(composite.memory.get("k").unwrap().is_none());
@@ -331,7 +331,10 @@ fn a_promoted_entry_never_outlives_the_disk_entry_it_came_from() {
     // An hour of promotion over an entry with a fraction of a second left.
     let composite = CompositeStore::open(dir.path(), CacheOpts::new(), Duration::from_secs(3600)).unwrap();
 
-    composite.disk.set("k", b"v", Duration::from_millis(200)).unwrap();
+    composite
+        .disk
+        .set("k", bytes(b"v"), Duration::from_millis(200))
+        .unwrap();
     composite.get("k").unwrap();
 
     let promoted = composite
@@ -352,7 +355,7 @@ fn a_write_lands_in_both_tiers() {
     let dir = TempDir::new().unwrap();
     let composite = CompositeStore::open(dir.path(), CacheOpts::new(), LONG).unwrap();
 
-    composite.set("k", b"v", LONG).unwrap();
+    composite.set("k", bytes(b"v"), LONG).unwrap();
 
     assert!(composite.memory.get("k").unwrap().is_some());
     assert!(composite.disk.get("k").unwrap().is_some());
@@ -416,7 +419,7 @@ fn a_composite_write_reports_the_disk_failure_over_the_memory_one() {
     // Too big for the memory budget, but perfectly writable to disk.
     let value = vec![0_u8; 4096];
     assert!(
-        composite.set("k", &value, LONG).is_ok(),
+        composite.set("k", bytes(&value), LONG).is_ok(),
         "one tier accepting the write makes it a success"
     );
     assert!(composite.disk.get("k").unwrap().is_some());
@@ -592,8 +595,8 @@ fn cleanup_removes_expired_entries_and_leaves_the_rest() {
     let dir = TempDir::new().unwrap();
     let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
 
-    store.set("stale", b"v", SHORT).unwrap();
-    store.set("fresh", b"v", LONG).unwrap();
+    store.set("stale", bytes(b"v"), SHORT).unwrap();
+    store.set("fresh", bytes(b"v"), LONG).unwrap();
     assert_eq!(store.record_count().unwrap(), 2);
 
     std::thread::sleep(EXPIRED);
@@ -614,7 +617,7 @@ fn cleanup_reclaims_the_space_expired_entries_held() {
 
     let payload = vec![0xAB_u8; 64 * 1024];
     for index in 0..64 {
-        store.set(&format!("k{index}"), &payload, SHORT).unwrap();
+        store.set(&format!("k{index}"), bytes(&payload), SHORT).unwrap();
     }
 
     let file = dir.path().join("memo.redb");
@@ -625,6 +628,27 @@ fn cleanup_reclaims_the_space_expired_entries_held() {
 
     let after = std::fs::metadata(&file).unwrap().len();
     assert!(after < before, "the file did not shrink: {before} -> {after}");
+}
+
+#[test]
+fn cleanup_does_not_compact_when_nothing_expired() {
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+
+    // Everything here is live, so the sweep has nothing to reclaim and must not pay for a compaction: it rewrites
+    // the whole file and excludes readers while it runs, which every open of a healthy cache would otherwise cost.
+    let payload = vec![0xAB_u8; 64 * 1024];
+    for index in 0..64 {
+        store.set(&format!("k{index}"), bytes(&payload), LONG).unwrap();
+    }
+
+    let file = dir.path().join("memo.redb");
+    let before = std::fs::metadata(&file).unwrap().len();
+
+    store.cleanup().unwrap();
+
+    let after = std::fs::metadata(&file).unwrap().len();
+    assert_eq!(after, before, "a sweep that removed nothing should not have compacted");
 }
 
 #[test]
@@ -643,7 +667,7 @@ fn a_disk_store_sweeps_once_in_the_background_when_it_opens() {
 
     {
         let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
-        store.set("stale", b"v", SHORT).unwrap();
+        store.set("stale", bytes(b"v"), SHORT).unwrap();
         assert_eq!(store.record_count().unwrap(), 1);
     }
 

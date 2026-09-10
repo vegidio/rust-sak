@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use tempfile::{Builder, NamedTempFile};
+use tempfile::Builder;
 
-use super::Result;
+use super::{NamedTempFile, Result};
 
 /// Creates a uniquely named temporary file under the system temporary directory.
 ///
@@ -13,7 +13,7 @@ use super::Result;
 ///
 /// Returns [`FsError::Io`](super::FsError::Io) if the file could not be created.
 pub fn mk_temp_file(prefix: &str) -> Result<NamedTempFile> {
-    Ok(Builder::new().prefix(prefix).tempfile()?)
+    Ok(NamedTempFile::new(Builder::new().prefix(prefix).tempfile()?))
 }
 
 /// Creates a uniquely named temporary file inside `directory`.
@@ -25,5 +25,7 @@ pub fn mk_temp_file(prefix: &str) -> Result<NamedTempFile> {
 ///
 /// Returns [`FsError::Io`](super::FsError::Io) if `directory` does not exist or the file could not be created.
 pub fn mk_temp_file_in(directory: impl AsRef<Path>, prefix: &str) -> Result<NamedTempFile> {
-    Ok(Builder::new().prefix(prefix).tempfile_in(directory)?)
+    Ok(NamedTempFile::new(
+        Builder::new().prefix(prefix).tempfile_in(directory)?,
+    ))
 }

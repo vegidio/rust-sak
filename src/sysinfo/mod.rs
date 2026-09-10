@@ -10,8 +10,9 @@
 //! in-band — an unnamed CPU becomes `"Unknown CPU"`, an unavailable core count becomes `None` — so there is no
 //! failure to report. Enumerating GPUs genuinely can fail.
 //!
-//! Nothing is cached. The CPU and total-memory figures never change while a machine is running, so a caller
-//! reading them often should hold onto the result rather than probe repeatedly.
+//! Nothing is cached apart from Linux's `pci.ids` database, which [`gpu_info`] reads at most once per process. The
+//! CPU and total-memory figures never change while a machine is running, so a caller reading them often should hold
+//! onto the result rather than probe repeatedly.
 //!
 //! What a GPU can report varies by platform and driver, which is why [`GpuInfo::vendor`] and [`GpuInfo::memory`]
 //! are optional — see `README.md` in this module for exactly what is available where.
@@ -43,7 +44,6 @@ mod memory;
 mod memory_info;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod pci_ids;
-#[allow(dead_code)]
 mod vendor;
 
 pub use cpu::CpuInfo;

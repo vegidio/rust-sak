@@ -74,6 +74,7 @@ pub(super) fn vendor_name(id: u16) -> Option<&'static str> {
 ///
 /// Matching is case-insensitive and substring-based, so `"NVIDIA GeForce RTX 3090"` and
 /// `"Intel(R) Arc(TM) A770"` both resolve.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(super) fn vendor_from_description(description: &str) -> Option<&'static str> {
     let haystack = description.to_ascii_lowercase();
     DESCRIPTIONS
@@ -86,6 +87,7 @@ pub(super) fn vendor_from_description(description: &str) -> Option<&'static str>
 ///
 /// Returns `None` for every driver not in [`SOC_DRIVERS`], which is what excludes framebuffer stubs and virtual
 /// devices from the results.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn gpu_from_driver(driver: &str) -> Option<(&'static str, &'static str)> {
     SOC_DRIVERS
         .iter()

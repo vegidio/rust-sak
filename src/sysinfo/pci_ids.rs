@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// Where a `pci.ids` database may live, in probe order.
 ///
@@ -52,10 +53,17 @@ pub(super) fn read_pci_ids_from(paths: &[&Path]) -> Option<String> {
 }
 
 /// Reads the first `pci.ids` database found among [`PCI_IDS_PATHS`].
-pub(super) fn read_pci_ids() -> Option<String> {
+fn read_pci_ids() -> Option<String> {
     let paths: Vec<&Path> = PCI_IDS_PATHS.iter().map(Path::new).collect();
     read_pci_ids_from(&paths)
 }
+
+/// The `pci.ids` database for this process, read at most once.
+///
+/// The file is around 1.5 MB and cannot meaningfully change while the process runs, so reading it afresh on every
+/// [`gpu_info`](super::gpu_info) call was pure waste. `None` means no database was found, which is the normal case
+/// on a minimal system. Tests call [`read_pci_ids_from`] directly to point at a temporary tree instead.
+pub(super) static PCI_IDS: LazyLock<Option<String>> = LazyLock::new(read_pci_ids);
 
 /// Looks a vendor and device pair up in a `pci.ids` database.
 ///

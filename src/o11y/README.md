@@ -22,7 +22,7 @@ use rust_sak::o11y::{Telemetry, TelemetryBuilder, Event, Value, Environment, Geo
 - **`Event`** — a record under construction, returned by `Telemetry::event`. Nothing is sent until a severity method is called.
 - **`Value`** — the field value type, with `From` impls for the everyday Rust types.
 - **`Environment`** — the deployment environment reported with every record.
-- **`Geolocation` / `fetch_geolocation`** — the optional IP-based location lookup, usable on its own.
+- **`Geolocation` / `fetch_geolocation`** — the optional IP-based location lookup, usable on its own. `fetch_geolocation_from` points it at another endpoint, and `fetch_geolocation_with` also chooses the timeout.
 - **`O11yError`** — construction and shutdown failures. **Emitting a record never fails.**
 
 The split between **configuration** (consumes `self`, returns `Self` — set up once) and **emit methods** (take `&self` — call many times) is what makes a single `Telemetry` shareable.
@@ -41,7 +41,8 @@ These consume `self` and return `Self`, so chain them. Only the endpoint and ser
 | `.enabled(bool)`                             | **`true`**          | Master switch. When `false`, **nothing leaves the process** and every record is discarded — but the handle stays fully usable. |
 | `.geolocation(bool)`                         | **`false`**         | Opt-in IP-based location enrichment. Ignored unless `.enabled(true)`.                                                          |
 | `.geolocation_url(impl Into<String>)`        | `https://ipinfo.io` | Point the lookup at a self-hosted or proxied endpoint. It requests `<base_url>/json`.                                          |
-| `.timeout(Duration)`                         | exporter default    | How long a single export attempt may take.                                                                                     |
+| `.timeout(Duration)`                         | exporter default    | How long a single **export** attempt may take. Reaches the OTLP exporter only, not the geolocation lookup.                     |
+| `.geolocation_timeout(Duration)`             | `1s`                | How long the geolocation lookup may take. Worth raising for a self-hosted endpoint behind a VPN or proxy.                      |
 | `.build()`                                   | —                   | `Result<Telemetry>`. Reports a bad endpoint, an unsendable header, or an exporter that could not be constructed.               |
 
 > Because the endpoint is always supplied programmatically, the `OTEL_EXPORTER_OTLP_*` environment variables are ignored.

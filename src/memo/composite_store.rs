@@ -48,15 +48,16 @@ impl Store for CompositeStore {
 
             // Best-effort. A promotion that is declined or fails costs a future hit, nothing more, and must not stop
             // this hit being returned.
-            let _ = self.memory.set(key, &entry.value, ttl);
+            let _ = self.memory.set(key, Arc::clone(&entry.value), ttl);
         }
 
         Ok(Some(entry))
     }
 
-    fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
-        // Both tiers are always visited, so a failing one cannot stop the other being written.
-        let disk = self.disk.set(key, value, ttl);
+    fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()> {
+        // Both tiers are always visited, so a failing one cannot stop the other being written. Both get the same
+        // allocation; only the refcount is duplicated.
+        let disk = self.disk.set(key, Arc::clone(&value), ttl);
         let memory = self.memory.set(key, value, ttl);
 
         match (disk, memory) {
@@ -74,9 +75,5 @@ impl Store for CompositeStore {
 
     fn path(&self) -> Option<&Path> {
         self.disk.path()
-    }
-
-    fn blocking(&self) -> bool {
-        true
     }
 }

@@ -32,21 +32,31 @@ impl fmt::Display for Limit {
 /// module's own, and the extraction ones are the security-relevant half: an archive entry is rejected *before* it is
 /// written, so a caller that sees [`FsError::IllegalPath`] or [`FsError::IllegalSymlink`] knows nothing landed outside
 /// the target directory.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FsError {
     /// An underlying filesystem, `tar` or `liblzma` operation failed.
-    Io(std::io::Error),
+    #[error("filesystem operation failed: {0}")]
+    Io(#[from] std::io::Error),
     /// The ZIP archive could not be read.
-    Zip(zip::result::ZipError),
+    #[error("zip archive could not be read: {0}")]
+    Zip(#[from] zip::result::ZipError),
     /// The 7z archive could not be read.
-    SevenZ(sevenz_rust2::Error),
+    #[error("7z archive could not be read: {0}")]
+    SevenZ(#[from] sevenz_rust2::Error),
     /// A name that must be non-empty was empty.
+    #[error("name must not be empty")]
     EmptyName,
     /// The user's configuration directory could not be determined for this platform.
+    #[error("the user configuration directory could not be determined")]
     NoConfigDir,
     /// The archive's extension is not one this module can extract.
-    UnknownArchiveFormat,
+    #[error("unknown archive format: {name}")]
+    UnknownArchiveFormat {
+        /// The file name that was rejected, so the caller can report which input was wrong.
+        name: String,
+    },
     /// An entry name was rejected before anything was written to disk.
+    #[error("illegal entry path {path:?}: {reason}")]
     IllegalPath {
         /// The offending name, exactly as the archive stored it.
         path: String,
@@ -54,6 +64,7 @@ pub enum FsError {
         reason: String,
     },
     /// A symbolic link would have pointed outside the target directory.
+    #[error("illegal symlink {link:?} pointing at {target:?}")]
     IllegalSymlink {
         /// The link's own name within the archive.
         link: String,
@@ -64,6 +75,7 @@ pub enum FsError {
     ///
     /// This is distinct from [`FsError::LimitExceeded`]: it fires even when no limits are configured, because the
     /// problem is the archive lying about itself rather than a policy the caller set.
+    #[error("entry {entry:?} produced more than the {declared} bytes it declared")]
     DeclaredSizeMismatch {
         /// The entry's name within the archive.
         entry: String,
@@ -71,68 +83,11 @@ pub enum FsError {
         declared: u64,
     },
     /// Extraction would have exceeded one of the configured ceilings.
+    #[error("extraction exceeded the configured {limit} limit of {allowed}")]
     LimitExceeded {
         /// Which ceiling was hit.
         limit: Limit,
         /// The configured value for that ceiling.
         allowed: u64,
     },
-}
-
-impl fmt::Display for FsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FsError::Io(err) => write!(f, "filesystem operation failed: {err}"),
-            FsError::Zip(err) => write!(f, "zip archive could not be read: {err}"),
-            FsError::SevenZ(err) => write!(f, "7z archive could not be read: {err}"),
-            FsError::EmptyName => f.write_str("name must not be empty"),
-            FsError::NoConfigDir => f.write_str("the user configuration directory could not be determined"),
-            FsError::UnknownArchiveFormat => f.write_str("unknown archive format"),
-            FsError::IllegalPath { path, reason } => write!(f, "illegal entry path {path:?}: {reason}"),
-            FsError::IllegalSymlink { link, target } => {
-                write!(f, "illegal symlink {link:?} pointing at {target:?}")
-            }
-            FsError::DeclaredSizeMismatch { entry, declared } => {
-                write!(f, "entry {entry:?} produced more than the {declared} bytes it declared")
-            }
-            FsError::LimitExceeded { limit, allowed } => {
-                write!(f, "extraction exceeded the configured {limit} limit of {allowed}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for FsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            FsError::Io(err) => Some(err),
-            FsError::Zip(err) => Some(err),
-            FsError::SevenZ(err) => Some(err),
-            FsError::EmptyName
-            | FsError::NoConfigDir
-            | FsError::UnknownArchiveFormat
-            | FsError::IllegalPath { .. }
-            | FsError::IllegalSymlink { .. }
-            | FsError::DeclaredSizeMismatch { .. }
-            | FsError::LimitExceeded { .. } => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for FsError {
-    fn from(err: std::io::Error) -> Self {
-        FsError::Io(err)
-    }
-}
-
-impl From<zip::result::ZipError> for FsError {
-    fn from(err: zip::result::ZipError) -> Self {
-        FsError::Zip(err)
-    }
-}
-
-impl From<sevenz_rust2::Error> for FsError {
-    fn from(err: sevenz_rust2::Error) -> Self {
-        FsError::SevenZ(err)
-    }
 }

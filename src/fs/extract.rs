@@ -55,20 +55,17 @@ pub(super) struct RawEntry<'a> {
 ///
 /// Every ceiling is an [`Option`] where [`None`] means "no ceiling". Nothing here uses zero as a magic value, so
 /// `max_entries(0)` rejects the first entry instead of silently meaning "unlimited".
-pub(super) struct Budget {
-    max_total_bytes: Option<u64>,
-    max_file_bytes: Option<u64>,
-    max_entries: Option<u64>,
+pub(super) struct Budget<'a> {
+    /// The ceilings, read straight from the caller's options so there is only ever one copy of the policy.
+    options: &'a ExtractOptions,
     pub(super) used_bytes: u64,
     used_entries: u64,
 }
 
-impl Budget {
-    pub(super) fn new(options: &ExtractOptions) -> Self {
+impl<'a> Budget<'a> {
+    pub(super) fn new(options: &'a ExtractOptions) -> Self {
         Self {
-            max_total_bytes: options.max_total_bytes,
-            max_file_bytes: options.max_file_bytes,
-            max_entries: options.max_entries,
+            options,
             used_bytes: 0,
             used_entries: 0,
         }
@@ -80,7 +77,7 @@ impl Budget {
     /// padding an archive with entries that produce nothing cannot buy room under the cap.
     pub(super) fn count_entry(&mut self) -> Result<()> {
         self.used_entries += 1;
-        match self.max_entries {
+        match self.options.max_entries {
             Some(max) if self.used_entries > max => Err(FsError::LimitExceeded {
                 limit: Limit::Entries,
                 allowed: max,
@@ -94,7 +91,7 @@ impl Budget {
     /// Reserving up front is the point: a header claiming to be tiny must not be able to get a file handle open and
     /// then stream gigabytes through it. Whatever is not used is handed back by [`Budget::settle`].
     pub(super) fn reserve(&mut self, declared: u64) -> Result<()> {
-        if let Some(max) = self.max_file_bytes
+        if let Some(max) = self.options.max_file_bytes
             && declared > max
         {
             return Err(FsError::LimitExceeded {
@@ -103,7 +100,7 @@ impl Budget {
             });
         }
 
-        if let Some(max) = self.max_total_bytes
+        if let Some(max) = self.options.max_total_bytes
             && self.used_bytes.saturating_add(declared) > max
         {
             return Err(FsError::LimitExceeded {
@@ -134,7 +131,7 @@ impl Budget {
 pub(super) struct Extractor<'a> {
     root: ExtractRoot,
     options: &'a ExtractOptions,
-    budget: Budget,
+    budget: Budget<'a>,
     dir_modes: Vec<(PathBuf, u32)>,
     summary: ExtractSummary,
 }
@@ -213,8 +210,11 @@ impl<'a> Extractor<'a> {
         self.summary.directories += 1;
 
         if let Some(mode) = mode {
-            self.dir_modes
-                .push((path.to_path_buf(), permissions(mode, DEFAULT_DIR_MODE)));
+            let mode = match permissions(mode) {
+                0 => DEFAULT_DIR_MODE,
+                bits => bits,
+            };
+            self.dir_modes.push((path.to_path_buf(), mode));
         }
 
         Ok(())
@@ -225,11 +225,7 @@ impl<'a> Extractor<'a> {
         let declared = entry.size;
         self.budget.reserve(declared)?;
 
-        let mode = self
-            .options
-            .file_mode
-            .or(entry.mode)
-            .map(|mode| permissions(mode, mode));
+        let mode = self.options.file_mode.or(entry.mode).map(permissions);
         let mut writer = BufWriter::new(self.root.create_file(path, mode)?);
 
         // Reading one byte past the declared size is what turns "the header lied" into an error instead of a file
@@ -255,7 +251,7 @@ impl<'a> Extractor<'a> {
     fn visit_symlink(
         &mut self,
         entry: &RawEntry<'_>,
-        components: &[String],
+        components: &[&str],
         path: &Path,
         data: &mut dyn Read,
     ) -> Result<()> {
@@ -293,12 +289,12 @@ fn read_link_target(data: &mut dyn Read) -> Result<String> {
     Ok(target.trim_end_matches(['\r', '\n', '\0']).to_string())
 }
 
-/// Reduces an archive's recorded mode to permission bits, falling back to `default` when it records nothing usable.
+/// Reduces an archive's recorded mode to permission bits.
 ///
 /// Masking with `0o777` is what keeps setuid, setgid and the sticky bit from surviving extraction — an archive must
 /// never be able to leave a setuid binary behind. It also strips the file-type bits, which `zip` includes in the mode
-/// it reports.
-pub(super) fn permissions(mode: u32, default: u32) -> u32 {
-    let permissions = mode & 0o777;
-    if permissions == 0 { default & 0o777 } else { permissions }
+/// it reports. A mode recording nothing usable comes back as `0`; choosing what to do about that is the caller's,
+/// since only directories have a default worth falling back to.
+pub(super) fn permissions(mode: u32) -> u32 {
+    mode & 0o777
 }

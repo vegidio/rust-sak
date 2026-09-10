@@ -10,7 +10,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 
 use super::enrichment::Enrichment;
-use super::geolocation::{self, fetch_geolocation_from};
+use super::geolocation::{self, fetch_geolocation_with};
 use super::{Environment, O11yError, Result, Telemetry};
 
 /// The `deployment.environment.name` attribute, from OpenTelemetry semantic conventions v1.27.
@@ -56,6 +56,8 @@ pub struct TelemetryBuilder {
     geolocation_url: String,
     /// Export timeout. `None` leaves the exporter default in place.
     timeout: Option<Duration>,
+    /// How long the geolocation lookup may take. Separate from `timeout`, which reaches only the OTLP exporter.
+    geolocation_timeout: Duration,
 }
 
 impl TelemetryBuilder {
@@ -71,6 +73,7 @@ impl TelemetryBuilder {
             geolocation: false,
             geolocation_url: geolocation::DEFAULT_URL.to_string(),
             timeout: None,
+            geolocation_timeout: geolocation::DEFAULT_TIMEOUT,
         }
     }
 
@@ -138,9 +141,22 @@ impl TelemetryBuilder {
         self
     }
 
-    /// Sets how long a single export attempt may take. Defaults to the OTLP exporter's own timeout.
+    /// Sets how long a single **export** attempt may take. Defaults to the OTLP exporter's own timeout.
+    ///
+    /// This reaches the OTLP exporter only. The geolocation lookup has its own budget — see
+    /// [`geolocation_timeout`](TelemetryBuilder::geolocation_timeout).
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how long the geolocation lookup may take. Defaults to one second.
+    ///
+    /// Worth raising for a self-hosted [`geolocation_url`](TelemetryBuilder::geolocation_url), which may sit behind
+    /// a VPN or a proxy. The lookup runs on a background thread either way, so this never delays
+    /// [`build`](TelemetryBuilder::build); it only decides how long that thread waits before giving up.
+    pub fn geolocation_timeout(mut self, timeout: Duration) -> Self {
+        self.geolocation_timeout = timeout;
         self
     }
 
@@ -199,8 +215,9 @@ impl TelemetryBuilder {
         if self.geolocation {
             let enrichment = Arc::clone(&enrichment);
             let url = self.geolocation_url;
+            let geolocation_timeout = self.geolocation_timeout;
             std::thread::spawn(move || {
-                if let Ok(geo) = fetch_geolocation_from(&url) {
+                if let Ok(geo) = fetch_geolocation_with(&url, geolocation_timeout) {
                     enrichment.set_location(&geo);
                 }
             });

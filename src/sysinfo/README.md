@@ -25,9 +25,9 @@ rust-sak = { version = "1", features = ["sysinfo"] }
 
 `cpu_info` and `memory_info` are **infallible**. The platform calls behind them report "unknown" in-band rather than failing — an unnamed processor becomes `"Unknown CPU"`, an unavailable physical-core count becomes `None` — so there is no error to propagate and no `?` to write. Enumerating GPUs genuinely can fail, so `gpu_info` returns a `Result`.
 
-### Nothing is cached
+### Results are not cached
 
-Every call probes afresh. The CPU figures and total RAM cannot change while a machine is running, so hold onto them rather than probing in a loop:
+Every call probes the hardware afresh. The CPU figures and total RAM cannot change while a machine is running, so hold onto them rather than probing in a loop:
 
 ```rust
 use std::sync::OnceLock;
@@ -37,7 +37,7 @@ static CPU: OnceLock<CpuInfo> = OnceLock::new();
 let cpu = CPU.get_or_init(cpu_info);
 ```
 
-On Linux `gpu_info` reads the ~1.5 MB `pci.ids` database once per call, so it is the one worth calling sparingly.
+The one exception is the ~1.5 MB `pci.ids` database `gpu_info` consults on Linux for model names: it cannot meaningfully change while the process runs, so it is read at most once per process rather than once per call. The GPU probe itself still runs every time.
 
 ## Types
 

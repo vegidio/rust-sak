@@ -1,3 +1,5 @@
+use super::vendor::{vendor_from_description, vendor_name};
+
 /// A graphics adapter detected on this machine.
 ///
 /// Returned by [`gpu_info`](super::gpu_info). Both optional fields distinguish *"the platform says this does not
@@ -18,4 +20,33 @@ pub struct GpuInfo {
     /// only reports VRAM for `amdgpu` — Intel, `nouveau` and the proprietary NVIDIA driver expose nothing. This is
     /// never `Some(0)`.
     pub memory: Option<u64>,
+}
+
+impl GpuInfo {
+    /// Builds an adapter from what a platform backend decoded, applying the conventions this type documents.
+    ///
+    /// An adapter whose name is empty or blank is dropped: one that cannot be named is not worth reporting. The
+    /// vendor is resolved from the numeric PCI id first and falls back to sniffing the model string, which is how a
+    /// machine reporting only `"AMD Radeon Pro 5500M"` still resolves to `"AMD"`. A zero memory figure becomes
+    /// `None`, because integrated and unified-memory GPUs own no VRAM rather than owning none.
+    ///
+    /// The DXGI and IORegistry backends both build adapters this way. The `sysfs` backend does not: on Linux the
+    /// `pci.ids` database gives a better vendor string than either source here, so it resolves its own.
+    pub(super) fn from_parts(name: &str, vendor_id: Option<u16>, memory: Option<u64>) -> Option<GpuInfo> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let vendor = vendor_id
+            .and_then(vendor_name)
+            .or_else(|| vendor_from_description(name))
+            .map(str::to_string);
+
+        Some(GpuInfo {
+            name: name.to_string(),
+            vendor,
+            memory: memory.filter(|bytes| *bytes > 0),
+        })
+    }
 }

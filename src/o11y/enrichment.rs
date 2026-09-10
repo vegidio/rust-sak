@@ -2,11 +2,20 @@
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use opentelemetry::Key;
 use opentelemetry::logs::AnyValue;
+use opentelemetry::{Key, StringValue};
 
 use super::Geolocation;
 use super::machine_id::machine_id;
+
+/// Wraps an owned string as a **reference-counted** attribute value.
+///
+/// `AnyValue::from(String)` stores a `Box<str>`, so every clone of it allocates — and the whole enrichment list is
+/// cloned into each record emitted. Reference-counting instead makes those clones a refcount bump. `machine.os` and
+/// `machine.arch` need none of this: they are `&'static str`, which is already free to clone.
+fn shared(value: impl Into<Arc<str>>) -> AnyValue {
+    AnyValue::String(StringValue::from(value.into()))
+}
 
 /// Attribute keys. Kept as constants so the emit path and the tests cannot drift apart.
 pub(super) const VERSION: &str = "version";
@@ -42,10 +51,10 @@ impl Enrichment {
     /// `machine.os` and `machine.arch` carry Rust's own platform names (`macos`/`x86_64`), not Go's
     /// (`darwin`/`amd64`).
     pub(super) fn new(version: &str, service: &str) -> Self {
-        let mut base = vec![(Key::from_static_str(VERSION), AnyValue::from(version.to_string()))];
+        let mut base = vec![(Key::from_static_str(VERSION), shared(version))];
 
         if let Some(id) = machine_id(service) {
-            base.push((Key::from_static_str(MACHINE_ID), AnyValue::from(id)));
+            base.push((Key::from_static_str(MACHINE_ID), shared(id)));
         }
 
         base.push((Key::from_static_str(MACHINE_OS), AnyValue::from(std::env::consts::OS)));
@@ -90,7 +99,7 @@ impl Enrichment {
                 (LOCATION_CITY, geo.city.as_deref()),
             ] {
                 if let Some(value) = value.filter(|v| !v.is_empty()) {
-                    base.push((Key::from_static_str(key), AnyValue::from(value.to_string())));
+                    base.push((Key::from_static_str(key), shared(value)));
                 }
             }
         }
@@ -108,7 +117,7 @@ impl Enrichment {
 
         let mut attributes = Vec::with_capacity(base.len() + 1);
         attributes.extend(base.iter().cloned());
-        attributes.push((Key::from_static_str(SESSION_ID), AnyValue::from(session_id.clone())));
+        attributes.push((Key::from_static_str(SESSION_ID), shared(session_id.as_str())));
 
         *self.rendered.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(attributes);
     }

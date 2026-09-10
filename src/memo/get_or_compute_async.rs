@@ -9,7 +9,9 @@ use serde::de::DeserializeOwned;
 
 use super::flight::{Call, Outcome};
 use super::store::Entry;
-use super::{Memo, MemoError, Result, flight, flight_key, header, resolve};
+use super::{
+    Memo, Result, decode_entry, encode_or_publish, flight, flight_key, header, publish_compute_error, resolve,
+};
 
 impl Memo {
     /// The `async` counterpart of [`get_or_compute`](Memo::get_or_compute), for computations that are themselves
@@ -62,7 +64,7 @@ impl Memo {
             return Ok(value);
         }
 
-        let mut leader = match self.flight.enter(&flight_key(fingerprint, key)) {
+        let mut leader = match self.flight.enter(flight_key(fingerprint, key)) {
             flight::Entry::Follower(call) => return resolve(Waiter { call }.await, fingerprint),
             flight::Entry::Leader(leader) => leader,
         };
@@ -76,24 +78,14 @@ impl Memo {
         // The leader guard is held across this await, which is what lets a dropped future release the followers.
         let value = match compute().await {
             Ok(value) => value,
-            Err(err) => {
-                let err: Arc<dyn std::error::Error + Send + Sync> = Arc::new(err);
-                leader.publish(Outcome::Compute(Arc::clone(&err)));
-                return Err(MemoError::Compute(err));
-            }
+            Err(err) => return Err(publish_compute_error(&mut leader, err)),
         };
 
-        let bytes = match header::encode(fingerprint, &value) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                leader.publish(Outcome::Encode(err.clone()));
-                return Err(MemoError::Encode(err));
-            }
-        };
+        let bytes = encode_or_publish(&mut leader, fingerprint, &value)?;
 
-        self.store_set(key, &bytes, ttl).await;
+        self.store_set(key, Arc::clone(&bytes), ttl).await;
 
-        leader.publish(Outcome::Ready(Arc::from(bytes)));
+        leader.publish(Outcome::Ready(bytes));
         Ok(value)
     }
 
@@ -102,15 +94,14 @@ impl Memo {
     where
         T: DeserializeOwned,
     {
-        let bytes = self.store_get(key).await?.value;
-        let value = header::decode(fingerprint, &bytes)?;
-
-        Some((Arc::from(bytes), value))
+        decode_entry(fingerprint, self.store_get(key).await?.value)
     }
 
     /// Reads one raw entry. A store failure — or a `spawn_blocking` that could not run — is a miss.
     async fn store_get(&self, key: &str) -> Option<Entry> {
-        if !self.store.blocking() {
+        // A store with no directory keeps everything in memory, so calling it inline beats a `spawn_blocking`
+        // round-trip, which costs more than the moka lookup it would be wrapping.
+        if self.store.path().is_none() {
             return self.store.get(key).ok().flatten();
         }
 
@@ -125,17 +116,19 @@ impl Memo {
     }
 
     /// Writes one raw entry, best-effort. A store failure, or a task that could not run, costs a future hit.
-    async fn store_set(&self, key: &str, value: &[u8], ttl: Duration) {
-        if !self.store.blocking() {
+    async fn store_set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) {
+        // As `store_get`: no directory means no blocking I/O to move off the runtime.
+        if self.store.path().is_none() {
             let _ = self.store.set(key, value, ttl);
             return;
         }
 
         let store = Arc::clone(&self.store);
         let key = key.to_owned();
-        let value = value.to_vec();
 
-        let _ = tokio::task::spawn_blocking(move || store.set(&key, &value, ttl)).await;
+        // The `Arc` moves into the task, so handing the value to a blocking store costs a refcount bump rather
+        // than a copy of the whole payload.
+        let _ = tokio::task::spawn_blocking(move || store.set(&key, value, ttl)).await;
     }
 }
 

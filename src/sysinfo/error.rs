@@ -1,5 +1,3 @@
-use std::fmt;
-
 /// A convenience alias for results returned by this module.
 pub type Result<T> = std::result::Result<T, SysinfoError>;
 
@@ -12,14 +10,16 @@ pub type Result<T> = std::result::Result<T, SysinfoError>;
 /// **An empty GPU list is not an error.** A headless server, a virtual machine with no display adapter, or a
 /// container without `/sys` mounted all yield `Ok(vec![])`. These variants report a probe that *could not run*,
 /// never a probe that ran and found nothing.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SysinfoError {
     /// Enumerating the graphics devices in the filesystem failed.
     ///
     /// Linux only: reading `/sys/class/drm` was refused. A *missing* `/sys/class/drm` is not an error — a machine
     /// with no DRM subsystem genuinely has no cards to report.
-    Io(std::io::Error),
+    #[error("reading the graphics devices failed: {0}")]
+    Io(#[from] std::io::Error),
     /// An operating-system graphics call returned a failure status.
+    #[error("{call} failed with status {code:#010x}")]
     GpuApi {
         /// The entry point that failed, e.g. `"IOServiceGetMatchingServices"` or `"CreateDXGIFactory1"`.
         call: &'static str,
@@ -27,33 +27,9 @@ pub enum SysinfoError {
         code: i32,
     },
     /// GPU detection has no implementation for this operating system.
+    #[error("gpu detection is not supported on {os}")]
     UnsupportedPlatform {
         /// The operating system, as [`std::env::consts::OS`] names it.
         os: &'static str,
     },
-}
-
-impl fmt::Display for SysinfoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SysinfoError::Io(err) => write!(f, "reading the graphics devices failed: {err}"),
-            SysinfoError::GpuApi { call, code } => write!(f, "{call} failed with status {code:#010x}"),
-            SysinfoError::UnsupportedPlatform { os } => write!(f, "gpu detection is not supported on {os}"),
-        }
-    }
-}
-
-impl std::error::Error for SysinfoError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SysinfoError::Io(err) => Some(err),
-            SysinfoError::GpuApi { .. } | SysinfoError::UnsupportedPlatform { .. } => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for SysinfoError {
-    fn from(err: std::io::Error) -> Self {
-        SysinfoError::Io(err)
-    }
 }

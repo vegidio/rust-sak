@@ -12,7 +12,6 @@
 //! Only [`gpus`] is macOS-specific. The decoding below is compiled everywhere so it stays testable from any host.
 
 use super::gpu::GpuInfo;
-use super::vendor::{vendor_from_description, vendor_name};
 
 /// Decodes an IORegistry `vendor-id`, which is stored as little-endian bytes rather than a number.
 ///
@@ -43,21 +42,7 @@ pub(super) fn data_string(bytes: &[u8]) -> Option<String> {
 /// falls back to the model string when the numeric id is missing or unrecognised, which is how a machine reporting
 /// only `"AMD Radeon Pro 5500M"` still resolves to `"AMD"`.
 pub(super) fn gpu_from_properties(model: Option<&str>, vendor_id: Option<u16>, vram: Option<u64>) -> Option<GpuInfo> {
-    let name = model?.trim();
-    if name.is_empty() {
-        return None;
-    }
-
-    let vendor = vendor_id
-        .and_then(vendor_name)
-        .or_else(|| vendor_from_description(name))
-        .map(str::to_string);
-
-    Some(GpuInfo {
-        name: name.to_string(),
-        vendor,
-        memory: vram.filter(|bytes| *bytes > 0),
-    })
+    GpuInfo::from_parts(model?, vendor_id, vram)
 }
 
 /// Converts a VRAM figure reported in mebibytes into bytes.

@@ -1,6 +1,6 @@
 [package]
 name = "rust-sak"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
@@ -28,6 +28,7 @@ sha2 = { version = "0.11.0", optional = true }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"], optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3.27", optional = true }
+thiserror = { version = "2.0.20", optional = true }
 tokio = { version = "1.52.3", features = ["time", "rt-multi-thread", "macros", "fs", "io-util", "sync"], optional = true }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64", "alloc"], optional = true }
 uuid = { version = "1.26.0", default-features = false, features = ["v4"], optional = true }
@@ -75,11 +76,12 @@ fs = [
     "dep:sevenz-rust2",
     "dep:tar",
     "dep:tempfile",
+    "dep:thiserror",
     "dep:walkdir",
     "dep:zip",
 ]
-image = ["dep:image", "dep:webp", "dep:avif", "dep:heif"]
-memo = ["dep:hex", "dep:moka", "dep:postcard", "dep:redb", "dep:serde", "dep:serde_json", "dep:sha2"]
+image = ["dep:image", "dep:webp", "dep:avif", "dep:heif", "dep:thiserror"]
+memo = ["dep:hex", "dep:moka", "dep:postcard", "dep:redb", "dep:serde", "dep:serde_json", "dep:sha2", "dep:thiserror"]
 memo-async = ["memo", "dep:tokio"]
 o11y = [
     "dep:hex",
@@ -92,10 +94,11 @@ o11y = [
     "dep:serde",
     "dep:serde_json",
     "dep:sha2",
+    "dep:thiserror",
     "dep:uuid",
     "reqwest/blocking",
 ]
-sysinfo = ["dep:objc2-core-foundation", "dep:objc2-io-kit", "dep:sysinfo", "dep:windows"]
+sysinfo = ["dep:objc2-core-foundation", "dep:objc2-io-kit", "dep:sysinfo", "dep:thiserror", "dep:windows"]
 
 [[bin]]
 name = "playground"

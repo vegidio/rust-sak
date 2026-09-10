@@ -163,7 +163,7 @@ impl Memo {
     ///
     /// Returns [`MemoError::Storage`] if the store fails.
     pub fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.store.get(key)?.map(|entry| entry.value))
+        Ok(self.store.get(key)?.map(|entry| entry.value.to_vec()))
     }
 
     /// Writes raw bytes under `key`, to be served for at most `ttl`.
@@ -173,7 +173,7 @@ impl Memo {
     /// Returns [`MemoError::NotAdmitted`] if the cache declined the write — a zero `ttl`, or a value larger than the
     /// whole memory budget — and [`MemoError::Storage`] if the store failed.
     pub fn set_bytes(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
-        self.store.set(key, value, ttl)
+        self.store.set(key, Arc::from(value), ttl)
     }
 
     /// Returns the value cached under `key`, running `compute` only when there is not one.
@@ -217,11 +217,11 @@ impl Memo {
     {
         let fingerprint = header::fingerprint::<T>();
 
-        if let Some(value) = self.load(key, fingerprint) {
+        if let Some((_, value)) = self.load_raw(key, fingerprint) {
             return Ok(value);
         }
 
-        let mut leader = match self.flight.enter(&flight_key(fingerprint, key)) {
+        let mut leader = match self.flight.enter(flight_key(fingerprint, key)) {
             flight::Entry::Follower(call) => return resolve(call.wait(), fingerprint),
             flight::Entry::Leader(leader) => leader,
         };
@@ -235,49 +235,42 @@ impl Memo {
 
         let value = match compute() {
             Ok(value) => value,
-            Err(err) => {
-                let err: Arc<dyn std::error::Error + Send + Sync> = Arc::new(err);
-                leader.publish(Outcome::Compute(Arc::clone(&err)));
-                return Err(MemoError::Compute(err));
-            }
+            Err(err) => return Err(publish_compute_error(&mut leader, err)),
         };
 
-        let bytes = match header::encode(fingerprint, &value) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                leader.publish(Outcome::Encode(err.clone()));
-                return Err(MemoError::Encode(err));
-            }
-        };
+        let bytes = encode_or_publish(&mut leader, fingerprint, &value)?;
 
         // Best-effort by design: a store that cannot take this value costs a future hit, nothing more.
-        let _ = self.store.set(key, &bytes, ttl);
+        let _ = self.store.set(key, Arc::clone(&bytes), ttl);
 
-        leader.publish(Outcome::Ready(Arc::from(bytes)));
+        leader.publish(Outcome::Ready(bytes));
         Ok(value)
     }
 
-    /// Reads and decodes the entry under `key`, or `None` if there is nothing this caller can use.
+    /// Reads and decodes the entry under `key`, handing back the stored bytes alongside the value so a leader can
+    /// publish them to its followers. `None` when there is nothing this caller can use.
     ///
     /// A store failure is a miss, exactly as an absent key is: a cache that cannot be read must not break the call
     /// path it is meant to speed up.
-    fn load<T>(&self, key: &str, fingerprint: u64) -> Option<T>
-    where
-        T: DeserializeOwned,
-    {
-        self.load_raw(key, fingerprint).map(|(_, value)| value)
-    }
-
-    /// As [`Memo::load`], but also hands back the stored bytes so a leader can publish them to its followers.
     fn load_raw<T>(&self, key: &str, fingerprint: u64) -> Option<(Arc<[u8]>, T)>
     where
         T: DeserializeOwned,
     {
-        let bytes = self.store.get(key).ok().flatten()?.value;
-        let value = header::decode(fingerprint, &bytes)?;
-
-        Some((Arc::from(bytes), value))
+        decode_entry(fingerprint, self.store.get(key).ok().flatten()?.value)
     }
+}
+
+/// Decodes stored bytes, handing them back alongside the value.
+///
+/// The bytes travel with the value because a leader publishes them to its followers verbatim, so every caller gets
+/// byte-identical data. Shared with the async loader, which differs only in how it reads the entry.
+fn decode_entry<T>(fingerprint: u64, bytes: Arc<[u8]>) -> Option<(Arc<[u8]>, T)>
+where
+    T: DeserializeOwned,
+{
+    let value = header::decode(fingerprint, &bytes)?;
+
+    Some((bytes, value))
 }
 
 /// The key one computation is deduplicated under.
@@ -286,6 +279,35 @@ impl Memo {
 /// computations and cannot be handed each other's bytes.
 fn flight_key(fingerprint: u64, key: &str) -> String {
     format!("{fingerprint:016x}\0{key}")
+}
+
+/// Encodes `value`, publishing the failure to the followers if it cannot be encoded.
+///
+/// Shared by the synchronous and async leaders so the publish protocol — which [`Outcome`] goes out on which path —
+/// is stated once. Nothing here awaits, which is what lets both paths use it.
+fn encode_or_publish<T>(leader: &mut flight::Leader<'_>, fingerprint: u64, value: &T) -> Result<Arc<[u8]>>
+where
+    T: Serialize,
+{
+    match header::encode(fingerprint, value) {
+        Ok(bytes) => Ok(Arc::from(bytes)),
+        Err(err) => {
+            leader.publish(Outcome::Encode(err.clone()));
+            Err(MemoError::Encode(err))
+        }
+    }
+}
+
+/// Publishes a failed computation to the followers and returns the error the leader itself should report.
+///
+/// As [`encode_or_publish`], shared so that both paths hand followers the very same error instance.
+fn publish_compute_error<E>(leader: &mut flight::Leader<'_>, err: E) -> MemoError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let err: Arc<dyn std::error::Error + Send + Sync> = Arc::new(err);
+    leader.publish(Outcome::Compute(Arc::clone(&err)));
+    MemoError::Compute(err)
 }
 
 /// Turns what a leader published into this caller's result.

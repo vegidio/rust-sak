@@ -14,7 +14,7 @@ use super::*;
 
 /// Splits a validated entry name, panicking on rejection — for cases where acceptance is the precondition, not the
 /// thing under test.
-fn components(name: &str) -> Vec<String> {
+fn components(name: &str) -> Vec<&str> {
     validate_entry_name(name).expect("name should be accepted")
 }
 
@@ -93,7 +93,7 @@ fn mk_temp_dir_removes_the_directory_on_drop() {
 #[test]
 fn mk_temp_dir_keeps_the_directory_when_kept() {
     let dir = mk_temp_dir("rust_sak_fs_").unwrap();
-    let path = dir.keep();
+    let path = dir.keep().unwrap();
 
     assert!(path.is_dir());
     fs::remove_dir_all(&path).unwrap();
@@ -994,7 +994,8 @@ fn move_files_reports_the_same_counts_as_a_copy() {
 
 #[test]
 fn budget_allows_everything_when_no_limits_are_set() {
-    let mut budget = Budget::new(&ExtractOptions::new());
+    let options = ExtractOptions::new();
+    let mut budget = Budget::new(&options);
 
     for _ in 0..1_000 {
         budget.count_entry().unwrap();
@@ -1004,7 +1005,8 @@ fn budget_allows_everything_when_no_limits_are_set() {
 
 #[test]
 fn budget_counts_entries_against_the_entry_limit() {
-    let mut budget = Budget::new(&ExtractOptions::new().max_entries(2));
+    let options = ExtractOptions::new().max_entries(2);
+    let mut budget = Budget::new(&options);
 
     budget.count_entry().unwrap();
     budget.count_entry().unwrap();
@@ -1022,7 +1024,8 @@ fn budget_counts_entries_against_the_entry_limit() {
 #[test]
 fn budget_of_zero_entries_rejects_the_very_first_entry() {
     // The behaviour Go's "0 means unlimited" convention cannot express at all.
-    let mut budget = Budget::new(&ExtractOptions::new().max_entries(0));
+    let options = ExtractOptions::new().max_entries(0);
+    let mut budget = Budget::new(&options);
 
     assert!(matches!(
         budget.count_entry(),
@@ -1035,7 +1038,8 @@ fn budget_of_zero_entries_rejects_the_very_first_entry() {
 
 #[test]
 fn budget_rejects_an_entry_larger_than_the_file_limit() {
-    let mut budget = Budget::new(&ExtractOptions::new().max_file_bytes(10));
+    let options = ExtractOptions::new().max_file_bytes(10);
+    let mut budget = Budget::new(&options);
 
     budget.reserve(10).unwrap();
 
@@ -1051,7 +1055,8 @@ fn budget_rejects_an_entry_larger_than_the_file_limit() {
 
 #[test]
 fn budget_rejects_entries_that_together_exceed_the_total_limit() {
-    let mut budget = Budget::new(&ExtractOptions::new().max_total_bytes(10));
+    let options = ExtractOptions::new().max_total_bytes(10);
+    let mut budget = Budget::new(&options);
 
     budget.reserve(6).unwrap();
 
@@ -1068,7 +1073,8 @@ fn budget_rejects_entries_that_together_exceed_the_total_limit() {
 #[test]
 fn budget_reserves_the_declared_size_before_anything_is_written() {
     // A header claiming 100 bytes must consume 100 bytes of budget up front, not zero.
-    let mut budget = Budget::new(&ExtractOptions::new().max_total_bytes(100));
+    let options = ExtractOptions::new().max_total_bytes(100);
+    let mut budget = Budget::new(&options);
 
     budget.reserve(100).unwrap();
     assert_eq!(budget.used_bytes, 100);
@@ -1077,7 +1083,8 @@ fn budget_reserves_the_declared_size_before_anything_is_written() {
 
 #[test]
 fn budget_hands_back_what_an_over_declared_entry_did_not_use() {
-    let mut budget = Budget::new(&ExtractOptions::new().max_total_bytes(10));
+    let options = ExtractOptions::new().max_total_bytes(10);
+    let mut budget = Budget::new(&options);
 
     budget.reserve(8).unwrap();
     budget.settle(8, 2);
@@ -1089,7 +1096,8 @@ fn budget_hands_back_what_an_over_declared_entry_did_not_use() {
 
 #[test]
 fn budget_settling_an_exact_entry_changes_nothing() {
-    let mut budget = Budget::new(&ExtractOptions::new().max_total_bytes(10));
+    let options = ExtractOptions::new().max_total_bytes(10);
+    let mut budget = Budget::new(&options);
 
     budget.reserve(5).unwrap();
     budget.settle(5, 5);
@@ -1210,11 +1218,13 @@ fn build_zip(entries: &[TestEntry]) -> Vec<u8> {
 
 /// Writes archive bytes to a temporary file with the given extension and returns the handle.
 fn archive_file(bytes: &[u8], extension: &str) -> NamedTempFile {
-    let file = tempfile::Builder::new()
-        .prefix("rust_sak_fs_")
-        .suffix(extension)
-        .tempfile()
-        .unwrap();
+    let file = NamedTempFile::new(
+        tempfile::Builder::new()
+            .prefix("rust_sak_fs_")
+            .suffix(extension)
+            .tempfile()
+            .unwrap(),
+    );
     fs::write(file.path(), bytes).unwrap();
 
     file
@@ -1584,16 +1594,17 @@ fn unzip_strips_the_file_type_bits_an_archive_records() {
 fn permissions_strips_setuid_setgid_and_sticky_bits() {
     // `zip`'s writer masks modes to 0o777, so these can only be reached directly — the mask itself is the guarantee
     // that an archive can never leave a setuid binary behind.
-    assert_eq!(permissions(0o4755, 0o644), 0o755, "setuid must not survive");
-    assert_eq!(permissions(0o2755, 0o644), 0o755, "setgid must not survive");
-    assert_eq!(permissions(0o1777, 0o644), 0o777, "the sticky bit must not survive");
-    assert_eq!(permissions(0o104_755, 0o644), 0o755, "type bits must not survive");
+    assert_eq!(permissions(0o4755), 0o755, "setuid must not survive");
+    assert_eq!(permissions(0o2755), 0o755, "setgid must not survive");
+    assert_eq!(permissions(0o1777), 0o777, "the sticky bit must not survive");
+    assert_eq!(permissions(0o104_755), 0o755, "type bits must not survive");
 }
 
 #[test]
-fn permissions_falls_back_when_the_archive_records_nothing_usable() {
-    assert_eq!(permissions(0, 0o644), 0o644);
-    assert_eq!(permissions(0o170_000, 0o755), 0o755);
+fn permissions_reports_zero_when_the_archive_records_nothing_usable() {
+    // Zero is what lets `visit_dir` tell "no mode recorded" from a real one and substitute its own default.
+    assert_eq!(permissions(0), 0);
+    assert_eq!(permissions(0o170_000), 0);
 }
 
 #[cfg(unix)]
@@ -2154,7 +2165,67 @@ fn classify_output_survives_the_permission_mask() {
     // The two halves together: `classify` hands back a raw st_mode, `permissions` reduces it to what lands on disk.
     let (_, mode) = classify(false, true, (0o104_755 << 16) | 0x8000);
 
-    assert_eq!(permissions(mode.unwrap(), 0o644), 0o755);
+    assert_eq!(permissions(mode.unwrap()), 0o755);
+}
+
+// --- ArchiveFormat tests ---
+
+#[test]
+fn archive_format_recognizes_every_supported_name() {
+    for (name, expected) in [
+        ("photos.zip", ArchiveFormat::Zip),
+        ("PHOTOS.ZIP", ArchiveFormat::Zip),
+        ("release.7z", ArchiveFormat::SevenZ),
+        ("backup.tar.xz", ArchiveFormat::TarXz),
+        ("backup.TAR.XZ", ArchiveFormat::TarXz),
+        ("backup.txz", ArchiveFormat::TarXz),
+    ] {
+        assert_eq!(ArchiveFormat::from_path(name), Some(expected), "{name}");
+    }
+}
+
+#[test]
+fn archive_format_rejects_names_it_cannot_place() {
+    // A bare `.xz` is a compressed stream, not a tarball, and must not be mistaken for one.
+    for name in ["notes.txt", "stream.xz", "archive", "photos.zip.part"] {
+        assert_eq!(ArchiveFormat::from_path(name), None, "{name}");
+    }
+}
+
+#[test]
+fn archive_format_ignores_directories_in_the_path() {
+    assert_eq!(ArchiveFormat::from_path("/tmp/7z/photos.zip"), Some(ArchiveFormat::Zip));
+}
+
+#[test]
+fn unknown_archive_format_reports_the_name_it_rejected() {
+    let archive = archive_file(b"not an archive", ".txt");
+    let sandbox = Sandbox::new();
+
+    let error = extract(archive.path(), sandbox.target(), &ExtractOptions::new()).unwrap_err();
+    let FsError::UnknownArchiveFormat { name } = error else {
+        panic!("expected UnknownArchiveFormat");
+    };
+
+    assert!(name.ends_with(".txt"), "should name the rejected file: {name}");
+}
+
+#[test]
+fn extract_as_ignores_the_file_name() {
+    // The whole point of `extract_as`: a `.bin` name `extract` would reject outright.
+    let archive = archive_file(&build_zip(&[TestEntry::file("notes.txt", "hello")]), ".bin");
+    let sandbox = Sandbox::new();
+
+    let summary = extract_as(
+        ArchiveFormat::Zip,
+        archive.path(),
+        sandbox.target(),
+        &ExtractOptions::new(),
+    )
+    .unwrap();
+
+    assert_eq!(summary.files, 1);
+    assert_eq!(fs::read(sandbox.target().join("notes.txt")).unwrap(), b"hello");
 }
 
 // --- extract dispatch tests ---
@@ -2215,7 +2286,7 @@ fn extract_rejects_an_unknown_extension() {
 
         let error = extract(&archive, sandbox.target(), &ExtractOptions::new()).unwrap_err();
         assert!(
-            matches!(error, FsError::UnknownArchiveFormat),
+            matches!(error, FsError::UnknownArchiveFormat { .. }),
             "should reject {name}, got {error:?}"
         );
     }
@@ -2248,7 +2319,12 @@ fn errors_display_usefully() {
     let cases: Vec<(FsError, &str)> = vec![
         (FsError::EmptyName, "empty"),
         (FsError::NoConfigDir, "configuration directory"),
-        (FsError::UnknownArchiveFormat, "unknown archive format"),
+        (
+            FsError::UnknownArchiveFormat {
+                name: "notes.txt".into(),
+            },
+            "unknown archive format: notes.txt",
+        ),
         (
             FsError::IllegalPath {
                 path: "../x".into(),
@@ -2300,7 +2376,13 @@ fn wrapper_errors_expose_their_source() {
     assert!(io.source().is_some());
 
     assert!(FsError::EmptyName.source().is_none());
-    assert!(FsError::UnknownArchiveFormat.source().is_none());
+    assert!(
+        FsError::UnknownArchiveFormat {
+            name: "notes.txt".into(),
+        }
+        .source()
+        .is_none()
+    );
 }
 
 #[test]

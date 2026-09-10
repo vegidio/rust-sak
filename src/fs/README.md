@@ -17,22 +17,24 @@ rust-sak = { version = "1", features = ["fs"] }
 
 ### Existence and temporary files
 
-| Function          | Signature                                                                     | What it does                                     |
-|-------------------|-------------------------------------------------------------------------------|--------------------------------------------------|
-| `file_exists`     | `fn file_exists(path: impl AsRef<Path>) -> bool`                              | True only for a regular file; follows symlinks.  |
-| `mk_temp_dir`     | `fn mk_temp_dir(prefix: &str) -> Result<TempDir>`                             | Temporary directory under the system temp dir.   |
-| `mk_temp_dir_in`  | `fn mk_temp_dir_in(directory: impl AsRef<Path>, prefix: &str) -> Result<TempDir>`      | Same, in a directory you choose.        |
-| `mk_temp_file`    | `fn mk_temp_file(prefix: &str) -> Result<NamedTempFile>`                      | Temporary file under the system temp dir.        |
-| `mk_temp_file_in` | `fn mk_temp_file_in(directory: impl AsRef<Path>, prefix: &str) -> Result<NamedTempFile>` | Same, in a directory you choose.      |
+| Function          | Signature                                                                                | What it does                                    |
+|-------------------|------------------------------------------------------------------------------------------|-------------------------------------------------|
+| `file_exists`     | `fn file_exists(path: impl AsRef<Path>) -> bool`                                         | True only for a regular file; follows symlinks. |
+| `mk_temp_dir`     | `fn mk_temp_dir(prefix: &str) -> Result<TempDir>`                                        | Temporary directory under the system temp dir.  |
+| `mk_temp_dir_in`  | `fn mk_temp_dir_in(directory: impl AsRef<Path>, prefix: &str) -> Result<TempDir>`        | Same, in a directory you choose.                |
+| `mk_temp_file`    | `fn mk_temp_file(prefix: &str) -> Result<NamedTempFile>`                                 | Temporary file under the system temp dir.       |
+| `mk_temp_file_in` | `fn mk_temp_file_in(directory: impl AsRef<Path>, prefix: &str) -> Result<NamedTempFile>` | Same, in a directory you choose.                |
 
-Temporary handles are **RAII**: dropping a `TempDir` or `NamedTempFile` removes it, including on an early `?` or a panic. Call `.keep()` to opt out. Both types are re-exported, so you can name them without depending on `tempfile` yourself.
+Temporary handles are **RAII**: dropping a `TempDir` or `NamedTempFile` removes it, including on an early `?` or a panic. Call `.keep()` to opt out.
+
+Both are this crate's own types, wrapping [`tempfile`](https://crates.io/crates/tempfile) rather than re-exporting it, so `tempfile`'s major version is not part of this crate's public API and you can depend on a different one yourself. They expose `path()`, `keep()` and `AsRef<Path>`; `NamedTempFile` also derefs to `std::fs::File`, so `Read`/`Write`/`Seek` work directly on it. Call `.into_inner()` when you need the wrapped `tempfile` value itself.
 
 ### User configuration
 
-| Function              | Signature                                                                          | What it does                                        |
-|-----------------------|------------------------------------------------------------------------------------|-----------------------------------------------------|
-| `user_config_dir`     | `fn user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Computes the path. **No I/O.**                      |
-| `mk_user_config_dir`  | `fn mk_user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>` | Creates it (mode `0o755`) and returns the path.     |
+| Function              | Signature                                                                          | What it does                                          |
+|-----------------------|------------------------------------------------------------------------------------|-------------------------------------------------------|
+| `user_config_dir`     | `fn user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>`    | Computes the path. **No I/O.**                        |
+| `mk_user_config_dir`  | `fn mk_user_config_dir(name: &str, sub_path: impl AsRef<Path>) -> Result<PathBuf>` | Creates it (mode `0o755`) and returns the path.       |
 | `mk_user_config_file` | `fn mk_user_config_file(name: &str, file_path: impl AsRef<Path>) -> Result<File>`  | Creates parents, opens the file read/write (`0o644`). |
 
 The path is `<platform config dir>/<name>/<sub_path>` — `~/.config/…` on Linux, `~/Library/Application Support/…` on macOS, `%APPDATA%\…` on Windows. `mk_user_config_file` **does not truncate**, so an existing config survives being opened.
@@ -41,9 +43,9 @@ Both `name` and `sub_path` are validated with the same rules as archive entries,
 
 ### Listing, copying, moving
 
-| Function     | Signature                                                                                        |
-|--------------|--------------------------------------------------------------------------------------------------|
-| `list_path`  | `fn list_path(directory: impl AsRef<Path>, options: &ListOptions) -> Result<Vec<PathBuf>>`       |
+| Function     | Signature                                                                                                   |
+|--------------|-------------------------------------------------------------------------------------------------------------|
+| `list_path`  | `fn list_path(directory: impl AsRef<Path>, options: &ListOptions) -> Result<Vec<PathBuf>>`                  |
 | `copy_files` | `fn copy_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
 | `move_files` | `fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
 
@@ -62,14 +64,29 @@ let copying = CopyOptions::new().recursive(true).preserve_structure(true).extens
 
 ### Extraction
 
-| Function    | Signature                                                                                                     |
-|-------------|---------------------------------------------------------------------------------------------------------------|
-| `extract`   | `fn extract(archive: impl AsRef<Path>, target_dir: impl AsRef<Path>, options: &ExtractOptions) -> Result<ExtractSummary>` |
-| `unzip`     | *(same three parameters)* — ZIP                                                                               |
-| `un7zip`    | *(same)* — 7z                                                                                                 |
-| `untar_xz`  | *(same)* — TAR.XZ                                                                                             |
+| Function     | Signature                                                                                                                 |
+|--------------|---------------------------------------------------------------------------------------------------------------------------|
+| `extract`    | `fn extract(archive: impl AsRef<Path>, target_dir: impl AsRef<Path>, options: &ExtractOptions) -> Result<ExtractSummary>` |
+| `extract_as` | `fn extract_as(format: ArchiveFormat, archive: ..., target_dir: ..., options: ...) -> Result<ExtractSummary>`             |
+| `unzip`      | *(same three parameters as `extract`)* — ZIP                                                                              |
+| `un7zip`     | *(same)* — 7z                                                                                                             |
+| `untar_xz`   | *(same)* — TAR.XZ                                                                                                         |
 
-`extract` dispatches on the file name: `.zip`, `.7z`, `.tar.xz`, `.txz` (case-insensitive). An unrecognised extension is an error, never a guess.
+`extract` dispatches on the file name: `.zip`, `.7z`, `.tar.xz`, `.txz` (case-insensitive). An unrecognised extension is an error, never a guess — nothing is sniffed from the contents.
+
+When you already know the format from somewhere more reliable than a file name — a `Content-Type` header, or a body downloaded into an `mk_temp_file` with no meaningful name — name it with `ArchiveFormat` and call `extract_as`, which ignores the name entirely:
+
+```rust
+# use rust_sak::fs::{extract_as, ArchiveFormat, ExtractOptions};
+# fn main() -> Result<(), rust_sak::fs::FsError> {
+assert_eq!(ArchiveFormat::from_path("backup.tar.xz"), Some(ArchiveFormat::TarXz));
+
+# if false {
+extract_as(ArchiveFormat::Zip, "/tmp/download.bin", "/tmp/out", &ExtractOptions::new())?;
+# }
+# Ok(())
+# }
+```
 
 ```rust
 use rust_sak::fs::{extract, ExtractOptions};
@@ -103,6 +120,6 @@ On top of that:
 
 ## Errors
 
-Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat`, `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch` and `LimitExceeded` (carrying a typed `Limit`).
+Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch` and `LimitExceeded` (carrying a typed `Limit`).
 
 Rejections happen **before** anything is written, so an `IllegalPath` or `IllegalSymlink` means nothing landed outside the target directory. Extraction stops at the first bad entry; entries already written stay on disk.

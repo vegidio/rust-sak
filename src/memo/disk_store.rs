@@ -209,12 +209,12 @@ impl Store for DiskStore {
         };
 
         Ok(Some(Entry {
-            value: value.to_vec(),
+            value: Arc::from(value),
             remaining,
         }))
     }
 
-    fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
+    fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()> {
         // A zero TTL expires the instant it lands, so the write is provably lost; say so instead of doing the I/O.
         if ttl.is_zero() {
             return Err(MemoError::NotAdmitted);
@@ -230,7 +230,7 @@ impl Store for DiskStore {
 
         let mut record = Vec::with_capacity(DEADLINE_LEN + value.len());
         record.extend_from_slice(&millis.to_be_bytes());
-        record.extend_from_slice(value);
+        record.extend_from_slice(&value);
 
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
         let txn = DiskStore::database(&db).begin_write()?;
@@ -258,15 +258,16 @@ impl Store for DiskStore {
     fn path(&self) -> Option<&Path> {
         Some(&self.directory)
     }
-
-    fn blocking(&self) -> bool {
-        true
-    }
 }
 
 impl DiskStore {
     /// Deletes expired entries, then compacts so the space they held is actually returned to the filesystem.
+    ///
+    /// Compaction is skipped when the pass deleted nothing. It rewrites the whole database file and is the only
+    /// part that needs to exclude readers, so paying for it to reclaim zero bytes would make every open of a
+    /// healthy cache cost a full-file read and write — see [`DiskStore::register`], which sweeps on every open.
     fn sweep(&self) -> Result<()> {
+        let removed;
         {
             let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
             let txn = DiskStore::database(&db).begin_write()?;
@@ -279,13 +280,23 @@ impl DiskStore {
                 };
 
                 // A record too short to split is corrupt: drop it rather than leave it to be re-read forever.
+                let mut deleted = 0_u64;
                 table.retain(|_key, record| {
-                    DiskStore::split(record)
+                    let keep = DiskStore::split(record)
                         .and_then(|(expires_at, _)| DiskStore::remaining(expires_at))
-                        .is_some()
+                        .is_some();
+
+                    deleted += u64::from(!keep);
+                    keep
                 })?;
+
+                removed = deleted;
             }
             txn.commit()?;
+        }
+
+        if removed == 0 {
+            return Ok(());
         }
 
         // Compaction is where the space actually comes back, and it is the only part that needs to exclude readers.

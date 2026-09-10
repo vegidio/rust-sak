@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{ExtractOptions, ExtractSummary, FsError, Result, un7zip, untar_xz, unzip};
+use super::{ArchiveFormat, ExtractOptions, ExtractSummary, FsError, Result, un7zip, untar_xz, unzip};
 
 /// Extracts an archive into `target_dir`, choosing the format from the file's extension.
 ///
@@ -34,19 +34,43 @@ pub fn extract(
     options: &ExtractOptions,
 ) -> Result<ExtractSummary> {
     let archive = archive.as_ref();
-    let name = archive
-        .file_name()
-        .map(|name| name.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+    let format = ArchiveFormat::from_path(archive).ok_or_else(|| FsError::UnknownArchiveFormat {
+        name: archive
+            .file_name()
+            .unwrap_or(archive.as_os_str())
+            .to_string_lossy()
+            .into_owned(),
+    })?;
 
-    // `.tar.xz` is checked before `.xz` would be, and `.zip`/`.7z` cannot collide with either.
-    if name.ends_with(".tar.xz") || name.ends_with(".txz") {
-        untar_xz(archive, target_dir, options)
-    } else if name.ends_with(".zip") {
-        unzip(archive, target_dir, options)
-    } else if name.ends_with(".7z") {
-        un7zip(archive, target_dir, options)
-    } else {
-        Err(FsError::UnknownArchiveFormat)
+    extract_as(format, archive, target_dir, options)
+}
+
+/// Extracts an archive whose format the caller already knows, ignoring the file's name entirely.
+///
+/// This is [`extract`] without the name-based guess, for when the format came from somewhere more reliable than an
+/// extension — a `Content-Type` header, the source the bytes were fetched from, or a
+/// [`mk_temp_file`](super::mk_temp_file) that has no meaningful name at all.
+///
+/// ```no_run
+/// use rust_sak::fs::{extract_as, ArchiveFormat, ExtractOptions};
+///
+/// // The download had no usable extension, but the server said what it was.
+/// extract_as(ArchiveFormat::Zip, "/tmp/download.bin", "/tmp/out", &ExtractOptions::new())?;
+/// # Ok::<(), rust_sak::fs::FsError>(())
+/// ```
+///
+/// # Errors
+///
+/// Whatever the format's own function returns — see [`unzip`], [`un7zip`] and [`untar_xz`].
+pub fn extract_as(
+    format: ArchiveFormat,
+    archive: impl AsRef<Path>,
+    target_dir: impl AsRef<Path>,
+    options: &ExtractOptions,
+) -> Result<ExtractSummary> {
+    match format {
+        ArchiveFormat::Zip => unzip(archive, target_dir, options),
+        ArchiveFormat::SevenZ => un7zip(archive, target_dir, options),
+        ArchiveFormat::TarXz => untar_xz(archive, target_dir, options),
     }
 }

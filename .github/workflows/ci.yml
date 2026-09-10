@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -30,6 +31,71 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - name: Lint
+        run: cargo clippy --all-features --all-targets --locked -- -D warnings
+
+  # Every feature is meant to be usable on its own, so each one is compiled on its own. `--all-features` alone would
+  # hide a feature that only builds because a sibling happened to pull in what it needs.
+  features:
+    name: feature (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - crypto
+          - fetch
+          - fs
+          - image
+          - memo
+          - memo-async
+          - o11y
+          - sysinfo
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features
+
+      - name: Check the feature on its own
+        run: cargo check --no-default-features --features ${{ matrix.feature }} --locked
+
+  # The crate has no default features, so this compiles the bare skeleton and nothing else.
+  no-features:
+    name: no features
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features
+
+      - name: Check with no features
+        run: cargo check --no-default-features --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -99,6 +165,9 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Kept in step with `IGNORE_REGEX` in scripts/coverage.sh: src/main.rs is the untested `playground` binary.
+    env:
+      IGNORE_REGEX: 'src/main\.rs'
     steps:
       - uses: actions/checkout@v7
 
@@ -120,19 +189,18 @@ jobs:
       - name: Run instrumented tests
         run: cargo llvm-cov nextest --all-features --locked --no-fail-fast --no-report
 
-      # `--ignore-filename-regex` drops src/main.rs — the untested `playground` binary — matching scripts/coverage.sh.
       - name: Generate reports
         id: reports
         if: ${{ !cancelled() }}
         run: |
           mkdir -p target/coverage
-          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" \
             --lcov --output-path target/coverage/lcov.info
-          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" \
             --html --output-dir target/coverage
-          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" \
             --json --summary-only --output-path target/coverage/summary.json
-          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' \
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" \
             --summary-only | tee target/coverage/summary.txt
 
       - name: Publish coverage to job summary

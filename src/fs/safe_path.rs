@@ -32,7 +32,7 @@ const RESERVED_STEMS: &[&str] = &[
 /// # Errors
 ///
 /// Returns [`FsError::IllegalPath`] describing the offending name and the rule it broke.
-pub(super) fn validate_entry_name(name: &str) -> Result<Vec<String>> {
+pub(super) fn validate_entry_name(name: &str) -> Result<Vec<&str>> {
     let reject = |reason: &str| {
         Err(FsError::IllegalPath {
             path: name.to_string(),
@@ -40,19 +40,8 @@ pub(super) fn validate_entry_name(name: &str) -> Result<Vec<String>> {
         })
     };
 
-    if name.contains('\0') {
-        return reject("contains an embedded NUL byte");
-    }
-
-    if name.starts_with('/') || name.starts_with('\\') {
-        return reject("is an absolute path");
-    }
-
-    // A drive prefix is exactly one ASCII letter followed by a colon, at the very start. Checking bytes is safe here:
-    // a multi-byte UTF-8 sequence never contains an ASCII byte, so this cannot split a character.
-    let bytes = name.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return reject("starts with a Windows drive letter");
+    if let Some(reason) = unsafe_prefix(name) {
+        return reject(reason);
     }
 
     let mut components = Vec::new();
@@ -67,10 +56,34 @@ pub(super) fn validate_entry_name(name: &str) -> Result<Vec<String>> {
             return reject("contains a reserved Windows device name");
         }
 
-        components.push(component.to_string());
+        components.push(component);
     }
 
     Ok(components)
+}
+
+/// Reports why `path` cannot be trusted as a relative, contained path, or `None` if its prefix is fine.
+///
+/// Shared by both validators below. An entry name and a symlink target are rejected for the same three reasons, and
+/// a rule that landed in only one of them is exactly the failure this module exists to prevent — so the rule set
+/// lives here once rather than being spelled out twice.
+fn unsafe_prefix(path: &str) -> Option<&'static str> {
+    if path.contains('\0') {
+        return Some("contains an embedded NUL byte");
+    }
+
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Some("is an absolute path");
+    }
+
+    // A drive prefix is exactly one ASCII letter followed by a colon, at the very start. Checking bytes is safe here:
+    // a multi-byte UTF-8 sequence never contains an ASCII byte, so this cannot split a character.
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some("starts with a Windows drive letter");
+    }
+
+    None
 }
 
 /// Checks that a symbolic link's target cannot leave the extraction root, judging by the text of the target alone.
@@ -88,7 +101,7 @@ pub(super) fn validate_entry_name(name: &str) -> Result<Vec<String>> {
 /// # Errors
 ///
 /// Returns [`FsError::IllegalSymlink`] if the target is absolute, empty, or climbs above the root.
-pub(super) fn validate_symlink_target(link_components: &[String], target: &str) -> Result<()> {
+pub(super) fn validate_symlink_target(link_components: &[&str], target: &str) -> Result<()> {
     let reject = || {
         Err(FsError::IllegalSymlink {
             link: link_components.join("/"),
@@ -96,16 +109,9 @@ pub(super) fn validate_symlink_target(link_components: &[String], target: &str) 
         })
     };
 
-    if target.is_empty() || target.contains('\0') {
-        return reject();
-    }
-
-    if target.starts_with('/') || target.starts_with('\\') {
-        return reject();
-    }
-
-    let bytes = target.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+    // An empty target is symlink-specific — there is no such thing as a link pointing nowhere — so it is checked
+    // here rather than in the shared prefix rules.
+    if target.is_empty() || unsafe_prefix(target).is_some() {
         return reject();
     }
 

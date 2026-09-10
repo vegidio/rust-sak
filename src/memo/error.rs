@@ -1,4 +1,3 @@
-use std::fmt;
 use std::sync::Arc;
 
 /// A convenience alias for results returned by this module.
@@ -11,70 +10,37 @@ pub type Result<T> = std::result::Result<T, MemoError>;
 /// [`get_or_compute`](super::Memo::get_or_compute) from returning the value it just computed. Only
 /// [`get_bytes`](super::Memo::get_bytes), [`set_bytes`](super::Memo::set_bytes), [`cleanup`](super::Memo::cleanup)
 /// and the constructors surface [`MemoError::Storage`], because those are the calls whose whole purpose is the store.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MemoError {
     /// The `compute` closure failed. Nothing was cached and the next call retries.
     ///
     /// Held behind an [`Arc`] because every caller that joined the same in-flight computation is handed this exact
     /// error instance rather than a copy of it.
+    #[error("computing the value failed: {0}")]
     Compute(Arc<dyn std::error::Error + Send + Sync + 'static>),
     /// The caller computing this key went away before publishing a usable result — it panicked, its future was
     /// dropped, or what it published could not be read back.
     ///
     /// Nothing was cached and the next call retries.
+    #[error("the caller computing this value was abandoned")]
     ComputeAbandoned,
     /// The computed value could not be encoded for storage.
-    Encode(postcard::Error),
+    #[error("the value could not be encoded: {0}")]
+    Encode(#[from] postcard::Error),
     /// A filesystem operation on the cache directory failed.
-    Io(std::io::Error),
+    #[error("cache directory operation failed: {0}")]
+    Io(#[from] std::io::Error),
     /// The cache declined the write. The value is simply not cached; nothing else is lost.
+    #[error("the value was not admitted to the cache")]
     NotAdmitted,
     /// The on-disk database could not be opened, read, written or compacted.
-    Storage(redb::Error),
+    #[error("cache storage failed: {0}")]
+    Storage(#[from] redb::Error),
 }
 
-impl fmt::Display for MemoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MemoError::Compute(err) => write!(f, "computing the value failed: {err}"),
-            MemoError::ComputeAbandoned => f.write_str("the caller computing this value was abandoned"),
-            MemoError::Encode(err) => write!(f, "the value could not be encoded: {err}"),
-            MemoError::Io(err) => write!(f, "cache directory operation failed: {err}"),
-            MemoError::NotAdmitted => f.write_str("the value was not admitted to the cache"),
-            MemoError::Storage(err) => write!(f, "cache storage failed: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for MemoError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            MemoError::Compute(err) => Some(&**err),
-            MemoError::Encode(err) => Some(err),
-            MemoError::Io(err) => Some(err),
-            MemoError::Storage(err) => Some(err),
-            MemoError::ComputeAbandoned | MemoError::NotAdmitted => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for MemoError {
-    fn from(err: std::io::Error) -> Self {
-        MemoError::Io(err)
-    }
-}
-
-impl From<postcard::Error> for MemoError {
-    fn from(err: postcard::Error) -> Self {
-        MemoError::Encode(err)
-    }
-}
-
-impl From<redb::Error> for MemoError {
-    fn from(err: redb::Error) -> Self {
-        MemoError::Storage(err)
-    }
-}
+// `#[from]` generates one conversion per variant, keyed on the field's type, so it covers `redb::Error` itself.
+// The six conversions below funnel *different* redb error types into that same `Storage` variant, which the derive
+// cannot express — they stay hand-written.
 
 impl From<redb::DatabaseError> for MemoError {
     fn from(err: redb::DatabaseError) -> Self {

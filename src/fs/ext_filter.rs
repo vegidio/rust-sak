@@ -35,7 +35,10 @@ impl ExtFilter {
             return false;
         };
 
-        let extension = extension.to_lowercase();
-        self.extensions.contains(&extension)
+        // `add` already lowercased everything in the set, so an ASCII-insensitive compare avoids allocating a
+        // lowercased copy of the extension for every path tested.
+        self.extensions
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
     }
 }

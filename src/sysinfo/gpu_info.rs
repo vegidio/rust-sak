@@ -14,8 +14,7 @@ use super::gpu::GpuInfo;
 /// machine's memory rather than owning any, and for every Linux GPU that is not driven by `amdgpu` — Intel,
 /// `nouveau` and the proprietary NVIDIA driver publish no VRAM figure in `sysfs`.
 ///
-/// On Linux the `pci.ids` database is read once per call to resolve model names, so a caller that needs this
-/// repeatedly should keep the result rather than call in a loop.
+/// On Linux the `pci.ids` database used to resolve model names is read once per process, not once per call.
 ///
 /// ```no_run
 /// use rust_sak::sysinfo::gpu_info;
@@ -41,10 +40,9 @@ pub fn gpu_info() -> Result<Vec<GpuInfo>> {
         use std::path::Path;
 
         use super::gpu_sysfs::{DRM_CLASS_DIR, gpus_from_drm_dir};
-        use super::pci_ids::read_pci_ids;
+        use super::pci_ids::PCI_IDS;
 
-        let pci_ids = read_pci_ids();
-        gpus_from_drm_dir(Path::new(DRM_CLASS_DIR), pci_ids.as_deref())
+        gpus_from_drm_dir(Path::new(DRM_CLASS_DIR), PCI_IDS.as_deref())
     }
 
     #[cfg(target_os = "macos")]

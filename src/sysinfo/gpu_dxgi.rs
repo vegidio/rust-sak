@@ -8,7 +8,6 @@
 //! Only [`gpus`] is Windows-specific. The decoding below is compiled everywhere so it stays testable from any host.
 
 use super::gpu::GpuInfo;
-use super::vendor::{vendor_from_description, vendor_name};
 
 /// The `DXGI_ADAPTER_FLAG_SOFTWARE` bit, which marks the WARP software rasteriser rather than real hardware.
 const ADAPTER_FLAG_SOFTWARE: u32 = 2;
@@ -36,24 +35,13 @@ pub(super) fn is_software_adapter(flags: u32) -> bool {
 /// An adapter with no description is dropped. `DedicatedVideoMemory` is zero for integrated graphics, which share
 /// system memory rather than owning any, so zero becomes `None`.
 pub(super) fn gpu_from_adapter(description: &[u16], vendor_id: u32, dedicated_video_memory: u64) -> Option<GpuInfo> {
-    let name = adapter_name(description);
-    if name.is_empty() {
-        return None;
-    }
-
     // DXGI widens the 16-bit PCI vendor id to 32 bits, and uses values above 0xffff for ACPI ids that no PCI
-    // vendor table can resolve.
-    let vendor = u16::try_from(vendor_id)
-        .ok()
-        .and_then(vendor_name)
-        .or_else(|| vendor_from_description(&name))
-        .map(str::to_string);
-
-    Some(GpuInfo {
-        name,
-        vendor,
-        memory: (dedicated_video_memory > 0).then_some(dedicated_video_memory),
-    })
+    // vendor table can resolve, so a value that does not fit is treated as no id at all.
+    GpuInfo::from_parts(
+        &adapter_name(description),
+        u16::try_from(vendor_id).ok(),
+        Some(dedicated_video_memory),
+    )
 }
 
 #[cfg(target_os = "windows")]

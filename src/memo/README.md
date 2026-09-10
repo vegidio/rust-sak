@@ -87,10 +87,10 @@ let memo = Memo::memory_disk("/var/cache/myapp", CacheOpts::new(), Duration::fro
 
 A consuming builder. Both figures are hints, clamped to whatever the engine accepts, so no value here can stop a store from opening.
 
-| Method           | Default | Notes                                                                                  |
-|------------------|---------|-----------------------------------------------------------------------------------------|
-| `max_entries`    | 10,000  | Sizes the memory tier. The disk tier has nothing to map it onto and **ignores it**.     |
-| `max_capacity`   | 1 GiB   | A real byte ceiling in memory; on disk it sizes the read cache, **not the directory**.  |
+| Method         | Default | Notes                                                                                  |
+|----------------|---------|----------------------------------------------------------------------------------------|
+| `max_entries`  | 10,000  | Sizes the memory tier. The disk tier has nothing to map it onto and **ignores it**.    |
+| `max_capacity` | 1 GiB   | A real byte ceiling in memory; on disk it sizes the read cache, **not the directory**. |
 
 Passing `0` to either restores its default. **The disk cache is not size-bounded** — use TTLs and `cleanup` to keep it in check, and don't read `max_capacity(512 << 20)` as "this directory stays under 512 MiB".
 
@@ -210,7 +210,7 @@ if let Err(err) = memo.cleanup() {
 # }
 ```
 
-It is safe to call at any time, is a no-op on a memory-only cache, and a call made while another sweep is running returns immediately rather than queueing. Prefer a quiet moment: the sweep briefly excludes readers while it compacts.
+It is safe to call at any time, is a no-op on a memory-only cache, and a call made while another sweep is running returns immediately rather than queueing. Prefer a quiet moment: when the sweep actually deletes something it goes on to compact, and compaction briefly excludes readers while it rewrites the file. A sweep that finds nothing to delete skips compaction entirely, so opening a healthy cache costs nothing.
 
 ## Things worth knowing
 

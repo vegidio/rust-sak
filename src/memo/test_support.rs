@@ -26,7 +26,7 @@ impl Store for FailingStore {
         Err(MemoError::Io(std::io::Error::other("this store is broken on purpose")))
     }
 
-    fn set(&self, _key: &str, _value: &[u8], _ttl: Duration) -> Result<()> {
+    fn set(&self, _key: &str, _value: Arc<[u8]>, _ttl: Duration) -> Result<()> {
         self.sets.fetch_add(1, Ordering::Relaxed);
         Err(MemoError::Io(std::io::Error::other("this store is broken on purpose")))
     }
@@ -37,10 +37,6 @@ impl Store for FailingStore {
 
     fn path(&self) -> Option<&Path> {
         None
-    }
-
-    fn blocking(&self) -> bool {
-        false
     }
 }
 
@@ -72,7 +68,7 @@ impl Store for CountingStore {
         self.inner.get(key)
     }
 
-    fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
+    fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()> {
         self.sets.fetch_add(1, Ordering::Relaxed);
         self.inner.set(key, value, ttl)
     }
@@ -84,10 +80,11 @@ impl Store for CountingStore {
     fn path(&self) -> Option<&Path> {
         self.inner.path()
     }
+}
 
-    fn blocking(&self) -> bool {
-        self.inner.blocking()
-    }
+/// Wraps a byte slice as the reference-counted payload [`Store::set`] takes.
+pub(super) fn bytes(value: impl AsRef<[u8]>) -> Arc<[u8]> {
+    Arc::from(value.as_ref())
 }
 
 /// The error type the test computations fail with.

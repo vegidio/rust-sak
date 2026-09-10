@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+#[cfg(feature = "memo-async")]
 use std::task::Waker;
 
 use super::MemoError;
@@ -41,7 +42,9 @@ pub(super) struct Call {
     ready: Condvar,
     /// The wakers of the async callers parked on this call, drained when the outcome is published.
     ///
-    /// Locked only *inside* the `outcome` lock, never the other way round.
+    /// Locked only *inside* the `outcome` lock, never the other way round. Only the async path parks anything here,
+    /// so without `memo-async` this module is entirely synchronous.
+    #[cfg(feature = "memo-async")]
     wakers: Mutex<Vec<Waker>>,
 }
 
@@ -50,6 +53,7 @@ impl Call {
         Call {
             outcome: Mutex::new(None),
             ready: Condvar::new(),
+            #[cfg(feature = "memo-async")]
             wakers: Mutex::new(Vec::new()),
         }
     }
@@ -62,10 +66,13 @@ impl Call {
         }
         *slot = Some(outcome);
 
+        #[cfg(feature = "memo-async")]
         let wakers = std::mem::take(&mut *self.wakers.lock().unwrap_or_else(PoisonError::into_inner));
         drop(slot);
 
         self.ready.notify_all();
+
+        #[cfg(feature = "memo-async")]
         for waker in wakers {
             waker.wake();
         }
@@ -87,6 +94,7 @@ impl Call {
     ///
     /// Registration happens while the `outcome` lock is still held, which is what closes the window between seeing
     /// `None` and being on the list — a leader publishing in between would otherwise wake nobody.
+    #[cfg(feature = "memo-async")]
     pub(super) fn poll(&self, waker: &Waker) -> Option<Outcome> {
         let slot = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(outcome) = slot.as_ref() {
@@ -106,26 +114,30 @@ impl Call {
 #[derive(Debug, Default)]
 pub(super) struct Flight {
     /// Held only long enough to look up or install a [`Call`] — never across a computation.
-    calls: Mutex<HashMap<String, Arc<Call>>>,
+    calls: Mutex<HashMap<Arc<str>, Arc<Call>>>,
 }
 
 impl Flight {
     /// Joins the computation already running for `key`, or installs one and becomes its leader.
     ///
+    /// Takes the key by value, and shares one `Arc<str>` between the map and the leader's guard, so becoming a
+    /// leader allocates the key once rather than once per holder.
+    ///
     /// A leader gets a guard whose [`Drop`] releases every waiter, so a panic or a dropped future cannot strand them.
-    pub(super) fn enter(&self, key: &str) -> Entry<'_> {
+    pub(super) fn enter(&self, key: String) -> Entry<'_> {
         let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
 
-        if let Some(call) = calls.get(key) {
+        if let Some(call) = calls.get(key.as_str()) {
             return Entry::Follower(Arc::clone(call));
         }
 
+        let key: Arc<str> = Arc::from(key);
         let call = Arc::new(Call::new());
-        calls.insert(key.to_owned(), Arc::clone(&call));
+        calls.insert(Arc::clone(&key), Arc::clone(&call));
 
         Entry::Leader(Leader {
             flight: self,
-            key: key.to_owned(),
+            key,
             call,
             published: false,
         })
@@ -150,8 +162,8 @@ pub(super) enum Entry<'a> {
 pub(super) struct Leader<'a> {
     /// The table to deregister from once the computation settles.
     flight: &'a Flight,
-    /// This computation's key in that table.
-    key: String,
+    /// This computation's key in that table, sharing the map's allocation rather than copying it.
+    key: Arc<str>,
     /// The call every follower is waiting on.
     call: Arc<Call>,
     /// Cleared once something has been published; still set at drop time means the leader vanished.
@@ -172,7 +184,7 @@ impl Drop for Leader<'_> {
             .calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.key);
+            .remove(self.key.as_ref());
 
         // The leader unwound or was cancelled without publishing. Release the followers with something actionable
         // rather than leaving them blocked on a computation that will never finish.

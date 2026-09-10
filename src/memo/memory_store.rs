@@ -85,12 +85,12 @@ impl Store for MemoryStore {
         };
 
         Ok(Some(Entry {
-            value: entry.value.to_vec(),
+            value: Arc::clone(&entry.value),
             remaining,
         }))
     }
 
-    fn set(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
+    fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()> {
         // Both cases are writes that are provably lost, so they are reported rather than accepted: a zero TTL expires
         // the instant it lands, and a value over the whole budget would be admitted and then immediately evicted.
         if ttl.is_zero() || value.len() as u64 > self.max_capacity {
@@ -98,7 +98,7 @@ impl Store for MemoryStore {
         }
 
         let entry = MemoryEntry {
-            value: Arc::from(value),
+            value,
             expires_at: Instant::now().checked_add(ttl),
         };
         self.cache.insert(key.to_owned(), entry);
@@ -114,9 +114,5 @@ impl Store for MemoryStore {
 
     fn path(&self) -> Option<&Path> {
         None
-    }
-
-    fn blocking(&self) -> bool {
-        false
     }
 }
