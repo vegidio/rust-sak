@@ -1,6 +1,7 @@
 use std::path::Path;
 
-/// A set of file extensions to match against, compared case-insensitively and without regard to a leading dot.
+/// A set of file extensions to match against, compared **ASCII**-case-insensitively and without regard to a leading
+/// dot.
 ///
 /// `"jpg"`, `".jpg"` and `"JPG"` all normalize to the same entry, so callers can pass whichever form reads best at
 /// the call site. An **empty** filter matches everything, which is what makes "no filter configured" and "match all"
@@ -15,8 +16,13 @@ impl ExtFilter {
     ///
     /// An extension that is empty once the leading dots are stripped is dropped: it would otherwise match every
     /// extensionless file, which is never what `extension("")` is asking for.
+    ///
+    /// Normalization is **ASCII-only**, deliberately: [`matches`](ExtFilter::matches) compares with
+    /// [`eq_ignore_ascii_case`](str::eq_ignore_ascii_case), so folding here with the full Unicode
+    /// [`to_lowercase`](str::to_lowercase) would leave the two halves disagreeing — `"JPÉG"` would be stored as
+    /// `"jpég"` and then never match a file actually named `photo.JPÉG`.
     pub(super) fn add(&mut self, extension: &str) {
-        let normalized = extension.trim_start_matches('.').to_lowercase();
+        let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
         if !normalized.is_empty() && !self.extensions.contains(&normalized) {
             self.extensions.push(normalized);
         }

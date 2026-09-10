@@ -1,0 +1,58 @@
+# rust-sak
+
+A "Swiss Army Knife" of reusable Rust building blocks.
+
+The crate is a collection of independent modules, each gated behind its own Cargo feature so
+consumers compile only what they need. **There are no default features** — enable exactly the ones
+you want:
+
+```toml
+[dependencies]
+rust-sak = { version = "2", features = ["crypto", "fs"] }
+```
+
+## Modules
+
+| Feature | Module | What it does | Async? |
+|---|---|---|---|
+| `crypto` | [`crypto`](src/crypto/README.md) | SHA-256 and XXH3-64 hashing of bytes, strings and files; always lowercase hex | no |
+| `fetch` | [`fetch`](src/fetch/README.md) | Reusable `reqwest` client with Fibonacci-backoff retries and resumable streaming downloads with live progress | **yes** (Tokio) |
+| `fs` | [`fs`](src/fs/README.md) | Filesystem helpers, RAII temp handles, and a hardened ZIP/7z/TAR.XZ extractor that treats every entry as hostile | no |
+| `image` | [`image`](src/image/README.md) | Encode and decode 8 image formats behind one uniform API — bmp, gif, jpeg, png, tiff, avif, heif, webp | no |
+| `memo` | [`memo`](src/memo/README.md) | Memoization with pluggable storage: memory, disk, or memory-over-disk, with concurrent calls coalesced | no |
+| `memo-async` | | Adds `Memo::get_or_compute_async` for computations that are themselves futures | **yes** (Tokio) |
+| `o11y` | [`o11y`](src/o11y/README.md) | Structured OTLP log records to an OpenTelemetry collector, exported on a background thread | no |
+| `sysinfo` | [`sysinfo`](src/sysinfo/README.md) | CPU, memory and GPU probes, asked through each platform's own interface — no subprocesses | no |
+
+Each module's README covers its API and guarantees in full; the same content is rendered in the
+[API documentation](https://docs.rs/rust-sak).
+
+## Build requirements
+
+Most features need nothing beyond a Rust compiler. Two do:
+
+- **`fs`** compiles xz from vendored C sources on first build, so a **C compiler** is required.
+- **`image`** downloads prebuilt static avif/heif/webp codec binaries on first build, so an
+  **internet connection** is required — or point `AVIF_BINARIES_DIR`, `HEIF_BINARIES_DIR` and
+  `WEBP_BINARIES_DIR` at pre-extracted archives for an offline build. They link statically, so no
+  system libraries are needed at runtime.
+
+The minimum supported Rust version is **1.95**.
+
+## Development
+
+```sh
+cargo test --all-features            # the full suite
+cargo test --doc --all-features      # doctests, including the module READMEs
+scripts/coverage.sh                  # HTML coverage report (all features)
+scripts/coverage.sh --by-feature     # per-feature coverage, each compiled in isolation
+cargo run --example playground --features fetch
+```
+
+CI additionally compiles every feature in isolation (`--no-default-features --features <f>`),
+which is how a feature that only builds because a sibling happened to pull in its dependency
+gets caught.
+
+## Licence
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

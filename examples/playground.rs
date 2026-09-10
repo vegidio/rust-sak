@@ -1,6 +1,6 @@
-//! Scratch binary for playing with the `fetch` module.
+//! Scratch example for playing with the `fetch` module.
 //!
-//! Run with: `cargo run --features fetch`
+//! Run with: `cargo run --example playground --features fetch`
 
 use rust_sak::fetch::Fetch;
 

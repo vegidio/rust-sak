@@ -8,13 +8,13 @@ The module is gated behind the `memo` Cargo feature:
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["memo"] }
+rust-sak = { version = "2", features = ["memo"] }
 ```
 
 Add `memo-async` for [`get_or_compute_async`](#the-async-variant). It enables `memo` for you, and pulls in Tokio:
 
 ```toml
-rust-sak = { version = "1", features = ["memo-async"] }
+rust-sak = { version = "2", features = ["memo-async"] }
 ```
 
 > This feature needs no toolchain beyond a Rust compiler — no C compiler, no downloads. The disk tier is [`redb`](https://crates.io/crates/redb), which is pure Rust.

@@ -42,7 +42,8 @@ fn headers_replaces_map() {
 // real request path without reaching the network.
 
 use super::test_support::{
-    read_request, write_partial_response, write_range_not_satisfiable, write_response, write_response_no_length,
+    read_request, write_partial_response, write_range_not_satisfiable, write_response, write_response_in_chunks,
+    write_response_no_length,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -481,6 +482,53 @@ async fn download_reports_total_and_completes_to_full() {
     assert_eq!(progress.total, Some(10));
     assert_eq!(progress.downloaded, 10);
     assert_eq!(progress.progress, Some(1.0));
+
+    let _ = tokio::fs::remove_file(&path).await;
+}
+
+#[tokio::test]
+async fn download_coalesces_progress_updates_but_reports_the_exact_total() {
+    // A body far larger than the 256 KiB threshold, delivered in small writes. Every update must still add up: the
+    // last one carries the exact byte count even though the intermediate ones were coalesced away.
+    const BODY_LEN: usize = 1 << 20;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        // 4 KiB at a time: ~256 sends, so an un-coalesced implementation would emit ~256 progress updates.
+        write_response_in_chunks(&mut stream, BODY_LEN, 4096).await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+
+    let mut updates = 0_usize;
+    let mut last = 0_u64;
+    download
+        .track(|_, downloaded, _| {
+            updates += 1;
+            // Progress never goes backwards.
+            assert!(downloaded >= last, "{downloaded} < {last}");
+            last = downloaded;
+        })
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(
+        last, BODY_LEN as u64,
+        "the final update must carry the exact byte count"
+    );
+    assert_eq!(
+        tokio::fs::metadata(&path).await.unwrap().len(),
+        BODY_LEN as u64,
+        "the file on disk must match what was reported"
+    );
+    // The point of the coalescing: far fewer updates than the ~256 chunks the body arrived in.
+    assert!(updates <= 32, "expected coalesced updates, got {updates}");
 
     let _ = tokio::fs::remove_file(&path).await;
 }

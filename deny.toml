@@ -1,0 +1,21 @@
+# Configuration for `cargo deny check` (see the `deny` job in .github/workflows/ci.yml).
+#
+# Only the `advisories` and `bans` checks are configured, and only those two are run: the CI job names them
+# explicitly, because `cargo deny check` with no arguments would run `licenses` and `sources` too and apply
+# their defaults.
+
+[advisories]
+# A security advisory or a yanked release fails the build.
+yanked = "deny"
+
+# `unmaintained` is a *scope*, not a severity: "workspace" limits the check to this crate's own direct dependencies,
+# and an unmaintained crate deeper in the tree is not reported at all. That is deliberate — today it would be `paste`,
+# reached via image -> exr -> pulp, four levels down and not something this crate can act on. Set this to "all" to see
+# every unmaintained crate in the graph, but note it fails the build rather than warning.
+unmaintained = "workspace"
+
+[bans]
+# Duplicate versions of one crate are normal in a tree this size and are not worth failing on; a wildcard dependency
+# is, since it pins nothing at all.
+multiple-versions = "allow"
+wildcards = "deny"

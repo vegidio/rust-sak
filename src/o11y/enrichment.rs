@@ -90,9 +90,15 @@ impl Enrichment {
     }
 
     /// Merges a resolved geolocation into the enrichment. Fields the service did not report are skipped.
+    ///
+    /// Any location already recorded is **replaced**, not added to. Only one lookup is started today, so this cannot
+    /// yet fire — but appending would silently put two `location.country` attributes on every record, and an
+    /// invariant held only by there being a single caller is one refactor away from being untrue.
     pub(super) fn set_location(&self, geo: &Geolocation) {
         {
             let mut base = self.base.lock().unwrap_or_else(PoisonError::into_inner);
+            base.retain(|(key, _)| !matches!(key.as_str(), LOCATION_COUNTRY | LOCATION_REGION | LOCATION_CITY));
+
             for (key, value) in [
                 (LOCATION_COUNTRY, geo.country.as_deref()),
                 (LOCATION_REGION, geo.region.as_deref()),

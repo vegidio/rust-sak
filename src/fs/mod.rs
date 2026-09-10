@@ -36,6 +36,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+// The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
+// examples into doctests, so the prose cannot drift from the code without CI noticing.
+#![doc = include_str!("README.md")]
+
 mod archive_format;
 mod copy_files;
 mod copy_move;

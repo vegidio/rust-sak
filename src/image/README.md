@@ -13,7 +13,7 @@ Gated behind the `image` Cargo feature:
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["image"] }
+rust-sak = { version = "2", features = ["image"] }
 # you'll also want the `image` crate for `DynamicImage`:
 image = { version = "0.25", default-features = false }
 ```
@@ -28,7 +28,7 @@ use rust_sak::image::{
 };
 ```
 
-> **Build note:** the `avif`/`heif`/`webp` crates download prebuilt **static** codec binaries on first build (internet required, or point `AVIF_BINARIES_DIR` / `HEIF_BINARIES_DIR` / `WEBP_BINARIES_DIR` at pre-extracted archives). No system libraries are needed at runtime. The AVIF (SVT-AV1) encoder keeps per-encode global state, so encoding several AVIFs **concurrently with different options is unsafe**, and it hangs on sub-16px frames.
+> **Build note:** the `avif`/`heif`/`webp` crates download prebuilt **static** codec binaries on first build (internet required, or point `AVIF_BINARIES_DIR` / `HEIF_BINARIES_DIR` / `WEBP_BINARIES_DIR` at pre-extracted archives). No system libraries are needed at runtime. The AVIF (SVT-AV1) encoder keeps per-encode global state, so this module serializes AVIF encodes against each other internally: encoding several AVIFs concurrently is **safe**, but they are processed one at a time rather than in parallel. It still hangs on sub-16px frames.
 
 ## Public functions
 
@@ -74,7 +74,7 @@ For both encoders, pass `options: None` to use the format's defaults. A `Some(_)
 
 Returned by `probe_file` / `probe_bytes`. A plain `Copy` struct of header metadata:
 
-```rust
+```rust,ignore
 pub struct ImageInfo {
     pub format: ImageFormat,
     pub width: u32,

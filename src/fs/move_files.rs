@@ -3,11 +3,14 @@ use std::path::Path;
 use super::copy_move::transfer;
 use super::{CopyOptions, CopySummary, Result};
 
-/// Moves each source into `dest_dir` by copying it and then removing the original.
+/// Moves each source into `dest_dir`.
 ///
 /// Identical to [`copy_files`](super::copy_files) in what it selects and where it puts things; the only difference is
-/// that each source file is deleted once it has been copied. Copying rather than renaming means this works across
-/// filesystems, where a rename fails.
+/// that the original does not survive. Each file is **renamed** when source and destination sit on the same
+/// filesystem — atomic, and costing a directory update rather than a read and write of every byte — and falls back to
+/// copy-then-delete when they do not, which is what lets this work across filesystems where a bare rename fails.
+///
+/// A renamed file keeps its modification time; a copied one does not. That difference is inherent to the fallback.
 ///
 /// **Only files are removed, never directories.** A directory source is left behind — possibly empty, possibly still
 /// holding files the extension filter skipped — because deleting it would throw away data the call deliberately did
@@ -31,8 +34,8 @@ use super::{CopyOptions, CopySummary, Result};
 /// # Errors
 ///
 /// Returns [`FsError::Io`](super::FsError::Io) if a source does not exist or cannot be read, the destination cannot
-/// be written, or a source cannot be removed after being copied. The first failure stops the move; sources already
-/// moved stay moved, and the rest are untouched.
+/// be written, or a source cannot be removed after being copied across a filesystem boundary. The first failure stops
+/// the move; sources already moved stay moved, and the rest are untouched.
 pub fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>
 where
     I: IntoIterator<Item = P>,

@@ -14,9 +14,6 @@
 # tests one feature at a time (`--no-default-features --features <f>`) so each summary
 # reflects only that feature's own tests.
 #
-# `--ignore-filename-regex` drops `src/main.rs` — the scratch `playground` binary has no
-# tests, so counting it would understate real coverage.
-#
 # Note: the `sysinfo` feature needs no toolchain beyond a Rust compiler, but its GPU coverage is
 # inherently partial off-Windows: the DXGI backend only compiles there, so only its parsers are
 # exercised elsewhere. The `fs` feature compiles xz from vendored C sources on first build, so a C compiler
@@ -27,8 +24,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# The scratch playground binary is not meaningfully coverable; keep it out of every report.
-IGNORE_REGEX='src/main\.rs'
 FEATURES=(crypto fetch fs image memo,memo-async o11y sysinfo)
 
 # Ensure the LLVM coverage tooling is available.
@@ -41,20 +36,18 @@ fi
 case "${1:-}" in
     --lcov)
         mkdir -p target/coverage
-        cargo llvm-cov --all-features --ignore-filename-regex "$IGNORE_REGEX" \
-            --lcov --output-path target/coverage/lcov.info
+        cargo llvm-cov --all-features --lcov --output-path target/coverage/lcov.info
         echo "Wrote target/coverage/lcov.info"
         ;;
     --by-feature)
         for feature in "${FEATURES[@]}"; do
             echo
             echo "=== feature: $feature (src/${feature%%,*}) ==="
-            cargo llvm-cov --no-default-features --features "$feature" \
-                --ignore-filename-regex "$IGNORE_REGEX" --summary-only
+            cargo llvm-cov --no-default-features --features "$feature" --summary-only
         done
         ;;
     "")
-        cargo llvm-cov --all-features --ignore-filename-regex "$IGNORE_REGEX" --html --open
+        cargo llvm-cov --all-features --html --open
         echo "HTML report written to target/llvm-cov/html/index.html"
         ;;
     *)

@@ -2,6 +2,29 @@
 name = "rust-sak"
 version = "2.0.0"
 edition = "2024"
+rust-version = "1.95"
+description = "A Swiss Army Knife of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry and hardware probes - each behind its own feature."
+repository = "https://github.com/vegidio/rust-sak"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["utility", "toolkit", "filesystem", "cache", "telemetry"]
+categories = ["development-tools", "filesystem", "caching", "multimedia::images"]
+
+[package.metadata.docs.rs]
+# The crate has no default features, so docs.rs would otherwise render an empty page.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
 
 [dependencies]
 avif = { package = "avif-rs", version = "26.7.1", optional = true }
@@ -100,7 +123,8 @@ o11y = [
 ]
 sysinfo = ["dep:objc2-core-foundation", "dep:objc2-io-kit", "dep:sysinfo", "dep:thiserror", "dep:windows"]
 
-[[bin]]
+# Mirrors the `required-features` the `playground` target carried as a `[[bin]]`: without this, a
+# build with any other feature set tries to compile it and fails on the missing `fetch` module.
+[[example]]
 name = "playground"
-path = "src/main.rs"
 required-features = ["fetch"]

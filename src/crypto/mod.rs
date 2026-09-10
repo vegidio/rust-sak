@@ -19,6 +19,10 @@
 //! assert_eq!(xxh3_bytes(b"abc"), xxh3_string("abc"));
 //! ```
 
+// The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
+// examples into doctests, so the prose cannot drift from the code without CI noticing.
+#![doc = include_str!("README.md")]
+
 mod chunked_read;
 mod sha256_bytes;
 mod sha256_file;

@@ -8,7 +8,7 @@ Gated behind the `fetch` Cargo feature (requires a Tokio runtime):
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["fetch"] }
+rust-sak = { version = "2", features = ["fetch"] }
 ```
 
 ```rust
@@ -146,3 +146,5 @@ dl.track(|total, downloaded, progress| match progress {
 ```
 
 For finer control, poll `download.progress()` and await `download.changed()` in a loop, then await the outcome with `download.join()`.
+
+Progress updates are **coalesced**: one when the response headers land, then at most one per 256 KiB or per 100 ms, plus a final one carrying the exact byte count. The update rate therefore does not depend on how the server framed the body.

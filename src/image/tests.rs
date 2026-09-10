@@ -230,6 +230,96 @@ fn probe_bytes_handles_dedicated_codecs() {
 }
 
 #[test]
+fn probe_file_handles_dedicated_codecs_and_matches_probe_bytes() {
+    // These three codecs parse a byte slice, so `probe_file` reads a bounded prefix rather than streaming. This is the
+    // check that the prefix is actually enough, and that the file and byte paths agree.
+    for (format, img) in [
+        (ImageFormat::WebP, sample_image()),
+        (ImageFormat::Avif, sample_image_sized(64, 64)),
+        (ImageFormat::Heif, sample_image()),
+    ] {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "rust_sak_probe_file_{}_{}.{}",
+            std::process::id(),
+            format.extension(),
+            format.extension(),
+        ));
+        encode_file(&img, &path, None).unwrap();
+
+        let from_file = probe_file(&path).unwrap();
+        let from_bytes = probe_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(from_file.format, format, "format {format:?}");
+        assert_eq!(
+            (from_file.width, from_file.height),
+            (img.width(), img.height()),
+            "format {format:?}"
+        );
+        assert_eq!(
+            (from_file.width, from_file.height, from_file.bit_depth),
+            (from_bytes.width, from_bytes.height, from_bytes.bit_depth),
+            "file and byte probes disagree for {format:?}"
+        );
+    }
+}
+
+#[test]
+fn probe_file_reads_only_the_header_of_a_native_format() {
+    // A native probe streams from the file, so trailing junk past the image is never read. Appending 8 MiB of it makes
+    // the difference observable: a `fs::read`-based probe would pull all of it in.
+    let img = sample_image();
+    let path = std::env::temp_dir().join(format!("rust_sak_probe_tail_{}.png", std::process::id()));
+    encode_file(&img, &path, None).unwrap();
+
+    let mut padded = std::fs::read(&path).unwrap();
+    padded.extend(std::iter::repeat_n(0_u8, 8 << 20));
+    std::fs::write(&path, &padded).unwrap();
+
+    let info = probe_file(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    assert_eq!((info.width, info.height), (8, 8));
+}
+
+#[test]
+fn concurrent_avif_encodes_with_different_options_stay_correct() {
+    // The bundled SVT-AV1 encoder keeps per-encode global state, so this is the regression test for the mutex that
+    // serializes the AVIF arm. Without it the two threads' settings can bleed into each other.
+    let img = sample_image_sized(64, 64);
+
+    let handles: Vec<_> = [20_u8, 90]
+        .into_iter()
+        .map(|quality| {
+            let img = img.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                encode_writer(
+                    &img,
+                    &mut bytes,
+                    ImageFormat::Avif,
+                    Some(EncodeOptions::Avif {
+                        quality,
+                        speed: 10,
+                        threads: Some(1),
+                    }),
+                )
+                .unwrap();
+                bytes
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let bytes = handle.join().unwrap();
+        let info = probe_bytes(&bytes).unwrap();
+        assert_eq!(info.format, ImageFormat::Avif);
+        assert_eq!((info.width, info.height), (64, 64));
+    }
+}
+
+#[test]
 fn probe_unknown_extension_errors() {
     assert!(matches!(probe_file("/tmp/file.xyz"), Err(ImageError::UnknownExtension)));
 }

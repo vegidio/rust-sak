@@ -7,6 +7,10 @@
 //! failures as a [`DownloadError`]). Individual requests can override the defaults — including attaching a JSON request
 //! body — by passing [`RequestOptions`].
 
+// The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
+// examples into doctests, so the prose cannot drift from the code without CI noticing.
+#![doc = include_str!("README.md")]
+
 mod download;
 mod prepared;
 mod request;

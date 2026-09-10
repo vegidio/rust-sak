@@ -8,7 +8,7 @@ Gated behind the `o11y` Cargo feature (no Tokio runtime required):
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["o11y"] }
+rust-sak = { version = "2", features = ["o11y"] }
 ```
 
 ```rust

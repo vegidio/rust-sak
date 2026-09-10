@@ -9,7 +9,11 @@ use super::error::{ImageError, Result};
 
 /// Decodes the image at `path` into a [`DynamicImage`], selecting the codec from the file extension.
 ///
-/// Returns [`ImageError::UnknownExtension`] if the path has no recognized image extension.
+/// # Errors
+///
+/// Returns [`ImageError::UnknownExtension`] if the path has no recognized image extension,
+/// [`ImageError::Io`](super::ImageError::Io) if the file cannot be read, and the codec's own error if its contents
+/// are not a valid image of that format.
 pub fn decode_file(path: impl AsRef<Path>) -> Result<DynamicImage> {
     let path = path.as_ref();
     let format = ImageFormat::from_path(path).ok_or(ImageError::UnknownExtension)?;

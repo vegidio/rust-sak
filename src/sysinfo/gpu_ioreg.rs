@@ -49,8 +49,11 @@ pub(super) fn gpu_from_properties(model: Option<&str>, vendor_id: Option<u16>, v
 ///
 /// Intel Macs publish `VRAM,totalMB`, whose name is honest about the unit. Apple Silicon publishes neither this nor
 /// its byte-valued sibling, because the GPU shares the machine's memory.
+///
+/// Saturating rather than wrapping: the input is whatever the IORegistry happens to hold, and a nonsensical value
+/// there should produce a nonsensical-but-bounded figure rather than panic in a debug build.
 pub(super) fn vram_from_megabytes(megabytes: u64) -> u64 {
-    megabytes * 1024 * 1024
+    megabytes.saturating_mul(1024 * 1024)
 }
 
 #[cfg(target_os = "macos")]

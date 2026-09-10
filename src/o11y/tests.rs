@@ -356,6 +356,36 @@ fn geolocation_is_merged_when_opted_in() {
 }
 
 #[test]
+fn a_second_location_replaces_the_first() {
+    // Only one lookup is started today, so this guards the invariant rather than a live bug: appending would put two
+    // `location.city` attributes on every record, and the attribute list has no notion of a duplicate key.
+    let enrichment = Enrichment::new("1.0.0", "test-service");
+
+    let first = Geolocation {
+        city: Some("Amsterdam".to_owned()),
+        country: Some("NL".to_owned()),
+        ..Geolocation::default()
+    };
+    let second = Geolocation {
+        city: Some("Lisbon".to_owned()),
+        country: Some("PT".to_owned()),
+        ..Geolocation::default()
+    };
+
+    enrichment.set_location(&first);
+    enrichment.set_location(&second);
+
+    let attributes = enrichment.attributes();
+    let cities = attributes
+        .iter()
+        .filter(|(key, _)| key.as_str() == LOCATION_CITY)
+        .count();
+    assert_eq!(cities, 1, "the second location should replace the first, not add to it");
+    assert_eq!(enrichment.snapshot().get(LOCATION_CITY).unwrap(), "Lisbon");
+    assert_eq!(enrichment.snapshot().get(LOCATION_COUNTRY).unwrap(), "PT");
+}
+
+#[test]
 fn fetch_geolocation_parses_the_response() {
     let url = spawn_json_server(GEO_JSON);
 

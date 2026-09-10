@@ -8,7 +8,7 @@ The module is gated behind the `fs` Cargo feature:
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["fs"] }
+rust-sak = { version = "2", features = ["fs"] }
 ```
 
 > Building this feature compiles **xz from vendored C sources**, so a C compiler is required. No system `liblzma` is needed.
@@ -88,7 +88,7 @@ extract_as(ArchiveFormat::Zip, "/tmp/download.bin", "/tmp/out", &ExtractOptions:
 # }
 ```
 
-```rust
+```rust,no_run
 use rust_sak::fs::{extract, ExtractOptions};
 
 let summary = extract("upload.zip", "/tmp/out", &ExtractOptions::new()

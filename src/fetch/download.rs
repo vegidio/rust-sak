@@ -13,6 +13,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -21,6 +22,16 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
 use super::{PreparedRequest, retry};
+
+/// How many bytes may arrive between progress updates before one is forced out.
+///
+/// A response body arrives in chunks of a few kilobytes, so sending an update per chunk means tens of thousands of
+/// them across a large transfer, each waking every observer. Coalescing to a byte and a time bound keeps a progress
+/// bar smooth while making the cost independent of how the body happens to be framed.
+const PROGRESS_BYTES: u64 = 256 * 1024;
+
+/// How long may pass between progress updates before one is forced out, so a slow transfer still ticks.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Controls what [`Fetch::download`](super::Fetch::download) does when a file already exists at the target path.
 ///
@@ -74,6 +85,7 @@ impl Progress {
 ///
 /// The download runs in a background task; this handle observes its progress and final result. Dropping the handle does
 /// **not** cancel the download.
+#[derive(Debug)]
 pub struct Download {
     rx: watch::Receiver<Progress>,
     handle: tokio::task::JoinHandle<Result<(), DownloadError>>,
@@ -121,6 +133,10 @@ impl Download {
     /// The callback receives `(total, downloaded, progress)` from each [`Progress`] update — the same fields as
     /// [`Progress::total`]/[`Progress::downloaded`]/[`Progress::progress`]. It is **not** called for the initial
     /// zero-valued snapshot (only for updates produced by the transfer) and it **is** called for the final update.
+    ///
+    /// Updates are **coalesced**, not one per received chunk: one goes out when the response headers land, then at
+    /// most one per 256 KiB or per 100 ms, and always a last one carrying the final byte count. So the callback fires
+    /// often enough to drive a progress bar without its rate depending on how the server happened to frame the body.
     ///
     /// The background task is awaited exactly once; this method returns its final result, so do **not** call
     /// [`join`](Download::join) afterward (it would re-await a finished task and panic). Reading
@@ -356,16 +372,32 @@ async fn stream_to_file(
             )
         };
 
+        // Unconditional, so `total` is published as soon as it is known rather than waiting for the first threshold.
         tx.send_replace(Progress::in_flight(total, downloaded));
 
         let mut stream = response.bytes_stream();
+        let mut reported = downloaded;
+        let mut reported_at = Instant::now();
+
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
-            tx.send_replace(Progress::in_flight(total, downloaded));
+
+            if downloaded - reported >= PROGRESS_BYTES || reported_at.elapsed() >= PROGRESS_INTERVAL {
+                tx.send_replace(Progress::in_flight(total, downloaded));
+                reported = downloaded;
+                reported_at = Instant::now();
+            }
         }
         file.flush().await?;
+
+        // The final count always goes out, whatever the thresholds said, so an observer's last update matches what is
+        // actually on disk — `track` in particular relies on seeing it.
+        if downloaded != reported {
+            tx.send_replace(Progress::in_flight(total, downloaded));
+        }
+
         Ok::<(), DownloadError>(())
     })
     .await

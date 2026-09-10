@@ -7,8 +7,9 @@ use super::{CopyOptions, CopySummary, ListOptions, Result, list_path};
 /// Copies every source into `dest_dir`, optionally removing each source once it has been copied.
 ///
 /// This is the whole of both [`copy_files`](super::copy_files) and [`move_files`](super::move_files); the only
-/// difference between them is `remove_sources`. Removal happens per file, immediately after that file has been
-/// copied, so an interrupted move never loses data that was not already written to the destination.
+/// difference between them is `remove_sources`. A move renames where it can and falls back to copy-then-delete
+/// across filesystems — see [`rename_or_copy`] — so an interrupted move never loses data that was not already
+/// written to the destination.
 ///
 /// # Errors
 ///
@@ -111,14 +112,39 @@ fn transfer_file(
         created.insert(parent.to_path_buf());
     }
 
-    summary.bytes += fs::copy(source, dest)?;
+    summary.bytes += if remove_sources {
+        rename_or_copy(source, dest)?
+    } else {
+        fs::copy(source, dest)?
+    };
     summary.files += 1;
 
-    if remove_sources {
-        fs::remove_file(source)?;
-    }
-
     Ok(())
+}
+
+/// Moves `source` onto `dest`, returning the number of bytes the file holds.
+///
+/// A rename costs a directory update; a copy reads and writes every byte, so for a large file the difference is the
+/// whole transfer. `rename` is also atomic, which removes the window in which a copy has succeeded but the delete has
+/// not and the file exists in both places at once.
+///
+/// The one thing a rename cannot do is cross a filesystem boundary, which is what the fallback is for — and the only
+/// case in which the old copy-then-delete behaviour still applies.
+fn rename_or_copy(source: &Path, dest: &Path) -> Result<u64> {
+    // Read the length first: after a successful rename there is nothing left at `source` to stat, and unlike
+    // `fs::copy` a rename does not report how much it moved.
+    let len = fs::metadata(source)?.len();
+
+    match fs::rename(source, dest) {
+        Ok(()) => Ok(len),
+        // The two paths are on different filesystems, so the bytes genuinely have to be carried across.
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            let copied = fs::copy(source, dest)?;
+            fs::remove_file(source)?;
+            Ok(copied)
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Returns a path's final component, rejecting paths that have none.

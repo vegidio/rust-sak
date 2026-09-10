@@ -25,6 +25,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+// The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
+// examples into doctests, so the prose cannot drift from the code without CI noticing.
+#![doc = include_str!("README.md")]
+
 mod cache_opts;
 mod composite_store;
 mod disk_store;
@@ -97,6 +101,10 @@ impl Memo {
     /// takes an exclusive file lock, and a plain re-open would fail with an error indistinguishable from another
     /// process holding it.
     ///
+    /// This blocks, and can block for a while: opening waits out a teardown of the same directory that is still in
+    /// flight, sleeping up to 50 ms in total before believing a lock error. Call it during start-up, or from
+    /// `tokio::task::spawn_blocking`, rather than on a runtime worker.
+    ///
     /// # Errors
     ///
     /// Returns [`MemoError::Io`] if `directory` cannot be created or resolved, and [`MemoError::Storage`] if the
@@ -110,6 +118,8 @@ impl Memo {
     /// Reads try memory first and fall back to disk; a disk hit is copied back into memory for `promote_ttl`, or for
     /// the entry's own remaining lifetime if that is shorter. Writes go to both tiers. A `promote_ttl` of
     /// [`Duration::ZERO`] turns promotion off, so disk hits are served without being cached in memory.
+    ///
+    /// Blocks exactly as [`Memo::disk`] does.
     ///
     /// # Errors
     ///
@@ -145,6 +155,12 @@ impl Memo {
     ///
     /// Prefer a quiet moment: the sweep briefly excludes readers while it compacts. It is a no-op for a memory-only
     /// cache, and a call made while another sweep is running returns immediately rather than queueing behind it.
+    ///
+    /// This blocks for as long as the compaction takes — it rewrites the whole database file — so from an async task
+    /// reach for `tokio::task::spawn_blocking`. The same goes for [`get_bytes`](Memo::get_bytes) and
+    /// [`set_bytes`](Memo::set_bytes), which have no async counterparts;
+    /// [`get_or_compute_async`](Memo::get_or_compute_async) is the only method that moves store I/O off the runtime
+    /// on its own.
     ///
     /// # Errors
     ///

@@ -29,6 +29,10 @@
 //! println!("{} ({} cores), {:.1} GiB RAM", cpu.name, cpu.cores, memory.total as f64 / 1024_f64.powi(3));
 //! ```
 
+// The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
+// examples into doctests, so the prose cannot drift from the code without CI noticing.
+#![doc = include_str!("README.md")]
+
 mod cpu;
 mod cpu_info;
 mod error;

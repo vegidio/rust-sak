@@ -69,6 +69,11 @@ pub struct Geolocation {
 ///
 /// The request is given a one-second timeout and the response body is capped at 64 KiB.
 ///
+/// **This blocks the calling thread** for up to the timeout — it goes through `reqwest`'s blocking client, which its
+/// own documentation says should not be used inside an async runtime. Call it from a plain thread, or from
+/// `tokio::task::spawn_blocking`. A [`Telemetry`](super::Telemetry) that opts into geolocation runs it on a
+/// background thread of its own, so this only concerns calling the function directly.
+///
 /// # Errors
 ///
 /// Returns an [`O11yError`](super::O11yError) if the request cannot be built or sent, the service answers with a
@@ -89,7 +94,8 @@ pub fn fetch_geolocation() -> Result<Geolocation> {
 
 /// Like [`fetch_geolocation`], but queries `<base_url>/json` instead of the default service.
 ///
-/// Useful for a self-hosted or proxied lookup endpoint, and for testing against a local stub.
+/// Useful for a self-hosted or proxied lookup endpoint, and for testing against a local stub. Blocks the calling
+/// thread, as [`fetch_geolocation`] does.
 ///
 /// # Errors
 ///
@@ -111,6 +117,9 @@ pub fn fetch_geolocation_from(base_url: &str) -> Result<Geolocation> {
 ///
 /// The one-second default the other two functions use suits a public service on a healthy connection. A self-hosted
 /// endpoint, one reached through a VPN or a proxy, or a deliberately slow test double may need longer.
+///
+/// Blocks the calling thread for up to `timeout`, as [`fetch_geolocation`] does — so a generous `timeout` here is
+/// also a generous amount of time to tie up whichever thread calls it.
 ///
 /// ```no_run
 /// # fn run() -> Result<(), Box<dyn std::error::Error>> {

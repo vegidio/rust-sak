@@ -4,7 +4,7 @@
 //! [`o11y`], [`sysinfo`]), each gated behind its own Cargo feature so consumers compile only what they need:
 //!
 //! ```toml
-//! rust-sak = { version = "0.1", features = ["fetch"] }
+//! rust-sak = { version = "2", features = ["fetch"] }
 //! ```
 
 #[cfg(feature = "crypto")]

@@ -6,7 +6,10 @@ use super::error::{ImageError, Result};
 
 /// Decodes the encoded image in `bytes` into a [`DynamicImage`], guessing the format from its magic bytes.
 ///
-/// Returns [`ImageError::UnrecognizedFormat`] if no supported format's signature matches.
+/// # Errors
+///
+/// Returns [`ImageError::UnrecognizedFormat`] if no supported format's signature matches, and the codec's own error
+/// if the bytes are not a valid image of the detected format.
 pub fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
     let format = ImageFormat::from_magic(bytes).ok_or(ImageError::UnrecognizedFormat)?;
     decode_with_format(bytes, format)

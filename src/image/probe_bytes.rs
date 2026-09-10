@@ -6,7 +6,10 @@ use super::info::ImageInfo;
 /// Reads the metadata of the encoded image in `bytes` (dimensions, color type, bit depth) **without decoding
 /// the pixels**, guessing the format from its magic bytes.
 ///
-/// Returns [`ImageError::UnrecognizedFormat`] if no supported format's signature matches.
+/// # Errors
+///
+/// Returns [`ImageError::UnrecognizedFormat`] if no supported format's signature matches, and the codec's own error
+/// if the header is malformed.
 ///
 /// ```no_run
 /// use rust_sak::image::probe_bytes;

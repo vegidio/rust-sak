@@ -8,7 +8,7 @@ The module is gated behind the `crypto` Cargo feature:
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["crypto"] }
+rust-sak = { version = "2", features = ["crypto"] }
 ```
 
 ```rust

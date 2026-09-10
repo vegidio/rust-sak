@@ -37,8 +37,13 @@
 //!
 //! The `avif`/`heif`/`webp` crates download prebuilt static codec binaries on first build (an internet connection is
 //! required, or point `AVIF_BINARIES_DIR`/`HEIF_BINARIES_DIR`/`WEBP_BINARIES_DIR` at pre-extracted archives). They link
-//! statically, so no system libraries are needed at runtime. The bundled AVIF (SVT-AV1) encoder keeps per-encode global
-//! state, so encoding several AVIFs concurrently with *different* options is unsafe.
+//! statically, so no system libraries are needed at runtime. The bundled AVIF (SVT-AV1) encoder keeps per-encode
+//! global state, so this module serializes AVIF encodes against each other internally — encoding several AVIFs
+//! concurrently is safe, though they will not run in parallel with one another.
+
+// The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
+// examples into doctests, so the prose cannot drift from the code without CI noticing.
+#![doc = include_str!("README.md")]
 
 mod decode_bytes;
 mod decode_bytes_with_format;

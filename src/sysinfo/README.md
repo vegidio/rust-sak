@@ -8,17 +8,17 @@ The module is gated behind the `sysinfo` Cargo feature:
 
 ```toml
 [dependencies]
-rust-sak = { version = "1", features = ["sysinfo"] }
+rust-sak = { version = "2", features = ["sysinfo"] }
 ```
 
 > This feature needs no toolchain beyond a Rust compiler — no C compiler, no downloads. It requires Rust **1.95** or newer, which is the minimum supported version of the [`sysinfo`](https://crates.io/crates/sysinfo) crate it builds on.
 
 ## Public API
 
-| Function      | Signature                              | What it does                                    |
-|---------------|----------------------------------------|-------------------------------------------------|
-| `cpu_info`    | `fn cpu_info() -> CpuInfo`             | Processor model, core counts, architecture.     |
-| `memory_info` | `fn memory_info() -> MemoryInfo`       | Total and available RAM, total swap, in bytes.  |
+| Function      | Signature                               | What it does                                   |
+|---------------|-----------------------------------------|------------------------------------------------|
+| `cpu_info`    | `fn cpu_info() -> CpuInfo`              | Processor model, core counts, architecture.    |
+| `memory_info` | `fn memory_info() -> MemoryInfo`        | Total and available RAM, total swap, in bytes. |
 | `gpu_info`    | `fn gpu_info() -> Result<Vec<GpuInfo>>` | Every graphics adapter the OS reports.         |
 
 ### Why only one of them returns a `Result`
@@ -43,12 +43,12 @@ The one exception is the ~1.5 MB `pci.ids` database `gpu_info` consults on Linux
 
 ### `CpuInfo`
 
-| Field            | Type                 | Notes                                                                    |
-|------------------|----------------------|--------------------------------------------------------------------------|
-| `name`           | `String`             | `"Apple M2 Max"`. Falls back to `"Unknown CPU"`.                          |
-| `cores`          | `usize`              | **Logical** cores — the machine's count, not this process's CPU budget.  |
-| `physical_cores` | `Option<usize>`      | `None` where the platform does not report it.                            |
-| `arch`           | `&'static str`       | What the binary was **compiled for**, not a runtime probe.               |
+| Field            | Type            | Notes                                                                   |
+|------------------|-----------------|-------------------------------------------------------------------------|
+| `name`           | `String`        | `"Apple M2 Max"`. Falls back to `"Unknown CPU"`.                        |
+| `cores`          | `usize`         | **Logical** cores — the machine's count, not this process's CPU budget. |
+| `physical_cores` | `Option<usize>` | `None` where the platform does not report it.                           |
+| `arch`           | `&'static str`  | What the binary was **compiled for**, not a runtime probe.              |
 
 `cores` counts every core the kernel exposes, so a container with a CPU quota still sees the whole machine. Use `std::thread::available_parallelism` when you want the process's actual budget. Likewise `arch` is `std::env::consts::ARCH`, so an x86-64 build under Rosetta 2 reports `"x86_64"` — the answer a program deciding what it can execute wants.
 
@@ -68,11 +68,11 @@ Both optional fields distinguish *"this does not apply"* from a zero. An Apple S
 
 ## How each platform is asked
 
-| Platform | Mechanism | Source of GPU data |
-|----------|-----------|--------------------|
-| macOS    | **IOKit** | `IOAccelerator` entries in the IORegistry — the same data `system_profiler SPDisplaysDataType` prints. |
+| Platform | Mechanism | Source of GPU data                                                                                      |
+|----------|-----------|---------------------------------------------------------------------------------------------------------|
+| macOS    | **IOKit** | `IOAccelerator` entries in the IORegistry — the same data `system_profiler SPDisplaysDataType` prints.  |
 | Windows  | **DXGI**  | `IDXGIFactory1::EnumAdapters1` → `DXGI_ADAPTER_DESC1`, the source behind WMI's `Win32_VideoController`. |
-| Linux    | **sysfs** | `/sys/class/drm/card*/device/`, plus `pci.ids` for model names. |
+| Linux    | **sysfs** | `/sys/class/drm/card*/device/`, plus `pci.ids` for model names.                                         |
 
 Linux is the odd one out because it has no GPU API at all: the kernel publishes device data as a virtual filesystem, which is what `lspci` itself reads.
 
@@ -82,13 +82,13 @@ On any other operating system `gpu_info` returns `SysinfoError::UnsupportedPlatf
 
 **`memory` is `None` more often than you might expect.** It is reported only where the platform actually publishes it:
 
-| Platform / driver | VRAM reported? |
-|-------------------|----------------|
-| Windows, any GPU  | ✅ yes         |
-| macOS, Intel Mac with a discrete GPU | ✅ yes |
-| macOS, Apple Silicon | ❌ no — unified memory, no separate VRAM exists |
-| Linux, `amdgpu`   | ✅ yes         |
-| Linux, Intel (`i915` / `xe`), `nouveau`, proprietary NVIDIA | ❌ no — nothing is published in sysfs |
+| Platform / driver                                           | VRAM reported?                                  |
+|-------------------------------------------------------------|-------------------------------------------------|
+| Windows, any GPU                                            | ✅ yes                                          |
+| macOS, Intel Mac with a discrete GPU                        | ✅ yes                                          |
+| macOS, Apple Silicon                                        | ❌ no — unified memory, no separate VRAM exists |
+| Linux, `amdgpu`                                             | ✅ yes                                          |
+| Linux, Intel (`i915` / `xe`), `nouveau`, proprietary NVIDIA | ❌ no — nothing is published in sysfs           |
 
 The Linux gaps are kernel limitations, not shortcuts: Intel's sysfs VRAM proposal was never merged, and the proprietary NVIDIA driver exposes no framebuffer size anywhere under `/proc` or `/sys`. Reading those needs a DRM `ioctl` or NVML, neither of which this module does. A zero is never invented to paper over the gap.
 
@@ -103,11 +103,11 @@ Also:
 
 `SysinfoError` has three variants, all reporting a probe that *could not run* — never one that ran and found nothing:
 
-| Variant                | When                                                                 |
-|------------------------|----------------------------------------------------------------------|
-| `Io`                   | Linux only: `/sys/class/drm` exists but cannot be read. A *missing* directory is not an error. |
-| `GpuApi { call, code }` | An OS graphics call failed. `code` is a `kern_return_t` on macOS, an `HRESULT` on Windows. |
-| `UnsupportedPlatform`  | GPU detection has no implementation for this operating system.       |
+| Variant                 | When                                                                                           |
+|-------------------------|------------------------------------------------------------------------------------------------|
+| `Io`                    | Linux only: `/sys/class/drm` exists but cannot be read. A *missing* directory is not an error. |
+| `GpuApi { call, code }` | An OS graphics call failed. `code` is a `kern_return_t` on macOS, an `HRESULT` on Windows.     |
+| `UnsupportedPlatform`   | GPU detection has no implementation for this operating system.                                 |
 
 ## Usage
 
@@ -131,7 +131,7 @@ for gpu in gpu_info()? {
 
 On an Apple Silicon Mac that prints something like:
 
-```
+```text
 Apple M2 Max — 12 cores (aarch64)
 64.0 GiB RAM
 Apple M2 Max — shared or unreported memory

@@ -643,6 +643,21 @@ fn list_path_matches_extensions_case_insensitively() {
 }
 
 #[test]
+fn list_path_matches_a_non_ascii_extension() {
+    // The filter normalizes with `to_ascii_lowercase` and compares with `eq_ignore_ascii_case`. Folding the stored
+    // copy with the full Unicode `to_lowercase` instead would leave the two disagreeing, and this would never match.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("photo.JPÉG"), b"x").unwrap();
+
+    let exact = list_path(dir.path(), &ListOptions::new().extension("JPÉG")).unwrap();
+    assert_eq!(names(&exact), ["photo.JPÉG"]);
+
+    // The ASCII half of the extension still folds; the non-ASCII half has to match as written.
+    let ascii_folded = list_path(dir.path(), &ListOptions::new().extension("jpÉg")).unwrap();
+    assert_eq!(names(&ascii_folded), ["photo.JPÉG"]);
+}
+
+#[test]
 fn list_path_accepts_an_extension_with_a_leading_dot() {
     let dir = list_fixture();
 
@@ -928,6 +943,44 @@ fn move_files_removes_the_source_file() {
     assert_eq!(summary.files, 1);
     assert!(!source.exists());
     assert_eq!(fs::read_to_string(to.path().join("a.txt")).unwrap(), "a");
+}
+
+#[test]
+fn move_files_renames_within_one_filesystem() {
+    // A rename preserves the inode and the modification time; a copy does not. Asserting on both is how this pins
+    // down that the fast path was actually taken rather than just that the file arrived.
+    let from = copy_fixture();
+    let to = TempDir::new().unwrap();
+    let source = from.path().join("a.txt");
+
+    let before = fs::metadata(&source).unwrap();
+    let summary = move_files([&source], to.path(), &CopyOptions::new()).unwrap();
+    let after = fs::metadata(to.path().join("a.txt")).unwrap();
+
+    assert_eq!(summary.files, 1);
+    assert_eq!(summary.bytes, before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(after.ino(), before.ino());
+    }
+}
+
+#[test]
+fn move_files_reports_byte_counts_for_a_renamed_tree() {
+    // `fs::rename` does not report how much it moved, so the byte count comes from a `metadata` call made before the
+    // rename. This guards the ordering: reading the length afterwards would stat a path that no longer exists.
+    let from = copy_fixture();
+    let to = TempDir::new().unwrap();
+
+    let options = CopyOptions::new().recursive(true).preserve_structure(true);
+    let summary = move_files([from.path()], to.path(), &options).unwrap();
+
+    assert_eq!(summary.files, 4);
+    // The fixture holds "a", "bb", "ccc", "dddd".
+    assert_eq!(summary.bytes, 1 + 2 + 3 + 4);
 }
 
 #[test]

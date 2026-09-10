@@ -34,6 +34,24 @@ pub(super) async fn write_response(stream: &mut TcpStream, status: &str, body: &
     stream.flush().await.unwrap();
 }
 
+/// Writes a 200 response whose body is `len` bytes delivered in `chunk` -sized writes.
+///
+/// Sending the body in many small writes is what makes the receiving side see many stream chunks, which is how the
+/// progress-coalescing behaviour becomes observable.
+pub(super) async fn write_response_in_chunks(stream: &mut TcpStream, len: usize, chunk: usize) {
+    let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+    stream.write_all(header.as_bytes()).await.unwrap();
+
+    let block = vec![b'x'; chunk];
+    let mut written = 0;
+    while written < len {
+        let take = chunk.min(len - written);
+        stream.write_all(&block[..take]).await.unwrap();
+        written += take;
+    }
+    stream.flush().await.unwrap();
+}
+
 /// Writes a 200 response with no `Content-Length`; the body length is implied by the connection close.
 pub(super) async fn write_response_no_length(stream: &mut TcpStream, body: &str) {
     let response = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}");

@@ -31,7 +31,8 @@ impl TempDir {
     ///
     /// # Errors
     ///
-    /// Returns [`FsError::Io`](super::FsError::Io) if the directory could not be persisted.
+    /// Never, today: defusing the drop is bookkeeping, with nothing to fail. It returns a [`Result`] so that gaining a
+    /// fallible step later is not a breaking change, and to match [`NamedTempFile::keep`], which genuinely can fail.
     pub fn keep(self) -> Result<PathBuf> {
         Ok(self.0.keep())
     }
