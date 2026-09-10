@@ -1,0 +1,55 @@
+name: Test summary
+description: Publish one runner's unit-test and doctest results to the job summary.
+
+inputs:
+  os:
+    description: Runner OS label, used as the section heading.
+    required: true
+  unit-outcome:
+    description: Outcome of the step that ran the unit tests.
+    required: true
+  doctest-outcome:
+    description: Outcome of the step that ran the doctests.
+    required: true
+  unit-log:
+    description: Captured output of the unit-test run.
+    required: false
+    default: nextest.log
+  doctest-log:
+    description: Captured output of the doctest run.
+    required: false
+    default: doctest.log
+
+runs:
+  using: composite
+  steps:
+    # `shell` is mandatory inside a composite action: a job's `defaults.run.shell` does not reach in here, so
+    # without it the Windows runner would fall back to pwsh, whose `>>` writes UTF-16LE and would corrupt the
+    # summary file.
+    - name: Write the result table
+      shell: bash
+      # The caller's values arrive as `env` rather than `${{ }}` interpolation because neither `matrix` nor the
+      # caller's `steps` context exists inside a composite action, and interpolation splices text into the script
+      # before bash parses it.
+      env:
+        OS: ${{ inputs.os }}
+        UNIT_OUTCOME: ${{ inputs.unit-outcome }}
+        DOCTEST_OUTCOME: ${{ inputs.doctest-outcome }}
+        UNIT_LOG: ${{ inputs.unit-log }}
+        DOCTEST_LOG: ${{ inputs.doctest-log }}
+      run: |
+        # Swatinem/rust-cache exports CARGO_TERM_COLOR=always, so nextest colours its output even through `tee`.
+        # $'...' makes bash insert a literal ESC byte before sed sees it, which works on BSD sed (macOS) too.
+        strip_ansi() { sed $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' "$1" 2>/dev/null; }
+        # Best-effort: a missing log or an unmatched line must never fail the build. The authoritative pass/fail
+        # is the outcome the caller passes in, not the grep.
+        unit=$(strip_ansi "$UNIT_LOG" | grep -aE '^[[:space:]]*Summary \[' | tail -1 | sed -E 's/^[[:space:]]+//') || unit=""
+        doc=$(strip_ansi "$DOCTEST_LOG" | grep -aE '^test result:' | tail -1) || doc=""
+        {
+          printf '### %s\n\n' "$OS"
+          printf '| Suite | Result | Detail |\n'
+          printf '| --- | --- | --- |\n'
+          printf '| unit (nextest) | %s | `%s` |\n' "$UNIT_OUTCOME" "${unit:-no summary line produced}"
+          printf '| doctests | %s | `%s` |\n' "$DOCTEST_OUTCOME" "${doc:-no summary line produced}"
+          printf '\n'
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -134,5 +134,6 @@ let decoded = decode_bytes(&bytes).unwrap();
 assert_eq!((decoded.width(), decoded.height()), (2, 2));
 
 // Encode to a file with custom options (format taken from the ".jpg" extension).
-encode_file(&original, "/tmp/out.jpg", Some(EncodeOptions::Jpeg { quality: 90 })).unwrap();
+let out = std::env::temp_dir().join("out.jpg");
+encode_file(&original, &out, Some(EncodeOptions::Jpeg { quality: 90 })).unwrap();
 ```

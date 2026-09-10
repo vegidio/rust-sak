@@ -1,0 +1,55 @@
+name: Coverage summary
+description: Publish coverage totals, a per-module breakdown and the per-file detail to the job summary.
+
+inputs:
+  summary-json:
+    description: Machine-readable coverage summary, as written by `cargo llvm-cov report --json`.
+    required: true
+  summary-txt:
+    description: Plain-text per-file coverage summary.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # `shell` is mandatory inside a composite action; a job's `defaults.run.shell` does not reach in here.
+    - name: Write the coverage tables
+      shell: bash
+      env:
+        SUMMARY_JSON: ${{ inputs.summary-json }}
+        SUMMARY_TXT: ${{ inputs.summary-txt }}
+      run: |
+        {
+          printf '## Coverage\n\n'
+          printf '`--all-features` on ubuntu-latest.\n\n'
+          jq -r '
+            def pct: if (.count // 0) > 0 then (.covered * 10000 / .count | round / 100) else 0 end;
+            .data[0].totals as $t
+            | "| Metric | Covered | Total | Coverage |",
+              "| --- | ---: | ---: | ---: |",
+              ( ["lines", "functions", "regions", "branches"][]
+                | select(($t[.].count // 0) > 0)
+                | "| \(.) | \($t[.].covered) | \($t[.].count) | \($t[.] | pct)% |" )
+          ' "$SUMMARY_JSON"
+          printf '\n### By module\n\n'
+          jq -r --arg root "$GITHUB_WORKSPACE/" '
+            def pct: if (.count // 0) > 0 then (.covered * 10000 / .count | round / 100) else 0 end;
+            .data[0].files
+            | map({ module: ( (.filename | ltrimstr($root) | split("/"))
+                              | if length > 2 then "src/" + .[1] else "src" end ),
+                    covered: .summary.lines.covered,
+                    count: .summary.lines.count })
+            | group_by(.module)
+            | map({ module: .[0].module,
+                    covered: (map(.covered) | add),
+                    count: (map(.count) | add) })
+            | sort_by(.module)
+            | "| Module | Lines covered | Lines | Coverage |",
+              "| --- | ---: | ---: | ---: |",
+              (.[] | "| `\(.module)` | \(.covered) | \(.count) | \(. | pct)% |")
+          ' "$SUMMARY_JSON"
+          printf '\n<details><summary>Per-file summary</summary>\n\n'
+          printf '```\n'
+          cat "$SUMMARY_TXT"
+          printf '```\n\n</details>\n'
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,55 @@
+name: Coverage reports
+description: Render lcov, HTML, JSON and text coverage reports from profdata already on disk.
+
+inputs:
+  output-dir:
+    description: Directory the reports are written into.
+    required: false
+    default: target/coverage
+
+outputs:
+  lcov-path:
+    description: The generated lcov tracefile.
+    value: ${{ steps.generate.outputs.lcov-path }}
+  html-dir:
+    description: Directory holding the generated HTML report.
+    value: ${{ steps.generate.outputs.html-dir }}
+  summary-json:
+    description: Machine-readable coverage summary.
+    value: ${{ steps.generate.outputs.summary-json }}
+  summary-txt:
+    description: Plain-text per-file coverage summary.
+    value: ${{ steps.generate.outputs.summary-txt }}
+
+runs:
+  using: composite
+  steps:
+    # `shell` is mandatory inside a composite action; a job's `defaults.run.shell` does not reach in here.
+    - name: Render the reports
+      id: generate
+      shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+      run: |
+        # The `default` above applies only when the caller omits the key entirely. An explicitly empty value
+        # arrives as "" and would otherwise scatter the reports across the workspace root.
+        OUTPUT_DIR="${OUTPUT_DIR:-target/coverage}"
+        # `--output-path` will not create its parent, and `--output-dir` is only accepted alongside --text,
+        # --html or --open, so neither flag can be relied on to make the directory.
+        mkdir -p "$OUTPUT_DIR"
+        cargo llvm-cov report \
+          --lcov --output-path "$OUTPUT_DIR/lcov.info"
+        # cargo-llvm-cov appends `html` to --output-dir rather than writing the report into it directly.
+        cargo llvm-cov report \
+          --html --output-dir "$OUTPUT_DIR"
+        cargo llvm-cov report \
+          --json --summary-only --output-path "$OUTPUT_DIR/summary.json"
+        cargo llvm-cov report \
+          --summary-only | tee "$OUTPUT_DIR/summary.txt"
+        # Published so the caller never has to restate paths that are derived from `output-dir`.
+        {
+          echo "lcov-path=$OUTPUT_DIR/lcov.info"
+          echo "html-dir=$OUTPUT_DIR/html"
+          echo "summary-json=$OUTPUT_DIR/summary.json"
+          echo "summary-txt=$OUTPUT_DIR/summary.txt"
+        } >> "$GITHUB_OUTPUT"

@@ -5,7 +5,10 @@ updates:
     schedule:
       interval: weekly
     # CI builds with `--locked` everywhere, so the lockfile has to be refreshed deliberately rather than drifting.
-    versioning-strategy: increase
+    # For the cargo ecosystem Dependabot accepts only `auto` and `lockfile-only` — the `increase`/`widen` values that
+    # work for npm and pip are rejected outright. `auto` refreshes the lockfile *and* proposes bumping a direct
+    # dependency's requirement in Cargo.toml when a release lands outside it, which is what a library wants to see.
+    versioning-strategy: auto
     open-pull-requests-limit: 5
     groups:
       # Patch and minor bumps are almost always mechanical; batching them keeps the PR queue readable while leaving
