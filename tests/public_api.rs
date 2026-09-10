@@ -198,7 +198,7 @@ mod sysinfo {
 
 #[cfg(feature = "fetch")]
 mod fetch {
-    use rust_sak::fetch::{DownloadMode, Fetch, RequestOptions};
+    use rust_sak::fetch::{DownloadMode, Fetch, ProxySettings, RequestOptions};
 
     #[test]
     fn the_builders_are_usable_from_outside() {
@@ -208,7 +208,16 @@ mod fetch {
             .retries(2)
             .disable_http2(true)
             .read_timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .download_mode(DownloadMode::Overwrite);
+
+        // The proxy settings must be nameable and composable from outside, not just settable.
+        let _via_proxy = Fetch::new().proxy(
+            ProxySettings::new("http://proxy.example.com:3128")
+                .basic_auth("user", "secret")
+                .no_proxy("localhost"),
+        );
+        let _direct = Fetch::new().no_proxy();
 
         let _options = RequestOptions::new()
             .method(reqwest::Method::POST)

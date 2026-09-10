@@ -937,3 +937,111 @@ async fn struct_download_mode_default_is_overridable() {
 
     let _ = tokio::fs::remove_file(&path).await;
 }
+
+// --- connect timeout and proxy tests ---
+
+#[test]
+fn connect_timeout_defaults_to_unbounded_and_round_trips() {
+    assert_eq!(Fetch::new().connect_timeout, None);
+
+    let bounded = Fetch::new().connect_timeout(Duration::from_secs(30));
+    assert_eq!(bounded.connect_timeout, Some(Duration::from_secs(30)));
+
+    // `impl Into<Option<Duration>>` accepts `None` to clear it, matching `read_timeout`.
+    assert_eq!(bounded.connect_timeout(None).connect_timeout, None);
+}
+
+#[test]
+fn proxy_mode_defaults_to_detection() {
+    assert_eq!(Fetch::new().proxy, ProxyMode::Detect);
+}
+
+#[test]
+fn proxy_sets_an_explicit_override_and_no_proxy_disables_detection() {
+    let settings = ProxySettings::new("http://proxy.example.com:3128");
+    let explicit = Fetch::new().proxy(settings.clone());
+    assert_eq!(explicit.proxy, ProxyMode::Explicit(settings));
+
+    assert_eq!(Fetch::new().no_proxy().proxy, ProxyMode::Disabled);
+
+    // The two are mutually exclusive rather than additive: the last call wins.
+    let overridden = Fetch::new()
+        .proxy(ProxySettings::new("http://proxy.example.com:3128"))
+        .no_proxy();
+    assert_eq!(overridden.proxy, ProxyMode::Disabled);
+}
+
+#[test]
+fn proxy_settings_carry_credentials_and_a_bypass_list() {
+    let settings = ProxySettings::new("http://proxy.example.com:3128")
+        .basic_auth("user", "secret")
+        .no_proxy("localhost,.internal");
+
+    assert_eq!(settings.url, "http://proxy.example.com:3128");
+    assert_eq!(settings.basic_auth, Some(("user".to_string(), "secret".to_string())));
+    assert_eq!(settings.no_proxy.as_deref(), Some("localhost,.internal"));
+}
+
+#[test]
+fn proxy_settings_display_never_reveals_the_password() {
+    let settings = ProxySettings::new("http://proxy.example.com:3128").basic_auth("user", "secret");
+    let rendered = settings.to_string();
+
+    assert_eq!(rendered, "http://proxy.example.com:3128");
+    assert!(!rendered.contains("secret"));
+}
+
+#[test]
+fn proxy_settings_build_a_reqwest_proxy() {
+    let settings = ProxySettings::new("http://proxy.example.com:3128")
+        .basic_auth("user", "secret")
+        .no_proxy("localhost");
+
+    assert!(settings.to_reqwest().is_ok());
+}
+
+#[test]
+fn an_invalid_proxy_url_surfaces_when_the_client_is_built() {
+    // Deferred rather than rejected by the builder, so `proxy()` stays infallible.
+    let fetch = Fetch::new().proxy(ProxySettings::new("not a url"));
+    assert!(fetch.client().is_err());
+}
+
+#[test]
+fn a_valid_proxy_url_builds_a_client() {
+    assert!(
+        Fetch::new()
+            .proxy(ProxySettings::new("http://proxy.example.com:3128"))
+            .client()
+            .is_ok()
+    );
+}
+
+#[test]
+fn config_builders_reset_the_cached_client() {
+    // A cached client built before the proxy was set would keep routing directly, so both of these
+    // must clear it.
+    let fetch = Fetch::new();
+    assert!(fetch.client().is_ok());
+    assert!(fetch.client.get().is_some());
+
+    let reconfigured = fetch.connect_timeout(Duration::from_secs(5));
+    assert!(reconfigured.client.get().is_none());
+
+    assert!(reconfigured.client().is_ok());
+    let reconfigured = reconfigured.no_proxy();
+    assert!(reconfigured.client.get().is_none());
+}
+
+#[test]
+fn clone_carries_the_connect_timeout_and_proxy() {
+    let original = Fetch::new()
+        .connect_timeout(Duration::from_secs(7))
+        .proxy(ProxySettings::new("http://proxy.example.com:3128"));
+    let copy = original.clone();
+
+    assert_eq!(copy.connect_timeout, Some(Duration::from_secs(7)));
+    assert_eq!(copy.proxy, original.proxy);
+    // The clone starts with an empty client cache, as the existing `Clone` contract states.
+    assert!(copy.client.get().is_none());
+}

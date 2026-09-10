@@ -13,6 +13,7 @@
 
 mod download;
 mod prepared;
+mod proxy;
 mod request;
 mod retry;
 
@@ -22,6 +23,7 @@ mod test_support;
 mod tests;
 
 pub use download::{Download, DownloadError, DownloadMode, Progress};
+pub use proxy::ProxySettings;
 pub use request::RequestOptions;
 
 use std::sync::OnceLock;
@@ -30,6 +32,7 @@ use std::time::Duration;
 use reqwest::header::HeaderMap;
 
 use prepared::PreparedRequest;
+use proxy::ProxyMode;
 
 /// A configurable, reusable HTTP fetcher, built with a fluent (consuming) builder API.
 ///
@@ -58,6 +61,12 @@ pub struct Fetch {
     /// Idle timeout applied per read: a request errors if no data arrives within this window (the timer resets on each
     /// successful read). `None` disables it. Defaults to 30 seconds.
     read_timeout: Option<Duration>,
+    /// Bound on establishing the connection — DNS, TCP and TLS — before any bytes are exchanged.
+    /// `None` leaves it unbounded, which is `reqwest`'s own default. Defaults to `None`.
+    connect_timeout: Option<Duration>,
+    /// How the proxy is resolved. Defaults to [`ProxyMode::Detect`], which leaves `reqwest`'s own
+    /// environment and system-settings detection in place.
+    proxy: ProxyMode,
     /// Default [`DownloadMode`] for [`Fetch::download`], overridable per request via
     /// [`RequestOptions::download_mode`]. Defaults to [`DownloadMode::Resume`].
     download_mode: DownloadMode,
@@ -66,14 +75,16 @@ pub struct Fetch {
 }
 
 impl Default for Fetch {
-    /// The default configuration: no headers, no retries, HTTP/2 enabled, a 30-second read (idle) timeout, and
-    /// [`DownloadMode::Resume`] for downloads.
+    /// The default configuration: no headers, no retries, HTTP/2 enabled, a 30-second read (idle) timeout, an
+    /// unbounded connect timeout, `reqwest`'s own proxy detection, and [`DownloadMode::Resume`] for downloads.
     fn default() -> Self {
         Self {
             headers: HeaderMap::new(),
             retries: 0,
             disable_http2: false,
             read_timeout: Some(Duration::from_secs(30)),
+            connect_timeout: None,
+            proxy: ProxyMode::Detect,
             download_mode: DownloadMode::Resume,
             client: OnceLock::new(),
         }
@@ -89,6 +100,8 @@ impl Clone for Fetch {
             retries: self.retries,
             disable_http2: self.disable_http2,
             read_timeout: self.read_timeout,
+            connect_timeout: self.connect_timeout,
+            proxy: self.proxy.clone(),
             download_mode: self.download_mode,
             client: OnceLock::new(),
         }
@@ -96,8 +109,8 @@ impl Clone for Fetch {
 }
 
 impl Fetch {
-    /// Creates a new [`Fetch`] with the default configuration: no headers, no retries, HTTP/2 enabled, and a
-    /// 30-second read (idle) timeout.
+    /// Creates a new [`Fetch`] with the default configuration: no headers, no retries, HTTP/2 enabled, a
+    /// 30-second read (idle) timeout, an unbounded connect timeout, and `reqwest`'s own proxy detection.
     pub fn new() -> Self {
         Self::default()
     }
@@ -163,6 +176,62 @@ impl Fetch {
         self
     }
 
+    /// Sets the bound on establishing a connection — DNS resolution, the TCP handshake and the TLS
+    /// handshake — before any bytes are exchanged.
+    ///
+    /// This is a different guarantee from [`read_timeout`](Fetch::read_timeout), which bounds how long an
+    /// *established* connection may stall. A host that accepts nothing at all — a dropped packet filter, a black-holed
+    /// address — never reaches a read, so only this setting bounds it. Pass a [`Duration`] to set it or `None` to
+    /// leave it unbounded, which is the default.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// let fetch = Fetch::new().connect_timeout(Duration::from_secs(30));
+    /// ```
+    pub fn connect_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.connect_timeout = timeout.into();
+        self.client = OnceLock::new();
+        self
+    }
+
+    /// Routes requests through an explicit proxy, overriding whatever the environment or the system settings say.
+    ///
+    /// Without this, `reqwest`'s own detection applies: the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` variables on every
+    /// platform, plus the system proxy settings on macOS and Windows. Call this only to override that; call
+    /// [`Fetch::no_proxy`] to switch it off entirely.
+    ///
+    /// An invalid proxy URL is not rejected here — it surfaces as the [`reqwest::Error`] from the first request, which
+    /// is where the client is built.
+    ///
+    /// ```
+    /// use rust_sak::fetch::{Fetch, ProxySettings};
+    ///
+    /// let fetch = Fetch::new().proxy(ProxySettings::new("http://proxy.example.com:3128"));
+    /// ```
+    pub fn proxy(mut self, proxy: ProxySettings) -> Self {
+        self.proxy = ProxyMode::Explicit(proxy);
+        self.client = OnceLock::new();
+        self
+    }
+
+    /// Connects directly, ignoring every source of proxy configuration including the environment variables.
+    ///
+    /// This is stronger than setting no proxy: it disables `reqwest`'s detection rather than declining to override it,
+    /// so a `HTTPS_PROXY` in the environment is bypassed rather than honoured.
+    ///
+    /// ```
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// let direct = Fetch::new().no_proxy();
+    /// ```
+    pub fn no_proxy(mut self) -> Self {
+        self.proxy = ProxyMode::Disabled;
+        self.client = OnceLock::new();
+        self
+    }
+
     /// Sets the default [`DownloadMode`] for [`Fetch::download`], controlling what happens when a file already exists at
     /// the target path. Defaults to [`DownloadMode::Resume`]. Individual requests can override this via
     /// [`RequestOptions::download_mode`]. Like [`Fetch::retries`], this is not a client-build setting, so it does not
@@ -180,8 +249,8 @@ impl Fetch {
 
     /// Returns the cached HTTP client, building it from the current configuration on first use.
     ///
-    /// The struct's headers become the client's default headers, the HTTP/2 toggle and read timeout are applied at
-    /// build time, and the result is cached for reuse across requests.
+    /// The struct's headers become the client's default headers; the HTTP/2 toggle, the read and connect timeouts
+    /// and the proxy mode are applied at build time; and the result is cached for reuse across requests.
     ///
     /// # Errors
     ///
@@ -197,6 +266,14 @@ impl Fetch {
         }
         if let Some(timeout) = self.read_timeout {
             builder = builder.read_timeout(timeout);
+        }
+        if let Some(timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(timeout);
+        }
+        match &self.proxy {
+            ProxyMode::Detect => {}
+            ProxyMode::Disabled => builder = builder.no_proxy(),
+            ProxyMode::Explicit(settings) => builder = builder.proxy(settings.to_reqwest()?),
         }
 
         let client = builder.build()?;

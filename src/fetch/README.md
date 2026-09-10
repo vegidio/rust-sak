@@ -29,13 +29,50 @@ These consume `self` and return `Self`, so chain them. Changing a client-build s
 
 | Method                                       | What it does                                                                                                            |
 |----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
-| `Fetch::new()` / `Fetch::default()`          | New fetcher. Defaults: no headers, no retries, HTTP/2 on, **30s read (idle) timeout**, `DownloadMode::Resume`.          |
+| `Fetch::new()` / `Fetch::default()`          | New fetcher. Defaults: no headers, no retries, HTTP/2 on, **30s read (idle) timeout**, no connect timeout, `reqwest` proxy detection, `DownloadMode::Resume`. |
 | `.header(key, value)`                        | Add one default header sent with every request. **Panics** on an invalid name/value — use for static headers.           |
 | `.headers(HeaderMap)`                        | Replace the entire default header set.                                                                                  |
 | `.retries(u32)`                              | Number of retry attempts for failed requests.                                                                           |
 | `.disable_http2(bool)`                       | `true` forces HTTP/1.x; `false` keeps HTTP/2.                                                                           |
 | `.read_timeout(impl Into<Option<Duration>>)` | Idle timeout per read — resets after each successful read, so it bounds stalls, not total duration. `None` disables it. |
 | `.download_mode(DownloadMode)`               | Default behavior when a download target already exists.                                                                 |
+| `.connect_timeout(impl Into<Option<Duration>>)` | Bound on establishing the connection (DNS + TCP + TLS), before any bytes move. `None` leaves it unbounded. |
+| `.proxy(ProxySettings)`                      | Route through an explicit proxy, overriding the environment and system settings.                                         |
+| `.no_proxy()`                                | Connect directly, ignoring **all** proxy configuration including `HTTPS_PROXY`.                                          |
+
+
+## Proxies and connection bounding
+
+With nothing configured, `reqwest`'s own detection applies: the `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables on every platform, plus the system proxy settings on macOS and Windows. The two builders below exist to *override* that, not to enable it.
+
+`ProxySettings` carries the proxy URL and, optionally, credentials and a bypass list. Its `Display` prints the URL alone, so it can be named in a log line or an error message without leaking the password.
+
+```rust
+use rust_sak::fetch::{Fetch, ProxySettings};
+
+// Override whatever the environment says.
+let via_proxy = Fetch::new().proxy(
+    ProxySettings::new("http://proxy.example.com:3128")
+        .basic_auth("user", "secret")
+        .no_proxy("localhost,127.0.0.1,.internal"),
+);
+
+// Or opt out of proxying entirely, environment variables included.
+let direct = Fetch::new().no_proxy();
+```
+
+An invalid proxy URL is not rejected by `.proxy(...)`; it surfaces as the `reqwest::Error` from the first request, which is where the client is built.
+
+`connect_timeout` bounds a different failure from `read_timeout`. `read_timeout` bounds how long an *established* connection may stall; a host that accepts nothing at all never reaches a read, so only `connect_timeout` bounds it.
+
+```rust
+use std::time::Duration;
+use rust_sak::fetch::Fetch;
+
+let fetch = Fetch::new()
+    .connect_timeout(Duration::from_secs(30)) // bounds the handshake
+    .read_timeout(Duration::from_secs(30));   // bounds a stall mid-transfer
+```
 
 ## `Fetch` — request methods
 
