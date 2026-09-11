@@ -2444,3 +2444,179 @@ fn io_errors_convert_into_fs_errors() {
 
     assert!(matches!(error, FsError::Io(_)));
 }
+
+// --- extraction progress tests ---
+//
+// The hook is the reason `fs` grew an option at all, so these cover the two properties a progress bar actually needs:
+// that the counts end where the summary does, and that a single very large entry reports more than once. Without the
+// second, the archive this was added for — one ~170 MB shared library — would render as a jump from 0 to 100%.
+
+/// Collects every [`ExtractProgress`] a hook is handed, in order.
+#[derive(Clone, Default)]
+struct ProgressLog(std::sync::Arc<std::sync::Mutex<Vec<ExtractProgress>>>);
+
+impl ProgressLog {
+    /// Options carrying a hook that records into this log.
+    fn options(&self) -> ExtractOptions {
+        let sink = std::sync::Arc::clone(&self.0);
+        ExtractOptions::new().on_progress(move |progress| sink.lock().unwrap().push(*progress))
+    }
+
+    fn entries(&self) -> Vec<ExtractProgress> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// An entry whose contents comfortably exceed one copy chunk and one coalescing window, so a single entry has to
+/// produce several updates rather than one.
+fn large_entry(name: &str) -> TestEntry {
+    TestEntry::File {
+        name: name.to_string(),
+        contents: vec![b'x'; 1 << 20],
+        mode: None,
+    }
+}
+
+#[test]
+fn extraction_progress_ends_where_the_summary_does() {
+    let entries = [
+        TestEntry::file("a.txt", "hello"),
+        TestEntry::file("b.txt", "world!"),
+        TestEntry::file("c.txt", "again"),
+    ];
+    let log = ProgressLog::default();
+
+    let (result, _sandbox) = unzip_entries(&entries, &log.options());
+    let summary = result.unwrap();
+    let updates = log.entries();
+
+    assert!(!updates.is_empty(), "the hook was never called");
+    assert!(
+        updates.windows(2).all(|pair| pair[0].bytes <= pair[1].bytes),
+        "byte counts must never go backwards: {updates:?}"
+    );
+
+    let last = updates.last().unwrap();
+    assert_eq!(last.bytes, summary.bytes);
+    assert_eq!(last.entries, summary.files);
+}
+
+#[test]
+fn extraction_progress_reports_within_a_single_large_entry() {
+    // The case design D3 names: one big file. Per-entry reporting would produce exactly one update here.
+    let log = ProgressLog::default();
+
+    let (result, _sandbox) = unzip_entries(&[large_entry("big.bin")], &log.options());
+    let summary = result.unwrap();
+    let updates = log.entries();
+
+    assert_eq!(summary.files, 1);
+    assert!(
+        updates.len() > 1,
+        "a single entry larger than one copy chunk must report more than once, got {} update(s)",
+        updates.len()
+    );
+    // Every update but the last lands mid-entry, before the entry count moves.
+    assert!(
+        updates[..updates.len() - 1].iter().any(|update| update.entries == 0),
+        "no update arrived while the entry was still being written: {updates:?}"
+    );
+    assert_eq!(updates.last().unwrap().bytes, summary.bytes);
+}
+
+#[test]
+fn zip_reports_totals_from_the_central_directory() {
+    let entries = [TestEntry::file("a.txt", "hello"), TestEntry::file("b.txt", "world!")];
+    let log = ProgressLog::default();
+
+    let (result, _sandbox) = unzip_entries(&entries, &log.options());
+    let summary = result.unwrap();
+    let last = *log.entries().last().unwrap();
+
+    assert_eq!(last.total_entries, Some(2));
+    assert_eq!(last.total_bytes, Some(summary.bytes));
+}
+
+#[test]
+fn sevenz_reports_totals_from_the_header() {
+    let entries = [TestEntry::file("a.txt", "hello"), TestEntry::file("b.txt", "world!")];
+    let log = ProgressLog::default();
+
+    let (result, _sandbox) = un7zip_entries(&entries, &log.options());
+    let summary = result.unwrap();
+    let last = *log.entries().last().unwrap();
+
+    assert_eq!(last.total_entries, Some(2));
+    assert_eq!(last.total_bytes, Some(summary.bytes));
+    assert_eq!(last.bytes, summary.bytes);
+}
+
+#[test]
+fn tar_xz_reports_no_totals() {
+    // TAR keeps its sizes inside the compressed stream, so a total would mean decompressing twice. Reporting `None`
+    // is the honest answer, not a gap.
+    let entries = [TestEntry::file("a.txt", "hello"), TestEntry::file("b.txt", "world!")];
+    let log = ProgressLog::default();
+
+    let (result, _sandbox) = untar_entries(&entries, &log.options());
+    let summary = result.unwrap();
+    let last = *log.entries().last().unwrap();
+
+    assert_eq!(last.total_entries, None);
+    assert_eq!(last.total_bytes, None);
+    // The running counts are still exact — only the destination is unknown.
+    assert_eq!(last.bytes, summary.bytes);
+    assert_eq!(last.entries, summary.files);
+}
+
+#[test]
+fn extraction_without_a_hook_behaves_exactly_as_before() {
+    let entries = [
+        TestEntry::dir("docs"),
+        TestEntry::file("docs/readme.txt", "hello"),
+        TestEntry::file("top.txt", "hi"),
+    ];
+
+    let (plain, plain_sandbox) = unzip_entries(&entries, &ExtractOptions::new());
+    let log = ProgressLog::default();
+    let (hooked, hooked_sandbox) = unzip_entries(&entries, &log.options());
+
+    assert_eq!(plain.unwrap(), hooked.unwrap());
+    assert_eq!(
+        fs::read(plain_sandbox.target().join("docs/readme.txt")).unwrap(),
+        fs::read(hooked_sandbox.target().join("docs/readme.txt")).unwrap()
+    );
+}
+
+#[test]
+fn progress_counts_every_entry_including_skipped_ones() {
+    // `entries` is counted on the same basis as `total_entries`, so an archive whose entries are not all files still
+    // ends with the two agreeing rather than stalling short of the total.
+    let entries = [
+        TestEntry::dir("docs"),
+        TestEntry::file("docs/readme.txt", "hello"),
+        TestEntry::file("top.txt", "hi"),
+    ];
+    let log = ProgressLog::default();
+
+    let (result, _sandbox) = unzip_entries(&entries, &log.options());
+    let summary = result.unwrap();
+    let last = *log.entries().last().unwrap();
+
+    assert_eq!(last.entries, summary.files + summary.directories);
+    assert_eq!(last.entries, last.total_entries.unwrap());
+}
+
+#[test]
+fn extract_options_debug_and_equality_survive_the_hook() {
+    let plain = ExtractOptions::new().max_entries(4);
+    assert_eq!(plain, ExtractOptions::new().max_entries(4));
+    assert!(format!("{plain:?}").contains("on_progress: false"));
+
+    let hooked = plain.clone().on_progress(|_| {});
+    assert_ne!(plain, hooked);
+    // A clone shares the very same hook, so it stays equal; a separately-built one does not.
+    assert_eq!(hooked, hooked.clone());
+    assert_ne!(hooked, plain.on_progress(|_| {}));
+    assert!(format!("{hooked:?}").contains("on_progress: true"));
+}
