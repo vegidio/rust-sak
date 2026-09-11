@@ -5,7 +5,7 @@ use std::path::Path;
 
 use zip::ZipArchive;
 
-use super::extract::{EntryKind, Extractor, RawEntry, S_IFMT, S_IFREG};
+use super::extract::{EntryKind, Extractor, RawEntry, S_IFMT, S_IFREG, Totals};
 use super::{ExtractOptions, ExtractSummary, Result};
 
 /// Extracts a ZIP archive into `target_dir`, creating it if it does not exist.
@@ -42,7 +42,14 @@ pub fn unzip(
     options: &ExtractOptions,
 ) -> Result<ExtractSummary> {
     let mut zip = ZipArchive::new(BufReader::new(File::open(archive)?))?;
-    let mut extractor = Extractor::new(target_dir.as_ref(), options)?;
+
+    // The central directory has already been read, so both totals are free. `decompressed_size` declines to answer
+    // for an archive using data descriptors, where the sizes are not in the directory at all.
+    let totals = Totals {
+        entries: Some(zip.len() as u64),
+        bytes: zip.decompressed_size().and_then(|bytes| u64::try_from(bytes).ok()),
+    };
+    let mut extractor = Extractor::new(target_dir.as_ref(), options, totals)?;
 
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;

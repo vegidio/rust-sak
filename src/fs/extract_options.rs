@@ -1,3 +1,9 @@
+use std::fmt;
+use std::sync::Arc;
+
+/// The progress callback, shared behind an [`Arc`] so [`ExtractOptions`] stays [`Clone`] and [`Sync`].
+type ProgressHook = Arc<dyn Fn(&ExtractProgress) + Send + Sync>;
+
 /// How [`extract`](super::extract) and the per-format functions should handle an archive.
 ///
 /// The default imposes **no limits**, allows symbolic links, and honours the modes the archive records. Every limit
@@ -15,13 +21,49 @@
 ///     .symlinks(false)
 ///     .file_mode(0o644);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ExtractOptions {
     pub(super) max_total_bytes: Option<u64>,
     pub(super) max_file_bytes: Option<u64>,
     pub(super) max_entries: Option<u64>,
     pub(super) symlinks: bool,
     pub(super) file_mode: Option<u32>,
+    /// The caller's progress hook, shared rather than owned so the options stay [`Clone`] and [`Sync`].
+    pub(super) on_progress: Option<ProgressHook>,
+}
+
+/// A callback is not comparable, so equality is decided on the ceilings and, for the hook, on whether two options
+/// share the very same one. Two separately-written closures doing identical work compare unequal — the only answer
+/// available without asking a function whether it equals another function.
+impl PartialEq for ExtractOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_total_bytes == other.max_total_bytes
+            && self.max_file_bytes == other.max_file_bytes
+            && self.max_entries == other.max_entries
+            && self.symlinks == other.symlinks
+            && self.file_mode == other.file_mode
+            && match (&self.on_progress, &other.on_progress) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ExtractOptions {}
+
+/// Renders every field except the hook, which is reported as present or absent — a `dyn Fn` has nothing else to say.
+impl fmt::Debug for ExtractOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractOptions")
+            .field("max_total_bytes", &self.max_total_bytes)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("max_entries", &self.max_entries)
+            .field("symlinks", &self.symlinks)
+            .field("file_mode", &self.file_mode)
+            .field("on_progress", &self.on_progress.is_some())
+            .finish()
+    }
 }
 
 impl ExtractOptions {
@@ -71,6 +113,35 @@ impl ExtractOptions {
         self.file_mode = Some(mode);
         self
     }
+
+    /// Sets a callback invoked as the extraction proceeds, receiving an [`ExtractProgress`] snapshot.
+    ///
+    /// It fires **within** an entry as well as between entries, which is the whole point for an archive that is one
+    /// very large file: reporting only per entry would render such an expansion as a single jump from nothing to
+    /// done. Updates are coalesced — roughly one per 256 KiB written or per 100 ms, plus one as each entry finishes —
+    /// so the rate does not depend on how the archive happens to be chunked.
+    ///
+    /// **The callback must not block.** It runs inline in the copy loop, so anything slow in it slows the extraction
+    /// itself. Send the snapshot somewhere and return; do the work elsewhere.
+    ///
+    /// `Fn`, not `FnMut`, so [`ExtractOptions`] stays [`Clone`] and [`Sync`]; a callback that needs to mutate state
+    /// uses interior mutability, as it would for any shared callback.
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    /// use rust_sak::fs::ExtractOptions;
+    ///
+    /// let written = Arc::new(AtomicU64::new(0));
+    /// let counter = Arc::clone(&written);
+    /// let options = ExtractOptions::new().on_progress(move |progress| {
+    ///     counter.store(progress.bytes, Ordering::Relaxed);
+    /// });
+    /// ```
+    pub fn on_progress(mut self, f: impl Fn(&ExtractProgress) + Send + Sync + 'static) -> Self {
+        self.on_progress = Some(Arc::new(f));
+        self
+    }
 }
 
 impl Default for ExtractOptions {
@@ -81,8 +152,29 @@ impl Default for ExtractOptions {
             max_entries: None,
             symlinks: true,
             file_mode: None,
+            on_progress: None,
         }
     }
+}
+
+/// How far an extraction has got, handed to the callback set by [`ExtractOptions::on_progress`].
+///
+/// The totals come from the archive's header, which is why they are optional rather than merely unknown-until-later:
+/// ZIP's central directory and 7z's header both carry every entry's uncompressed size, so both report [`Some`].
+/// TAR.XZ carries none — the sizes live inside the compressed stream, and producing a total would mean decompressing
+/// the whole archive twice — so it reports [`None`] rather than a guess, and a caller renders an indeterminate bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtractProgress {
+    /// How many entries have been processed so far, counted exactly as [`total_entries`](ExtractProgress::total_entries)
+    /// counts them — every entry the archive yields, including ones that are deliberately skipped.
+    pub entries: u64,
+    /// How many uncompressed bytes of file content have been written so far. Never decreases.
+    pub bytes: u64,
+    /// How many entries the archive says it holds, or [`None`] for a format whose header does not say.
+    pub total_entries: Option<u64>,
+    /// How many uncompressed bytes the archive says its entries hold, or [`None`] for a format whose header does not
+    /// say.
+    pub total_bytes: Option<u64>,
 }
 
 /// What an extraction actually did.

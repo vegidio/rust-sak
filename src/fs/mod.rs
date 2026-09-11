@@ -70,7 +70,7 @@ pub use copy_files::copy_files;
 pub use copy_options::{CopyOptions, CopySummary};
 pub use error::{FsError, Limit, Result};
 pub use extract_archive::{extract, extract_as};
-pub use extract_options::{ExtractOptions, ExtractSummary};
+pub use extract_options::{ExtractOptions, ExtractProgress, ExtractSummary};
 pub use file_exists::file_exists;
 pub use list_options::ListOptions;
 pub use list_path::list_path;

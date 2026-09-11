@@ -6,7 +6,7 @@ use std::path::Path;
 use liblzma::read::XzDecoder;
 use tar::EntryType;
 
-use super::extract::{EntryKind, Extractor, RawEntry};
+use super::extract::{EntryKind, Extractor, RawEntry, Totals};
 use super::{ExtractOptions, ExtractSummary, FsError, Result};
 
 /// Extracts an xz-compressed TAR archive into `target_dir`, creating it if it does not exist.
@@ -42,7 +42,10 @@ pub fn untar_xz(
 ) -> Result<ExtractSummary> {
     let decoder = XzDecoder::new(BufReader::new(File::open(archive)?));
     let mut tar = tar::Archive::new(decoder);
-    let mut extractor = Extractor::new(target_dir.as_ref(), options)?;
+
+    // TAR carries its sizes inside the compressed stream, so a total would mean decompressing the whole archive twice.
+    // Reporting nothing is the honest answer; a caller renders an indeterminate bar.
+    let mut extractor = Extractor::new(target_dir.as_ref(), options, Totals::default())?;
 
     for entry in tar.entries()? {
         let mut entry = entry?;

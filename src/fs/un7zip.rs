@@ -3,7 +3,7 @@ use std::path::Path;
 
 use sevenz_rust2::{ArchiveReader, Password};
 
-use super::extract::{EntryKind, Extractor, RawEntry, S_IFLNK, S_IFMT};
+use super::extract::{EntryKind, Extractor, RawEntry, S_IFLNK, S_IFMT, Totals};
 use super::{ExtractOptions, ExtractSummary, Result};
 
 /// The flag p7zip sets in `windows_attributes` to mean "the high 16 bits are a Unix mode".
@@ -34,7 +34,14 @@ pub fn un7zip(
     options: &ExtractOptions,
 ) -> Result<ExtractSummary> {
     let mut reader = ArchiveReader::open(archive.as_ref(), Password::empty())?;
-    let mut extractor = Extractor::new(target_dir.as_ref(), options)?;
+
+    // 7z's header lists every entry and its uncompressed size, so both totals are known before a byte is expanded.
+    let files = &reader.archive().files;
+    let totals = Totals {
+        entries: Some(files.len() as u64),
+        bytes: Some(files.iter().map(|file| file.size).sum()),
+    };
+    let mut extractor = Extractor::new(target_dir.as_ref(), options, totals)?;
 
     // `for_each_entries` can only carry a `sevenz_rust2::Error` back out, and ours are richer than that. Parking the
     // failure here and stopping the walk cleanly with `Ok(false)` keeps the real reason intact.
