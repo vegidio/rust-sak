@@ -45,7 +45,7 @@ use super::test_support::{
     read_request, write_partial_response, write_range_not_satisfiable, write_response, write_response_in_chunks,
     write_response_no_length,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -439,6 +439,43 @@ async fn drain(download: &mut Download) -> Progress {
     download.progress()
 }
 
+/// Removes a test's target file and any partial bookkeeping left beside it.
+async fn clean(path: &Path) {
+    let _ = tokio::fs::remove_file(path).await;
+    let _ = tokio::fs::remove_file(partial::part_path(path)).await;
+    let _ = tokio::fs::remove_file(partial::sidecar_path(path)).await;
+}
+
+/// Seeds an interrupted transfer: `bytes` in `<path>.part`, plus the sidecar identifying them.
+///
+/// The recorded URL is normalized through [`reqwest::Url`] because that is what the transfer compares against — the
+/// sidecar has to hold the URL the request actually resolves to, not the string a caller happened to type.
+async fn seed_partial(path: &Path, url: &str, bytes: &[u8], etag: Option<&str>, resume_key: Option<&str>) {
+    clean(path).await;
+    tokio::fs::write(partial::part_path(path), bytes).await.unwrap();
+    partial::write(
+        &partial::sidecar_path(path),
+        &partial::Sidecar {
+            url: reqwest::Url::parse(url).unwrap().to_string(),
+            etag: etag.map(str::to_owned),
+            total: None,
+            resume_key: resume_key.map(str::to_owned),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Asserts that a finished transfer left the target file with `contents` and no bookkeeping behind.
+async fn assert_settled(path: &Path, contents: &[u8]) {
+    assert_eq!(tokio::fs::read(path).await.unwrap(), contents);
+    assert!(!partial::part_path(path).exists(), "a finished transfer left a .part");
+    assert!(
+        !partial::sidecar_path(path).exists(),
+        "a finished transfer left a sidecar"
+    );
+}
+
 #[tokio::test]
 async fn download_writes_file() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -699,10 +736,10 @@ async fn resume_appends_from_offset() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
 
-    // Pre-seed a partial file: the first 4 bytes of "0123456789".
-    let _ = tokio::fs::remove_file(&path).await;
-    tokio::fs::write(&path, b"0123").await.unwrap();
+    // An interrupted transfer: the first 4 bytes of "0123456789", recorded against this URL.
+    seed_partial(&path, &url, b"0123", None, None).await;
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -714,7 +751,7 @@ async fn resume_appends_from_offset() {
         write_partial_response(&mut stream, 4, 10, "456789").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    let mut download = Fetch::new().download(&url, &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -723,10 +760,8 @@ async fn resume_appends_from_offset() {
     assert_eq!(progress.total, Some(10));
     assert_eq!(progress.downloaded, 10);
 
-    let contents = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(contents, b"0123456789");
-
-    let _ = tokio::fs::remove_file(&path).await;
+    assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
 }
 
 #[tokio::test]
@@ -734,10 +769,10 @@ async fn resume_falls_back_when_server_ignores_range() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
 
-    // Pre-seed stale partial bytes; the server ignores Range and replies with a full 200 body.
-    let _ = tokio::fs::remove_file(&path).await;
-    tokio::fs::write(&path, b"stale").await.unwrap();
+    // A partial that is ours by identity; the server ignores Range and replies with a full 200 body.
+    seed_partial(&path, &url, b"stale", None, None).await;
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -745,7 +780,7 @@ async fn resume_falls_back_when_server_ignores_range() {
         write_response(&mut stream, "200 OK", "full body").await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    let mut download = Fetch::new().download(&url, &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -753,10 +788,8 @@ async fn resume_falls_back_when_server_ignores_range() {
     assert!(!progress.failed);
 
     // The stale partial was truncated, not appended to.
-    let contents = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(contents, b"full body");
-
-    let _ = tokio::fs::remove_file(&path).await;
+    assert_settled(&path, b"full body").await;
+    clean(&path).await;
 }
 
 #[tokio::test]
@@ -764,10 +797,10 @@ async fn resume_rejects_206_with_mismatched_content_range() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
 
-    // Pre-seed a 4-byte partial; the client will request `bytes=4-`.
-    let _ = tokio::fs::remove_file(&path).await;
-    tokio::fs::write(&path, b"0123").await.unwrap();
+    // A 4-byte partial; the client will request `bytes=4-`.
+    seed_partial(&path, &url, b"0123", None, None).await;
 
     let server = tokio::spawn(async move {
         // First attempt: a 206 that lies about its range — it claims to start at byte 0, not the requested 4.
@@ -789,7 +822,7 @@ async fn resume_rejects_206_with_mismatched_content_range() {
         write_response(&mut stream, "200 OK", "0123456789").await;
     });
 
-    let mut download = Fetch::new().retries(1).download(format!("http://{addr}"), &path);
+    let mut download = Fetch::new().retries(1).download(&url, &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -798,10 +831,8 @@ async fn resume_rejects_206_with_mismatched_content_range() {
     assert_eq!(progress.downloaded, 10);
 
     // The mismatched partial body was never appended; the retry produced the correct full file.
-    let contents = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(contents, b"0123456789");
-
-    let _ = tokio::fs::remove_file(&path).await;
+    assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
 }
 
 #[tokio::test]
@@ -811,7 +842,7 @@ async fn skip_when_file_exists() {
     let addr = listener.local_addr().unwrap();
     let path = temp_path(addr.port());
 
-    let _ = tokio::fs::remove_file(&path).await;
+    clean(&path).await;
     tokio::fs::write(&path, b"existing").await.unwrap();
 
     let mut download = Fetch::new().download_with_options(
@@ -831,7 +862,7 @@ async fn skip_when_file_exists() {
     assert_eq!(contents, b"existing");
 
     drop(listener);
-    let _ = tokio::fs::remove_file(&path).await;
+    clean(&path).await;
 }
 
 #[tokio::test]
@@ -839,8 +870,10 @@ async fn overwrite_truncates_existing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
 
-    let _ = tokio::fs::remove_file(&path).await;
+    // Both an old target file and a resumable partial: Overwrite must ignore the partial and replace the target.
+    seed_partial(&path, &url, b"0123", None, None).await;
     tokio::fs::write(&path, b"old stale contents").await.unwrap();
 
     let server = tokio::spawn(async move {
@@ -854,7 +887,7 @@ async fn overwrite_truncates_existing() {
     });
 
     let mut download = Fetch::new().download_with_options(
-        format!("http://{addr}"),
+        &url,
         &path,
         RequestOptions::new().download_mode(DownloadMode::Overwrite),
     );
@@ -864,10 +897,8 @@ async fn overwrite_truncates_existing() {
     assert!(progress.completed);
     assert!(!progress.failed);
 
-    let contents = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(contents, b"fresh");
-
-    let _ = tokio::fs::remove_file(&path).await;
+    assert_settled(&path, b"fresh").await;
+    clean(&path).await;
 }
 
 #[tokio::test]
@@ -875,10 +906,10 @@ async fn resume_416_treated_as_complete() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
 
-    // A file that is already complete; the server rejects the range with 416.
-    let _ = tokio::fs::remove_file(&path).await;
-    tokio::fs::write(&path, b"0123456789").await.unwrap();
+    // A partial that is in fact the whole file; the server rejects the range with 416.
+    seed_partial(&path, &url, b"0123456789", None, None).await;
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -886,7 +917,7 @@ async fn resume_416_treated_as_complete() {
         write_range_not_satisfiable(&mut stream, 10).await;
     });
 
-    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    let mut download = Fetch::new().download(&url, &path);
     let progress = drain(&mut download).await;
     server.await.unwrap();
 
@@ -894,11 +925,263 @@ async fn resume_416_treated_as_complete() {
     assert!(!progress.failed);
     assert_eq!(progress.downloaded, 10);
 
-    // The complete file is preserved.
-    let contents = tokio::fs::read(&path).await.unwrap();
-    assert_eq!(contents, b"0123456789");
+    // The complete partial was promoted rather than transferred again.
+    assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
+}
 
-    let _ = tokio::fs::remove_file(&path).await;
+// --- partial-file bookkeeping ---
+//
+// One test per row of the resume state machine: what is on disk, what the sidecar says, and whether a byte of it may
+// be kept. Each is a case where writing straight to the target path silently produced a corrupt or falsely-complete
+// file.
+
+#[tokio::test]
+async fn a_completed_transfer_leaves_no_partial_behind() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+
+    clean(&path).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "complete").await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"complete").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_changed_url_discards_the_partial_instead_of_appending_to_it() {
+    // The bug this bookkeeping exists for. Release assets are namespaced by version in the URL but keep the same file
+    // name, so a version bump is a different URL writing to the same local path — and a resume would append the new
+    // release's bytes onto the old one's prefix.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+
+    seed_partial(&path, &format!("http://{addr}/v1/asset.bin"), b"OLD!", None, None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            !request.to_lowercase().contains("range:"),
+            "a partial from a different URL must not be resumed, got: {request}"
+        );
+        write_response(&mut stream, "200 OK", "v2 bytes").await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}/v2/asset.bin"), &path);
+    let progress = drain(&mut download).await;
+    server.await.unwrap();
+
+    assert!(!progress.failed);
+    assert_settled(&path, b"v2 bytes").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_partial_without_a_sidecar_restarts() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+
+    // Bytes whose origin is unknowable. Guessing that they belong to this request is the whole failure mode.
+    clean(&path).await;
+    tokio::fs::write(partial::part_path(&path), b"orphaned").await.unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            !request.to_lowercase().contains("range:"),
+            "an unidentifiable partial must not be resumed, got: {request}"
+        );
+        write_response(&mut stream, "200 OK", "fresh bytes").await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"fresh bytes").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_mismatched_resume_key_restarts() {
+    // Same URL, different bytes — a release re-cut in place. Only the caller's own identity can see it.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"0123", None, Some("sha256:old")).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            !request.to_lowercase().contains("range:"),
+            "a partial with a different resume_key must not be resumed, got: {request}"
+        );
+        write_response(&mut stream, "200 OK", "new bytes").await;
+    });
+
+    let mut download =
+        Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:new"));
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"new bytes").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_matching_resume_key_resumes() {
+    // The counterpart to the test above: the same key means the partial really is these bytes, so it is kept.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"0123", None, Some("sha256:same")).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            request.contains("bytes=4-"),
+            "expected a resume Range header, got: {request}"
+        );
+        write_partial_response(&mut stream, 4, 10, "456789").await;
+    });
+
+    let mut download =
+        Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:same"));
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_recorded_etag_is_sent_as_if_range() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"0123", Some("\"v1\""), None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            request.to_lowercase().contains("if-range: \"v1\""),
+            "expected the recorded ETag as If-Range, got: {request}"
+        );
+        write_partial_response(&mut stream, 4, 10, "456789").await;
+    });
+
+    let mut download = Fetch::new().download(&url, &path);
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn if_range_answered_with_200_restarts() {
+    // The server's own verdict that the bytes changed: it declines the range and sends the whole resource instead.
+    // Nothing extra handles this — the existing fresh-download branch does, which is exactly the point.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"0123", Some("\"v1\""), None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(request.to_lowercase().contains("if-range:"));
+        write_response(&mut stream, "200 OK", "replaced!!").await;
+    });
+
+    let mut download = Fetch::new().download(&url, &path);
+    let progress = drain(&mut download).await;
+    server.await.unwrap();
+
+    assert!(!progress.failed);
+    // The old prefix was discarded rather than kept in front of the new body.
+    assert_settled(&path, b"replaced!!").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_transfer_leaves_nothing_at_the_target_path() {
+    // The second half of the bug: writing straight to the target left a truncated file there, after which `Skip`
+    // reported it complete forever.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+
+    clean(&path).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        // Announce far more than is ever sent, then stall so the transfer is cancelled mid-body.
+        use tokio::io::AsyncWriteExt;
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(b"partial").await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    // Wait until bytes are actually in flight, then abort.
+    download.changed().await.unwrap();
+    download.cancel();
+    assert!(matches!(download.join().await, Err(DownloadError::Cancelled)));
+    server.abort();
+
+    assert!(
+        !path.exists(),
+        "a cancelled transfer must not leave a file at the target path"
+    );
+
+    // ...so a following Skip has nothing to mistake for a finished download and actually transfers. A second server
+    // on its own port keeps this half independent of the stalled one above.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "the real thing").await;
+    });
+
+    let mut download = Fetch::new().download_with_options(
+        format!("http://{addr}"),
+        &path,
+        RequestOptions::new().download_mode(DownloadMode::Skip),
+    );
+    let progress = drain(&mut download).await;
+    server.await.unwrap();
+
+    assert!(!progress.failed);
+    assert_settled(&path, b"the real thing").await;
+    clean(&path).await;
 }
 
 #[tokio::test]

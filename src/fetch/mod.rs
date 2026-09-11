@@ -12,6 +12,7 @@
 #![doc = include_str!("README.md")]
 
 mod download;
+mod partial;
 mod prepared;
 mod proxy;
 mod request;
@@ -452,13 +453,19 @@ impl Fetch {
     /// This uses default per-request options; use [`Fetch::download_with_options`] to override the method, headers,
     /// retries, or [`DownloadMode`] for a single transfer. The struct's own configuration still provides the defaults.
     ///
-    /// When a file already exists at `path`, the resolved [`DownloadMode`] (the struct's
-    /// [`download_mode`](Fetch::download_mode), overridable via [`RequestOptions::download_mode`]) decides the behavior:
-    /// [`DownloadMode::Resume`] (the default) continues an incomplete transfer with an HTTP `Range` request — appending
-    /// the remaining bytes, or falling back to a full redownload if the server ignores `Range`;
-    /// [`DownloadMode::Overwrite`] truncates and re-downloads from byte zero; and [`DownloadMode::Skip`] leaves the
-    /// existing file untouched and reports the transfer complete without contacting the server. On a retry the transfer
-    /// likewise resumes from whatever bytes are already on disk (under `Resume`) rather than restarting.
+    /// Bytes are written to `<path>.part`, described by a `<path>.part.json` sidecar, and renamed onto `path` only
+    /// once the transfer finishes. A file at `path` is therefore complete by construction: an interrupted or cancelled
+    /// transfer leaves a partial beside it, never a truncated file at it.
+    ///
+    /// The resolved [`DownloadMode`] (the struct's [`download_mode`](Fetch::download_mode), overridable via
+    /// [`RequestOptions::download_mode`]) decides what already-present bytes mean. [`DownloadMode::Resume`] (the
+    /// default) reports an existing file at `path` as complete, and otherwise continues `<path>.part` with an HTTP
+    /// `Range` request — but only after its sidecar confirms it belongs to *this* request; a partial recorded against a
+    /// different URL or [`resume_key`](RequestOptions::resume_key), or one with no sidecar at all, is discarded rather
+    /// than appended to, as is one the server disowns by answering `If-Range` with a `200`.
+    /// [`DownloadMode::Overwrite`] discards any partial and downloads from byte zero, replacing whatever is at `path`.
+    /// [`DownloadMode::Skip`] reports an existing file at `path` as complete without contacting the server. On a retry
+    /// the transfer likewise resumes from whatever bytes are already in the partial rather than restarting.
     ///
     /// All fallible setup is surfaced through the handle rather than from this call: an invalid URL or a client-build
     /// error is captured and reported, alongside a bad HTTP status, a stream error, or a disk-write error, via
@@ -525,10 +532,11 @@ impl Fetch {
         options: RequestOptions,
     ) -> Download {
         let mode = options.download_mode.unwrap_or(self.download_mode);
+        let resume_key = options.resume_key.clone();
         let prepared = self.prepare(url, options);
         let path = path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::watch::channel(Progress::default());
-        let handle = tokio::spawn(download::run(prepared, path, tx, mode));
+        let handle = tokio::spawn(download::run(prepared, path, tx, mode, resume_key));
         Download::from_parts(rx, handle)
     }
 }

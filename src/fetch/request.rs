@@ -42,6 +42,9 @@ pub struct RequestOptions {
     /// Download behavior when a file already exists at the target path (only used by
     /// [`Fetch::download`](super::Fetch::download)). `None` inherits the struct's default.
     pub(super) download_mode: Option<DownloadMode>,
+    /// Caller-supplied identity for a download's bytes, recorded in the partial file's sidecar. `None` identifies a
+    /// partial by its URL alone.
+    pub(super) resume_key: Option<String>,
 }
 
 impl RequestOptions {
@@ -126,6 +129,28 @@ impl RequestOptions {
         self.download_mode = Some(mode);
         self
     }
+
+    /// Identifies what a [`Fetch::download`](super::Fetch::download)'s bytes *are*, beyond the URL they come from.
+    ///
+    /// A resumable transfer keeps its bytes in `<path>.part` and records what they belong to in a sidecar; a partial
+    /// that does not match the current request is discarded instead of appended to. The URL alone already covers the
+    /// common case — versioned release assets change the URL while keeping the same file name — but it cannot see a
+    /// release that was re-cut with different bytes at the *same* URL. Pass a value that changes when the bytes do
+    /// (a pinned content hash is the natural one) and that case is covered too.
+    ///
+    /// Opt-in, because most callers have no such value and should not have to invent one. Has no effect on
+    /// [`Fetch::text`](super::Fetch::text) or [`Fetch::json`](super::Fetch::json).
+    ///
+    /// ```
+    /// use rust_sak::fetch::RequestOptions;
+    ///
+    /// // The archive's pinned SHA-256: known before the transfer starts, and different bytes mean a different key.
+    /// let options = RequestOptions::new().resume_key("5cafbaae1f3d...");
+    /// ```
+    pub fn resume_key(mut self, key: impl Into<String>) -> Self {
+        self.resume_key = Some(key.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +167,7 @@ mod tests {
         assert!(!options.retry_non_idempotent);
         assert!(options.body.is_none());
         assert!(options.download_mode.is_none());
+        assert!(options.resume_key.is_none());
     }
 
     #[test]
@@ -154,7 +180,8 @@ mod tests {
             .retries(4)
             .retry_non_idempotent(true)
             .body(serde_json::json!({ "name": "rust" }))
-            .download_mode(DownloadMode::Skip);
+            .download_mode(DownloadMode::Skip)
+            .resume_key("sha256:abc");
 
         assert_eq!(options.method, Some(reqwest::Method::POST));
         assert_eq!(options.headers.get("Accept").unwrap(), "application/json");
@@ -166,6 +193,19 @@ mod tests {
         assert!(options.retry_non_idempotent);
         assert_eq!(options.body, Some(serde_json::json!({ "name": "rust" })));
         assert_eq!(options.download_mode, Some(DownloadMode::Skip));
+        assert_eq!(options.resume_key.as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn resume_key_accepts_owned_and_borrowed() {
+        assert_eq!(
+            RequestOptions::new().resume_key(String::from("owned")).resume_key,
+            Some("owned".to_string())
+        );
+        assert_eq!(
+            RequestOptions::new().resume_key("borrowed").resume_key,
+            Some("borrowed".to_string())
+        );
     }
 
     #[test]

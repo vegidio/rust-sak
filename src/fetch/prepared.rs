@@ -31,4 +31,17 @@ impl PreparedRequest {
         }
         request
     }
+
+    /// The fully resolved URL this request would be sent to, query parameters included.
+    ///
+    /// Built through [`PreparedRequest::request`] rather than by re-deriving the query string, so what the
+    /// partial-file sidecar records as "where these bytes came from" is exactly what the transfer asks for. Falls
+    /// back to the bare URL if the builder cannot be finalized, which leaves a weaker identity rather than failing a
+    /// download over bookkeeping.
+    pub(super) fn effective_url(&self) -> String {
+        match self.request().build() {
+            Ok(request) => request.url().to_string(),
+            Err(_) => self.url.to_string(),
+        }
+    }
 }

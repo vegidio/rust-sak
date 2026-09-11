@@ -6,9 +6,14 @@
 //! final [`Result`] with [`Download::join`]. Progress is shared over a [`tokio::sync::watch`] channel — the background
 //! task is the single producer, the handle is the observer.
 //!
-//! When a file already exists at the target path, [`DownloadMode`] decides the behavior: [`DownloadMode::Resume`] (the
-//! default) continues an incomplete transfer via an HTTP `Range` request, [`DownloadMode::Overwrite`] truncates and
-//! re-downloads, and [`DownloadMode::Skip`] leaves the existing file untouched.
+//! Bytes never land on the target path directly: a transfer writes `<path>.part` alongside a `<path>.part.json`
+//! sidecar (see [`partial`](super::partial)) and renames it into place only once it is complete. So a file at the
+//! target path is complete by construction, and a partial one can be checked against what it claims to be before a
+//! resume appends to it.
+//!
+//! [`DownloadMode`] decides what an existing file means: [`DownloadMode::Resume`] (the default) continues a matching
+//! `<path>.part` via an HTTP `Range` request, [`DownloadMode::Overwrite`] discards any partial and re-downloads, and
+//! [`DownloadMode::Skip`] reports an existing target file as complete without contacting the server.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -17,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::header::{CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
-use super::{PreparedRequest, retry};
+use super::{PreparedRequest, partial, retry};
 
 /// How many bytes may arrive between progress updates before one is forced out.
 ///
@@ -39,15 +44,18 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// [`RequestOptions::download_mode`](super::RequestOptions::download_mode); the per-request value takes priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DownloadMode {
-    /// Resume an incomplete file via an HTTP `Range` request, appending the remaining bytes. Falls back to a full
-    /// redownload if the server ignores `Range` (responds `200` instead of `206`). Starts fresh when no file exists.
-    /// This is the default.
+    /// Resume an incomplete transfer from its `<path>.part` via an HTTP `Range` request, appending the remaining
+    /// bytes. Falls back to a full redownload if the partial does not belong to this request (see
+    /// [`RequestOptions::resume_key`](super::RequestOptions::resume_key)) or if the server ignores `Range` (responds
+    /// `200` instead of `206`). A file already at the target path is complete — nothing else is ever written there —
+    /// so it is reported as such without contacting the server. This is the default.
     #[default]
     Resume,
-    /// Always truncate any existing file and download from byte zero.
+    /// Always download from byte zero, discarding any existing partial and replacing whatever is at the target path.
     Overwrite,
-    /// If any file already exists at the path, do nothing and report the transfer complete without contacting the
-    /// server.
+    /// If a file already exists at the target path, do nothing and report the transfer complete without contacting the
+    /// server. Any partial transfer in progress is resumed as under [`DownloadMode::Resume`], since only a completed
+    /// transfer ever reaches the target path.
     Skip,
 }
 
@@ -165,8 +173,9 @@ impl Download {
     /// Cancels the download if it is still running; a no-op if it has already completed or errored.
     ///
     /// Aborts the background task. After cancelling, [`join`](Download::join)/[`track`](Download::track) return
-    /// [`DownloadError::Cancelled`]. Aborting mid-transfer leaves the partially written file on disk (no cleanup runs),
-    /// so callers that cancel should remove it themselves.
+    /// [`DownloadError::Cancelled`]. Aborting mid-transfer leaves `<path>.part` and its sidecar on disk (no cleanup
+    /// runs) but **nothing at the target path**, so a later [`DownloadMode::Resume`] picks the transfer up where it
+    /// stopped and a [`DownloadMode::Skip`] correctly declines to treat it as finished.
     pub fn cancel(&self) {
         self.handle.abort();
     }
@@ -267,15 +276,16 @@ fn fraction(total: Option<u64>, downloaded: u64) -> Option<f64> {
 ///
 /// Called inside the background task spawned by [`Fetch::download`](super::Fetch::download). `prepared` carries any
 /// setup error (an invalid URL or a client-build failure) so it surfaces through the handle. `mode` decides how an
-/// existing file at `path` is handled. On return, a final [`Progress`] with `completed = true` (and `failed` reflecting
-/// the outcome) is sent.
+/// existing file at `path` is handled, and `resume_key` is the caller's optional identity for the bytes. On return, a
+/// final [`Progress`] with `completed = true` (and `failed` reflecting the outcome) is sent.
 pub(super) async fn run(
     prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
     tx: watch::Sender<Progress>,
     mode: DownloadMode,
+    resume_key: Option<String>,
 ) -> Result<(), DownloadError> {
-    let result = stream_to_file(prepared, path, &tx, mode).await;
+    let result = stream_to_file(prepared, path, &tx, mode, resume_key).await;
     tx.send_modify(|p| {
         p.completed = true;
         p.failed = result.is_err();
@@ -296,13 +306,20 @@ async fn file_len(path: &Path) -> std::io::Result<u64> {
     }
 }
 
-/// Streams the response body to `path`, retrying the whole transfer with Fibonacci backoff.
+/// Reads a response's `ETag`, if it carried one that is valid UTF-8.
+fn response_etag(response: &reqwest::Response) -> Option<String> {
+    response.headers().get(ETAG)?.to_str().ok().map(str::to_owned)
+}
+
+/// Streams the response body to `<path>.part`, retrying the whole transfer with Fibonacci backoff, and renames it onto
+/// `path` once it is complete.
 ///
-/// The behavior when a file already exists at `path` is governed by `mode`:
-/// - [`DownloadMode::Skip`] returns immediately (reporting the existing file as complete) without making a request.
-/// - [`DownloadMode::Resume`] sends a `Range` request from the current on-disk length and appends the remainder; if the
-///   server ignores `Range` (responds `200`), it falls back to truncating and restarting from byte zero.
-/// - [`DownloadMode::Overwrite`] always truncates and downloads from byte zero.
+/// The behavior when something already exists is governed by `mode`:
+/// - Under [`DownloadMode::Resume`] and [`DownloadMode::Skip`], a file at `path` is complete (only the final rename
+///   ever puts one there) and is reported as such without a request.
+/// - Those two modes otherwise resume `<path>.part`, but only after its sidecar confirms it belongs to this request; a
+///   mismatched or unidentifiable partial is deleted instead of appended to.
+/// - [`DownloadMode::Overwrite`] discards any partial and downloads from byte zero.
 ///
 /// The offset is re-read from disk at the start of each attempt, so a retry resumes from whatever bytes are already
 /// present rather than restarting.
@@ -311,66 +328,115 @@ async fn stream_to_file(
     path: PathBuf,
     tx: &watch::Sender<Progress>,
     mode: DownloadMode,
+    resume_key: Option<String>,
 ) -> Result<(), DownloadError> {
     let prepared = prepared?;
+    let part = partial::part_path(&path);
+    let sidecar = partial::sidecar_path(&path);
 
-    if mode == DownloadMode::Skip && tokio::fs::try_exists(&path).await? {
+    // Nothing but the final rename ever writes to `path`, so a file there is finished. Both modes that respect an
+    // existing file stop here — which is what makes `Skip` sound: it can no longer mistake a truncated transfer for a
+    // complete download.
+    if mode != DownloadMode::Overwrite && tokio::fs::try_exists(&path).await? {
         let len = file_len(&path).await?;
         tx.send_replace(Progress::in_flight(Some(len), len));
         return Ok(());
+    }
+
+    let identity = partial::Identity {
+        url: prepared.effective_url(),
+        resume_key,
+    };
+
+    // The resume decision is made once, up front: whether these bytes are ours is knowable before the first byte is
+    // appended, and finding out afterwards (from a hash that fails) costs a whole transfer.
+    if mode == DownloadMode::Overwrite {
+        partial::discard(&part, &sidecar).await?;
+    } else {
+        partial::reconcile(&part, &sidecar, &identity).await?;
     }
 
     retry::with_fibonacci_backoff(prepared.retries, || async {
         // The offset is re-read each attempt, so a retry resumes from whatever is already on disk.
         let offset = match mode {
             DownloadMode::Overwrite => 0,
-            DownloadMode::Resume | DownloadMode::Skip => file_len(&path).await?,
+            DownloadMode::Resume | DownloadMode::Skip => file_len(&part).await?,
         };
+        // Re-read rather than cached across attempts, so an `ETag` an earlier attempt recorded reaches this one.
+        let recorded = if offset > 0 { partial::read(&sidecar).await } else { None };
 
         let mut builder = prepared.request();
         if offset > 0 {
             builder = builder.header(RANGE, format!("bytes={offset}-"));
+            // The server-side half of the identity check, and the only one that can see bytes changing at a URL that
+            // did not: a resource that no longer matches the recorded `ETag` answers `200` rather than `206`, which
+            // the fresh-download branch below already handles as a restart.
+            if let Some(etag) = recorded.as_ref().and_then(|sidecar| sidecar.etag.clone()) {
+                builder = builder.header(IF_RANGE, etag);
+            }
         }
         let response = builder.send().await?;
 
-        // A `416` to a ranged request means the offset is at (or past) the end: the file is already complete.
+        // A `416` to a ranged request means the offset is at (or past) the end: the partial is the whole file, so it
+        // is promoted rather than transferred again.
         if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            partial::promote(&part, &sidecar, &path).await?;
             tx.send_replace(Progress::in_flight(Some(offset), offset));
             return Ok(());
         }
 
         let response = response.error_for_status()?;
-        let partial = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+        let resuming = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
 
         // A `206` is only a trustworthy resume if its `Content-Range` begins exactly at the byte we asked for. A
         // server that ignored `Range` answers `200` (handled as a fresh download below); one that returns a `206` for
         // some *other* range would corrupt the file if we blindly appended its body. Reject it: discard the partial
         // file so the next attempt re-reads a zero offset and re-requests without `Range`, and error out so the retry
         // (or a final failure) kicks in rather than writing bad bytes.
-        if partial && content_range_start(&response) != Some(offset) {
-            tokio::fs::File::create(&path).await?;
+        if resuming && content_range_start(&response) != Some(offset) {
+            tokio::fs::File::create(&part).await?;
             return Err(DownloadError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "server returned a 206 whose Content-Range does not match the requested offset",
             )));
         }
-        let resuming = partial;
 
         // Open the file only after a good response, so a failed attempt never leaves a stray empty file (which would
         // corrupt the next attempt's offset).
         let (mut file, mut downloaded, total) = if resuming {
             // A `206` `Content-Length` reports the remaining bytes, so the total is `offset + remaining`.
             let total = response.content_length().map(|remaining| offset + remaining);
-            let handle = tokio::fs::OpenOptions::new().append(true).open(&path).await?;
+            let handle = tokio::fs::OpenOptions::new().append(true).open(&part).await?;
             (BufWriter::new(handle), offset, total)
         } else {
             // A `200` (fresh download, or a server that ignored `Range`): truncate and start from byte zero.
             (
-                BufWriter::new(tokio::fs::File::create(&path).await?),
+                BufWriter::new(tokio::fs::File::create(&part).await?),
                 0,
                 response.content_length(),
             )
         };
+
+        // A `206` need not repeat the `ETag`, so the recorded one carries forward; a `200` replaced the bytes, so only
+        // what this response said still applies.
+        let etag = match response_etag(&response) {
+            Some(etag) => Some(etag),
+            None if resuming => recorded.and_then(|sidecar| sidecar.etag),
+            None => None,
+        };
+
+        // Written as soon as the response says what the `.part` will hold, so an interruption one chunk later already
+        // has something to validate the partial against.
+        partial::write(
+            &sidecar,
+            &partial::Sidecar {
+                url: identity.url.clone(),
+                etag,
+                total,
+                resume_key: identity.resume_key.clone(),
+            },
+        )
+        .await?;
 
         // Unconditional, so `total` is published as soon as it is known rather than waiting for the first threshold.
         tx.send_replace(Progress::in_flight(total, downloaded));
@@ -390,7 +456,11 @@ async fn stream_to_file(
                 reported_at = Instant::now();
             }
         }
+
+        // Synced before the rename, so a crash cannot leave a complete-looking file whose tail never reached the disk.
         file.flush().await?;
+        file.into_inner().sync_all().await?;
+        partial::promote(&part, &sidecar, &path).await?;
 
         // The final count always goes out, whatever the thresholds said, so an observer's last update matches what is
         // actually on disk — `track` in particular relies on seeing it.
