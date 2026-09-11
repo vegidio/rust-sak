@@ -1129,6 +1129,46 @@ async fn if_range_answered_with_200_restarts() {
 }
 
 #[tokio::test]
+async fn an_interrupted_transfer_records_what_its_partial_is() {
+    // The write half of the bookkeeping: everything above seeds a sidecar by hand, so without this nothing proves the
+    // transfer itself leaves one — and a partial with no sidecar is thrown away, which would quietly cost every resume.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    clean(&path).await;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        // Announce far more than is ever sent, then stall so the transfer is interrupted mid-body.
+        use tokio::io::AsyncWriteExt;
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n";
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(b"partial").await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let mut download = Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:abc"));
+    download.changed().await.unwrap();
+    download.cancel();
+    let _ = download.join().await;
+    server.abort();
+
+    assert!(partial::part_path(&path).exists(), "the partial bytes were not kept");
+    let sidecar = partial::read(&partial::sidecar_path(&path))
+        .await
+        .expect("an interrupted transfer must record what its partial is");
+    assert_eq!(sidecar.url, reqwest::Url::parse(&url).unwrap().to_string());
+    assert_eq!(sidecar.etag.as_deref(), Some("\"v1\""));
+    assert_eq!(sidecar.total, Some(1000));
+    assert_eq!(sidecar.resume_key.as_deref(), Some("sha256:abc"));
+
+    clean(&path).await;
+}
+
+#[tokio::test]
 async fn a_cancelled_transfer_leaves_nothing_at_the_target_path() {
     // The second half of the bug: writing straight to the target left a truncated file there, after which `Skip`
     // reported it complete forever.
