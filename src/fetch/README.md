@@ -101,16 +101,59 @@ A consuming builder. Anything left unset is inherited from the `Fetch` struct. H
 | `.retry_non_idempotent(bool)`           | Allow retries for `POST`/`PATCH` etc. (off by default — re-sending a non-idempotent request risks a duplicate write). |
 | `.body<T: Serialize>(body)`             | Attach a JSON body, sent with `Content-Type: application/json`. **Panics** if not serializable.                       |
 | `.download_mode(DownloadMode)`          | Override the download mode (no effect on `text`/`json`).                                                              |
+| `.resume_key(impl Into<String>)`        | Identify a download's bytes beyond their URL, so a partial recorded under a different key is discarded rather than resumed. A pinned content hash is the natural value. |
 
 ## Downloads
 
-### `DownloadMode` (what to do when the target file already exists)
+### On-disk layout: `.part` plus a sidecar
 
-| Variant              | Behavior                                                                                                                                                                                                                   |
-|----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Resume` *(default)* | Continue an incomplete file via an HTTP `Range` request, appending the remaining bytes. Falls back to a full redownload if the server ignores `Range`. Re-reads the on-disk length on each attempt, so retries resume too. |
-| `Overwrite`          | Always truncate and download from byte zero.                                                                                                                                                                               |
-| `Skip`               | If any file exists at the path, do nothing and report complete **without contacting the server**.                                                                                                                          |
+A transfer never writes to its target path. Bytes go to `<path>.part`, and a `<path>.part.json` sidecar records what
+they are:
+
+```text
+  during transfer                      on success
+  ---------------                      ----------
+  release.7z.part                -->   flush + fsync, remove the sidecar,
+  release.7z.part.json           -->   rename release.7z.part -> release.7z
+  { "url": "https://.../runtime/1.26.0/release.7z",
+    "etag": "\"a1b2\"",
+    "total": 174834737,                a file at the target path is now,
+    "resume_key": "5cafbaae..." }      by construction, complete
+```
+
+Two things follow, and they are why the files exist:
+
+- **A file at the target path is complete, always.** An interrupted, failed or cancelled transfer leaves a `.part`
+  beside the target, never a truncated file at it. `Skip` can therefore no longer mistake a half-finished download for
+  a finished one.
+- **A resume is provably a resume of the right thing.** Versioned release assets change the URL while keeping the same
+  file name, so "same local path" says nothing about "same bytes". The sidecar is checked *before* the `Range` request
+  is built.
+
+What a `Resume` request does with what it finds:
+
+| On disk                       | Sidecar                          | Action                                                             |
+|-------------------------------|----------------------------------|--------------------------------------------------------------------|
+| the target path exists        | —                                | complete; nothing is transferred                                   |
+| `.part` + matching sidecar    | `url` **and** `resume_key` match | `Range` from the `.part`'s length, plus `If-Range` if an `ETag` was recorded |
+| `.part` + sidecar             | either differs                   | delete both, start fresh                                           |
+| `.part`, no sidecar           | —                                | delete, start fresh — the bytes' identity is unknowable            |
+| nothing                       | —                                | fresh                                                              |
+
+`If-Range` is the third layer: where the sidecar catches a URL that changed, `If-Range` catches bytes that changed at a
+URL that did not. A server whose resource no longer matches the recorded `ETag` answers `200` rather than `206`, which
+is already handled as a fresh download.
+
+Concurrent transfers to the same target path are not supported, and nothing locks across processes; callers are assumed
+to be single-writer per path.
+
+### `DownloadMode` (what already-present bytes mean)
+
+| Variant              | Behavior                                                                                                                                                                                                                                     |
+|----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Resume` *(default)* | A file at the target path is complete, and is reported as such without contacting the server. Otherwise continue `<path>.part` with an HTTP `Range` request — but only if its sidecar says it belongs to this request. Falls back to a full redownload if the partial is not ours or the server ignores `Range`. Re-reads the partial's length on each attempt, so retries resume too. |
+| `Overwrite`          | Discard any partial and download from byte zero, replacing whatever is at the target path.                                                                                                                                                    |
+| `Skip`               | If a file exists at the target path, do nothing and report complete **without contacting the server**. Otherwise behaves as `Resume`.                                                                                                          |
 
 ### `Download` (the progress handle)
 
@@ -123,7 +166,7 @@ Dropping the handle does **not** cancel the download.
 | `.failed() -> bool`                                        | `true` if finished with an error.                                                                                                                                                                                                                      |
 | `.changed() -> Result<(), RecvError>`                      | Await the next progress update.                                                                                                                                                                                                                        |
 | `.track(&mut self, callback) -> Result<(), DownloadError>` | Drive a `FnMut(Option<u64> total, u64 downloaded, Option<f64> fraction)` callback on every update, then resolve with the final result. **Borrows** the handle (stays usable after), but awaits the task **once** — do **not** call `join()` afterward. |
-| `.cancel(&self)`                                           | Abort the background task. The transfer then surfaces as `DownloadError::Cancelled`; any partial file is left on disk.                                                                                                                                 |
+| `.cancel(&self)`                                           | Abort the background task. The transfer then surfaces as `DownloadError::Cancelled`; `<path>.part` and its sidecar are left on disk (so a later `Resume` picks up where it stopped) but **nothing is left at the target path**.                        |
 | `.join(self) -> Result<(), DownloadError>`                 | Consume the handle and await the final result.                                                                                                                                                                                                         |
 
 ### `Progress` (public fields)

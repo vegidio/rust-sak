@@ -28,8 +28,8 @@ mod crypto {
 #[cfg(feature = "fs")]
 mod fs {
     use rust_sak::fs::{
-        ArchiveFormat, CopyOptions, ExtractOptions, FsError, ListOptions, copy_files, file_exists, list_path,
-        mk_temp_dir, move_files, user_config_dir,
+        ArchiveFormat, CopyOptions, ExtractOptions, ExtractProgress, FsError, ListOptions, copy_files, file_exists,
+        list_path, mk_temp_dir, move_files, user_config_dir,
     };
 
     #[test]
@@ -64,6 +64,17 @@ mod fs {
 
         // The options builder is consuming, so this also checks it is usable without naming private types.
         let _ = ExtractOptions::new().max_entries(10).symlinks(false).file_mode(0o644);
+
+        // The progress hook's argument has to be nameable and readable from outside the crate, or a caller cannot
+        // write the callback at all.
+        let _ = ExtractOptions::new().on_progress(|progress: &ExtractProgress| {
+            let _ = (
+                progress.entries,
+                progress.bytes,
+                progress.total_entries,
+                progress.total_bytes,
+            );
+        });
     }
 }
 
@@ -223,6 +234,7 @@ mod fetch {
             .method(reqwest::Method::POST)
             .query("page", "2")
             .retry_non_idempotent(true)
+            .resume_key("sha256:5cafbaae")
             .body(serde_json::json!({ "ok": true }));
     }
 }

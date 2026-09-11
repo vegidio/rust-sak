@@ -118,6 +118,49 @@ On top of that:
 
 `ExtractSummary` counts `files`, `directories`, `symlinks`, `skipped` and `bytes` — the counters are the only way skipped behaviour becomes observable, since by definition it leaves nothing on disk.
 
+## Extraction progress
+
+`ExtractOptions::on_progress` takes an `Fn(&ExtractProgress) + Send + Sync + 'static`, called as the extraction runs:
+
+```rust,no_run
+use rust_sak::fs::{extract, ExtractOptions};
+
+let options = ExtractOptions::new().on_progress(|progress| {
+    match progress.total_bytes {
+        Some(total) => println!("{} / {total} bytes", progress.bytes),
+        None => println!("{} bytes", progress.bytes),
+    }
+});
+
+extract("runtime.7z", "/tmp/runtime", &options)?;
+# Ok::<(), rust_sak::fs::FsError>(())
+```
+
+| `ExtractProgress` field | Meaning                                                                                         |
+|-------------------------|-------------------------------------------------------------------------------------------------|
+| `entries: u64`          | Entries processed so far, counted on the same basis as `total_entries` — including skipped ones. |
+| `bytes: u64`            | Uncompressed bytes of file content written so far. Never decreases.                             |
+| `total_entries: Option<u64>` | What the archive's header says it holds.                                                    |
+| `total_bytes: Option<u64>`   | What the archive's header says its entries add up to.                                       |
+
+The hook fires **inside** an entry as well as between entries. That is the point for an archive that is essentially one
+very large file — reporting only per entry would render such an expansion as a single jump from nothing to done.
+Updates are coalesced to roughly one per 256 KiB or per 100 ms, plus one as each entry finishes, so the rate does not
+depend on how the archive happens to be chunked.
+
+**The callback must not block.** It runs inline in the copy loop, so anything slow in it slows the extraction itself.
+Send the snapshot somewhere and return. It is `Fn` rather than `FnMut` so `ExtractOptions` stays `Clone` and `Sync`;
+a callback that needs to mutate uses interior mutability.
+
+The totals are `Option` per **format**, not per archive. ZIP's central directory and 7z's header both carry every
+entry's uncompressed size, so both report `Some`. **TAR.XZ reports `None`** — its sizes live inside the compressed
+stream, and producing a total would mean decompressing the whole archive twice. That is the honest answer rather than a
+gap: render an indeterminate bar. The running `entries`/`bytes` counts are exact for every format; only the destination
+is unknown.
+
+Setting no hook changes nothing: an extraction without one behaves exactly as it did before, down to the summary and
+the bytes on disk.
+
 ## Errors
 
 Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch` and `LimitExceeded` (carrying a typed `Limit`).

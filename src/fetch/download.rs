@@ -363,7 +363,11 @@ async fn stream_to_file(
             DownloadMode::Resume | DownloadMode::Skip => file_len(&part).await?,
         };
         // Re-read rather than cached across attempts, so an `ETag` an earlier attempt recorded reaches this one.
-        let recorded = if offset > 0 { partial::read(&sidecar).await } else { None };
+        let recorded = if offset > 0 {
+            partial::read(&sidecar).await
+        } else {
+            None
+        };
 
         let mut builder = prepared.request();
         if offset > 0 {

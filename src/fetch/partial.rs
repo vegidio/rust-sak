@@ -113,8 +113,8 @@ pub(super) async fn discard(part: &Path, sidecar: &Path) -> io::Result<()> {
 ///
 /// Returns an [`io::Error`] if the partial cannot be stat'd or removed.
 pub(super) async fn reconcile(part: &Path, sidecar: &Path, identity: &Identity) -> io::Result<()> {
-    let resumable = tokio::fs::try_exists(part).await?
-        && read(sidecar).await.is_some_and(|recorded| recorded.matches(identity));
+    let resumable =
+        tokio::fs::try_exists(part).await? && read(sidecar).await.is_some_and(|recorded| recorded.matches(identity));
 
     if resumable {
         return Ok(());

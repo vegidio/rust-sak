@@ -176,7 +176,8 @@ impl<'a> Reporter<'a> {
     /// archive actually has — report more than the one update per-entry reporting would give it.
     fn advance(&mut self, bytes: u64) {
         self.progress.bytes += bytes;
-        if self.progress.bytes - self.reported_bytes >= PROGRESS_BYTES || self.reported_at.elapsed() >= PROGRESS_INTERVAL
+        if self.progress.bytes - self.reported_bytes >= PROGRESS_BYTES
+            || self.reported_at.elapsed() >= PROGRESS_INTERVAL
         {
             self.flush();
         }

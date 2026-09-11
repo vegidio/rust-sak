@@ -1035,8 +1035,7 @@ async fn a_mismatched_resume_key_restarts() {
         write_response(&mut stream, "200 OK", "new bytes").await;
     });
 
-    let mut download =
-        Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:new"));
+    let mut download = Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:new"));
     drain(&mut download).await;
     server.await.unwrap();
 
@@ -1064,8 +1063,7 @@ async fn a_matching_resume_key_resumes() {
         write_partial_response(&mut stream, 4, 10, "456789").await;
     });
 
-    let mut download =
-        Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:same"));
+    let mut download = Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:same"));
     drain(&mut download).await;
     server.await.unwrap();
 
