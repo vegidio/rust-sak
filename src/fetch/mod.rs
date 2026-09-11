@@ -11,6 +11,7 @@
 // examples into doctests, so the prose cannot drift from the code without CI noticing.
 #![doc = include_str!("README.md")]
 
+mod digest;
 mod download;
 mod partial;
 mod prepared;
@@ -23,11 +24,12 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+pub use digest::DigestAlgorithm;
 pub use download::{Download, DownloadError, DownloadMode, Progress};
 pub use proxy::ProxySettings;
 pub use request::RequestOptions;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reqwest::header::HeaderMap;
@@ -533,11 +535,23 @@ impl Fetch {
     ) -> Download {
         let mode = options.download_mode.unwrap_or(self.download_mode);
         let resume_key = options.resume_key.clone();
+        let algorithm = options.digest;
         let prepared = self.prepare(url, options);
         let path = path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::watch::channel(Progress::default());
-        let handle = tokio::spawn(download::run(prepared, path, tx, mode, resume_key));
-        Download::from_parts(rx, handle)
+        // Written by the background task on success and read through the handle, so the digest travels without
+        // widening `Progress` — an in-flight snapshot has nothing to say about a hash that is not finished yet.
+        let digest = Arc::new(OnceLock::new());
+        let handle = tokio::spawn(download::run(
+            prepared,
+            path,
+            tx,
+            mode,
+            resume_key,
+            algorithm,
+            Arc::clone(&digest),
+        ));
+        Download::from_parts(rx, handle, digest)
     }
 }
 

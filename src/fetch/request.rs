@@ -3,7 +3,7 @@
 
 use reqwest::header::HeaderMap;
 
-use super::DownloadMode;
+use super::{DigestAlgorithm, DownloadMode};
 
 /// Per-request overrides applied to a single [`Fetch::text`](super::Fetch::text),
 /// [`Fetch::json`](super::Fetch::json), or [`Fetch::download`](super::Fetch::download) call, built with the same fluent
@@ -45,6 +45,9 @@ pub struct RequestOptions {
     /// Caller-supplied identity for a download's bytes, recorded in the partial file's sidecar. `None` identifies a
     /// partial by its URL alone.
     pub(super) resume_key: Option<String>,
+    /// Hash computed over a download's bytes as they are written, reported by
+    /// [`Download::digest`](super::Download::digest). `None` hashes nothing.
+    pub(super) digest: Option<DigestAlgorithm>,
 }
 
 impl RequestOptions {
@@ -151,6 +154,33 @@ impl RequestOptions {
         self.resume_key = Some(key.into());
         self
     }
+
+    /// Hashes a [`Fetch::download`](super::Fetch::download)'s bytes as they are written, making the digest available
+    /// from [`Download::digest`](super::Download::digest) once the transfer has completed successfully.
+    ///
+    /// The download path is the only place the bytes are already in hand, so hashing there costs nothing while
+    /// hashing afterwards is a second full read of the finished file. A resumed transfer hashes the bytes already in
+    /// its partial before it appends, so the digest always covers the whole artifact rather than the tail this attempt
+    /// carried.
+    ///
+    /// There is one case this cannot cover, and it is reported rather than guessed: a
+    /// [`DownloadMode::Resume`](super::DownloadMode::Resume) or [`DownloadMode::Skip`](super::DownloadMode::Skip)
+    /// transfer that finds a file already at the target path reports success without contacting the server, and
+    /// therefore without a digest. [`Download::digest`](super::Download::digest) is `None` there, and a caller that
+    /// must verify falls back to hashing the file itself.
+    ///
+    /// Opt-in, because most downloads have no published checksum to check against. Has no effect on
+    /// [`Fetch::text`](super::Fetch::text) or [`Fetch::json`](super::Fetch::json).
+    ///
+    /// ```
+    /// use rust_sak::fetch::{DigestAlgorithm, RequestOptions};
+    ///
+    /// let options = RequestOptions::new().digest(DigestAlgorithm::Sha256);
+    /// ```
+    pub fn digest(mut self, algorithm: DigestAlgorithm) -> Self {
+        self.digest = Some(algorithm);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +198,7 @@ mod tests {
         assert!(options.body.is_none());
         assert!(options.download_mode.is_none());
         assert!(options.resume_key.is_none());
+        assert!(options.digest.is_none());
     }
 
     #[test]
@@ -181,7 +212,8 @@ mod tests {
             .retry_non_idempotent(true)
             .body(serde_json::json!({ "name": "rust" }))
             .download_mode(DownloadMode::Skip)
-            .resume_key("sha256:abc");
+            .resume_key("sha256:abc")
+            .digest(DigestAlgorithm::Sha256);
 
         assert_eq!(options.method, Some(reqwest::Method::POST));
         assert_eq!(options.headers.get("Accept").unwrap(), "application/json");
@@ -194,6 +226,7 @@ mod tests {
         assert_eq!(options.body, Some(serde_json::json!({ "name": "rust" })));
         assert_eq!(options.download_mode, Some(DownloadMode::Skip));
         assert_eq!(options.resume_key.as_deref(), Some("sha256:abc"));
+        assert_eq!(options.digest, Some(DigestAlgorithm::Sha256));
     }
 
     #[test]

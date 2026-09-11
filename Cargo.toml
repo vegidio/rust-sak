@@ -1,6 +1,6 @@
 [package]
 name = "rust-sak"
-version = "26.9.0"
+version = "26.9.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A Swiss Army Knife of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry and hardware probes - each behind its own feature."
@@ -91,7 +91,8 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util", "
 [features]
 default = []
 crypto = ["dep:sha2", "dep:hex", "dep:twox-hash"]
-fetch = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:futures-util"]
+# `sha2`/`hex` are here for `RequestOptions::digest`, which hashes a transfer's bytes as they are written.
+fetch = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:futures-util", "dep:sha2", "dep:hex"]
 fs = [
     "dep:cap-std",
     "dep:dirs",

@@ -1366,3 +1366,216 @@ fn clone_carries_the_connect_timeout_and_proxy() {
     // The clone starts with an empty client cache, as the existing `Clone` contract states.
     assert!(copy.client.get().is_none());
 }
+
+// --- digest tests ---
+//
+// An artifact published with a checksum is verified against the bytes that arrived, so what matters in every case
+// below is the same: the digest describes the *whole* artifact, never the slice this particular attempt carried.
+
+/// SHA-256 of `"0123456789"` — the ten-byte artifact the resume tests reassemble from a prefix and a tail.
+const DIGEST_0_TO_9: &str = "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882";
+
+#[tokio::test]
+async fn digest_reports_the_hash_of_the_downloaded_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    clean(&path).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "hello download").await;
+    });
+
+    let mut download = Fetch::new().download_with_options(
+        format!("http://{addr}"),
+        &path,
+        RequestOptions::new().digest(DigestAlgorithm::Sha256),
+    );
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_eq!(
+        download.digest().as_deref(),
+        Some("f13fd89cc6417f1028614173a449ca08607af977ad51d788e8749198273fa7c1")
+    );
+    // The point of hashing in-stream is that it saves this second read, so the two had better agree.
+    #[cfg(feature = "crypto")]
+    assert_eq!(download.digest(), crate::crypto::sha256_file(&path).ok());
+
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn no_digest_is_reported_when_none_was_asked_for() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    clean(&path).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "hello download").await;
+    });
+
+    let mut download = Fetch::new().download(format!("http://{addr}"), &path);
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_eq!(download.digest(), None);
+
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_resumed_transfer_digests_the_prefix_it_appended_to() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    // Four bytes already on disk; only the remaining six cross the wire on this attempt.
+    seed_partial(&path, &url, b"0123", None, None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(request.contains("bytes=4-"), "expected a resume, got: {request}");
+        write_partial_response(&mut stream, 4, 10, "456789").await;
+    });
+
+    let mut download =
+        Fetch::new().download_with_options(&url, &path, RequestOptions::new().digest(DigestAlgorithm::Sha256));
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"0123456789").await;
+    assert_eq!(download.digest().as_deref(), Some(DIGEST_0_TO_9));
+
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_transfer_restarted_by_a_mismatched_sidecar_digests_only_the_new_bytes() {
+    // The failure this guards: the discarded prefix belongs to a different artifact, so folding it into the hash
+    // would report a digest of bytes that were never on disk together — and the verification would fail on a file
+    // that is in fact correct.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"0123", None, Some("sha256:old")).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            !request.to_lowercase().contains("range:"),
+            "a partial with a different resume_key must not be resumed, got: {request}"
+        );
+        write_response(&mut stream, "200 OK", "new bytes").await;
+    });
+
+    let mut download = Fetch::new().download_with_options(
+        &url,
+        &path,
+        RequestOptions::new()
+            .resume_key("sha256:new")
+            .digest(DigestAlgorithm::Sha256),
+    );
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"new bytes").await;
+    assert_eq!(
+        download.digest().as_deref(),
+        Some("11e2defd59f47c7f2aac84d6a5d6747e98e785afffb72c8bb7b05ec74e1d663c")
+    );
+
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_server_that_ignores_range_digests_only_what_it_sent() {
+    // The subtler restart: the partial *is* ours by identity, so the request goes out with a `Range` — but the server
+    // answers `200`, which truncates the partial. The prefix is gone from the file, so it must be gone from the hash
+    // too; keying the prefix read off the offset rather than the response would silently double-count it.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"stale", None, None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "200 OK", "full body").await;
+    });
+
+    let mut download =
+        Fetch::new().download_with_options(&url, &path, RequestOptions::new().digest(DigestAlgorithm::Sha256));
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"full body").await;
+    assert_eq!(
+        download.digest().as_deref(),
+        Some("34eff3154477afb1a3ee6925c09340b2df092050cbe9ed82ffcb3ee9a13a8a8a")
+    );
+
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_416_promotes_the_partial_and_digests_all_of_it() {
+    // Nothing streams past the hasher here: the server says the partial is already the whole artifact, so the digest
+    // can only come from reading back what is on disk.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+
+    seed_partial(&path, &url, b"0123456789", None, None).await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_range_not_satisfiable(&mut stream, 10).await;
+    });
+
+    let mut download =
+        Fetch::new().download_with_options(&url, &path, RequestOptions::new().digest(DigestAlgorithm::Sha256));
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"0123456789").await;
+    assert_eq!(download.digest().as_deref(), Some(DIGEST_0_TO_9));
+
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_transfer_short_circuited_by_an_existing_file_reports_no_digest() {
+    // The one case in-stream hashing cannot cover, documented rather than papered over: `Resume` finds a complete file
+    // at the target path and reports success without contacting the server, so no bytes pass the hasher. A caller that
+    // must verify falls back to hashing the file.
+    let path = std::env::temp_dir().join("rust-sak-dl-digest-existing.bin");
+    clean(&path).await;
+    tokio::fs::write(&path, b"already here").await.unwrap();
+
+    let mut download = Fetch::new().download_with_options(
+        "http://127.0.0.1:1/never-contacted",
+        &path,
+        RequestOptions::new().digest(DigestAlgorithm::Sha256),
+    );
+    let progress = drain(&mut download).await;
+
+    assert!(progress.completed && !progress.failed);
+    assert_eq!(download.digest(), None);
+
+    clean(&path).await;
+}

@@ -11,6 +11,9 @@
 //! target path is complete by construction, and a partial one can be checked against what it claims to be before a
 //! resume appends to it.
 //!
+//! A transfer can also hash its own bytes on the way past, via
+//! [`RequestOptions::digest`](super::RequestOptions::digest); the result is read back from [`Download::digest`].
+//!
 //! [`DownloadMode`] decides what an existing file means: [`DownloadMode::Resume`] (the default) continues a matching
 //! `<path>.part` via an HTTP `Range` request, [`DownloadMode::Overwrite`] discards any partial and re-downloads, and
 //! [`DownloadMode::Skip`] reports an existing target file as complete without contacting the server.
@@ -18,6 +21,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -26,6 +30,7 @@ use reqwest::header::{CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::watch;
 
+use super::digest::{DigestAlgorithm, Hasher};
 use super::{PreparedRequest, partial, retry};
 
 /// How many bytes may arrive between progress updates before one is forced out.
@@ -97,6 +102,10 @@ impl Progress {
 pub struct Download {
     rx: watch::Receiver<Progress>,
     handle: tokio::task::JoinHandle<Result<(), DownloadError>>,
+    /// Set once by the background task when a transfer it actually ran completes successfully. Shared rather than
+    /// carried in [`Progress`], because a digest only exists at the end and an in-flight snapshot has nothing to say
+    /// about it.
+    digest: Arc<OnceLock<String>>,
 }
 
 impl Download {
@@ -105,13 +114,29 @@ impl Download {
     pub(super) fn from_parts(
         rx: watch::Receiver<Progress>,
         handle: tokio::task::JoinHandle<Result<(), DownloadError>>,
+        digest: Arc<OnceLock<String>>,
     ) -> Self {
-        Self { rx, handle }
+        Self { rx, handle, digest }
     }
 
     /// Returns the latest [`Progress`] snapshot (a cheap clone of the watched value).
     pub fn progress(&self) -> Progress {
         self.rx.borrow().clone()
+    }
+
+    /// The hex digest of the artifact, once the transfer has completed successfully.
+    ///
+    /// `None` until then, and `None` for the whole life of a download that did not ask for one via
+    /// [`RequestOptions::digest`](super::RequestOptions::digest). It is also `None` after a
+    /// [`DownloadMode::Resume`]/[`DownloadMode::Skip`] transfer that found a file already at the target path: it
+    /// reports completion without contacting the server, so no bytes passed through the hasher. A caller that must
+    /// verify hashes the file itself in that one case — see
+    /// [`crypto::sha256_file`](crate::crypto::sha256_file).
+    ///
+    /// The digest covers the whole artifact even when the transfer resumed a partial: the bytes already on disk are
+    /// hashed before the first appended chunk.
+    pub fn digest(&self) -> Option<String> {
+        self.digest.get().cloned()
     }
 
     /// `true` once the transfer has finished, whether it succeeded or failed.
@@ -276,16 +301,19 @@ fn fraction(total: Option<u64>, downloaded: u64) -> Option<f64> {
 ///
 /// Called inside the background task spawned by [`Fetch::download`](super::Fetch::download). `prepared` carries any
 /// setup error (an invalid URL or a client-build failure) so it surfaces through the handle. `mode` decides how an
-/// existing file at `path` is handled, and `resume_key` is the caller's optional identity for the bytes. On return, a
-/// final [`Progress`] with `completed = true` (and `failed` reflecting the outcome) is sent.
+/// existing file at `path` is handled, and `resume_key` is the caller's optional identity for the bytes. `algorithm`
+/// opts the transfer into hashing its own bytes, and the result is published through `digest`. On return, a final
+/// [`Progress`] with `completed = true` (and `failed` reflecting the outcome) is sent.
 pub(super) async fn run(
     prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
     tx: watch::Sender<Progress>,
     mode: DownloadMode,
     resume_key: Option<String>,
+    algorithm: Option<DigestAlgorithm>,
+    digest: Arc<OnceLock<String>>,
 ) -> Result<(), DownloadError> {
-    let result = stream_to_file(prepared, path, &tx, mode, resume_key).await;
+    let result = stream_to_file(prepared, path, &tx, mode, resume_key, algorithm, &digest).await;
     tx.send_modify(|p| {
         p.completed = true;
         p.failed = result.is_err();
@@ -323,12 +351,15 @@ fn response_etag(response: &reqwest::Response) -> Option<String> {
 ///
 /// The offset is re-read from disk at the start of each attempt, so a retry resumes from whatever bytes are already
 /// present rather than restarting.
+#[allow(clippy::too_many_arguments)]
 async fn stream_to_file(
     prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
     tx: &watch::Sender<Progress>,
     mode: DownloadMode,
     resume_key: Option<String>,
+    algorithm: Option<DigestAlgorithm>,
+    digest: &OnceLock<String>,
 ) -> Result<(), DownloadError> {
     let prepared = prepared?;
     let part = partial::part_path(&path);
@@ -384,6 +415,13 @@ async fn stream_to_file(
         // A `416` to a ranged request means the offset is at (or past) the end: the partial is the whole file, so it
         // is promoted rather than transferred again.
         if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            // The partial already is the whole artifact, so no byte of it streams past the hasher on this attempt:
+            // what is on disk is read back before the promotion moves it.
+            if let Some(algorithm) = algorithm {
+                let mut hasher = Hasher::new(algorithm);
+                hasher.update_prefix(&part, offset).await?;
+                let _ = digest.set(hasher.finish());
+            }
             partial::promote(&part, &sidecar, &path).await?;
             tx.send_replace(Progress::in_flight(Some(offset), offset));
             return Ok(());
@@ -421,6 +459,19 @@ async fn stream_to_file(
             )
         };
 
+        // Keyed off `resuming`, not the offset: it is the response that decides whether the bytes already on disk are
+        // part of this artifact, since a server that answered `200` just had them truncated away.
+        let mut hasher = match algorithm {
+            Some(algorithm) => {
+                let mut hasher = Hasher::new(algorithm);
+                if resuming {
+                    hasher.update_prefix(&part, offset).await?;
+                }
+                Some(hasher)
+            }
+            None => None,
+        };
+
         // A `206` need not repeat the `ETag`, so the recorded one carries forward; a `200` replaced the bytes, so only
         // what this response said still applies.
         let etag = match response_etag(&response) {
@@ -452,6 +503,9 @@ async fn stream_to_file(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(&chunk);
+            }
             downloaded += chunk.len() as u64;
 
             if downloaded - reported >= PROGRESS_BYTES || reported_at.elapsed() >= PROGRESS_INTERVAL {
@@ -465,6 +519,12 @@ async fn stream_to_file(
         file.flush().await?;
         file.into_inner().sync_all().await?;
         partial::promote(&part, &sidecar, &path).await?;
+
+        // Published only once the bytes are at the target path, so a digest is never readable for a transfer that did
+        // not finish.
+        if let Some(hasher) = hasher {
+            let _ = digest.set(hasher.finish());
+        }
 
         // The final count always goes out, whatever the thresholds said, so an observer's last update matches what is
         // actually on disk — `track` in particular relies on seeing it.

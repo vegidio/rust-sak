@@ -12,7 +12,7 @@ rust-sak = { version = "2", features = ["fetch"] }
 ```
 
 ```rust
-use rust_sak::fetch::{Fetch, RequestOptions, Download, DownloadMode, DownloadError, Progress};
+use rust_sak::fetch::{Fetch, RequestOptions, Download, DownloadMode, DownloadError, DigestAlgorithm, Progress};
 ```
 
 ## Overview
@@ -102,6 +102,7 @@ A consuming builder. Anything left unset is inherited from the `Fetch` struct. H
 | `.body<T: Serialize>(body)`             | Attach a JSON body, sent with `Content-Type: application/json`. **Panics** if not serializable.                       |
 | `.download_mode(DownloadMode)`          | Override the download mode (no effect on `text`/`json`).                                                              |
 | `.resume_key(impl Into<String>)`        | Identify a download's bytes beyond their URL, so a partial recorded under a different key is discarded rather than resumed. A pinned content hash is the natural value. |
+| `.digest(DigestAlgorithm)`              | Hash a download's bytes as they are written; read the result from `Download::digest()`. See [Content digests](#content-digests). |
 
 ## Downloads
 
@@ -155,6 +156,50 @@ to be single-writer per path.
 | `Overwrite`          | Discard any partial and download from byte zero, replacing whatever is at the target path.                                                                                                                                                    |
 | `Skip`               | If a file exists at the target path, do nothing and report complete **without contacting the server**. Otherwise behaves as `Resume`.                                                                                                          |
 
+### Content digests
+
+An artifact published with a checksum has to be hashed before it is trusted. `RequestOptions::digest(algorithm)` makes
+the transfer hash the bytes on their way to disk, and `Download::digest()` hands back the lowercase hex result once the
+transfer has completed successfully:
+
+```rust,no_run
+use rust_sak::fetch::{DigestAlgorithm, Fetch, RequestOptions};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let mut download = Fetch::new().download_with_options(
+    "https://example.com/release.7z",
+    "/tmp/release.7z",
+    RequestOptions::new()
+        .resume_key("5cafbaae...")          // the pinned hash also identifies the partial
+        .digest(DigestAlgorithm::Sha256),
+);
+download.track(|_, _, _| {}).await?;
+
+assert_eq!(download.digest().as_deref(), Some("5cafbaae..."));
+# Ok(())
+# }
+```
+
+`DigestAlgorithm` currently offers `Sha256`, producing exactly what `crypto::sha256_file` would produce for the
+finished file — without the second full read of it, which is the point: the download path is the only place the bytes
+are already in hand.
+
+The digest always describes the **whole** artifact, not the slice one attempt carried:
+
+| The transfer…                                       | What is hashed                                                        |
+|-----------------------------------------------------|-----------------------------------------------------------------------|
+| ran from byte zero                                  | everything it received                                                |
+| resumed a matching `.part`                          | the bytes already on disk, read back first, then everything appended  |
+| asked to resume but got a `200` (server ignored `Range`) | only the new body — the partial was truncated away, so it is not part of the file |
+| got a `416` (the `.part` is already complete)       | the `.part`, read back off disk                                       |
+| **found a file already at the target path**         | **nothing — `digest()` is `None`**                                    |
+
+That last row is the one case in-stream hashing cannot cover, and it is reported rather than guessed: `Resume` and
+`Skip` report an existing target file as complete *without contacting the server*, so no bytes pass the hasher. A
+caller that must verify falls back to `crypto::sha256_file` on that path.
+
+Opt-in, because most downloads have no published checksum to check against. Has no effect on `text`/`json`.
+
 ### `Download` (the progress handle)
 
 Dropping the handle does **not** cancel the download.
@@ -162,6 +207,7 @@ Dropping the handle does **not** cancel the download.
 | Method                                                     | What it does                                                                                                                                                                                                                                           |
 |------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `.progress() -> Progress`                                  | Latest snapshot (cheap clone).                                                                                                                                                                                                                         |
+| `.digest() -> Option<String>`                              | The artifact's hex digest once the transfer has completed successfully — `None` before then, and `None` unless `RequestOptions::digest` asked for one. See [Content digests](#content-digests).                                                          |
 | `.completed() -> bool`                                     | `true` once finished (success or failure).                                                                                                                                                                                                             |
 | `.failed() -> bool`                                        | `true` if finished with an error.                                                                                                                                                                                                                      |
 | `.changed() -> Result<(), RecvError>`                      | Await the next progress update.                                                                                                                                                                                                                        |
