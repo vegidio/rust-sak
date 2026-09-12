@@ -6,7 +6,7 @@ Encode and decode images across **8 formats** behind one small, uniform, synchro
 |------------------|-------------------------------------------|---------------------------------------------------------------------------------------------------|
 | Native           | `bmp`, `gif`, `jpeg`/`jpg`, `png`, `tiff` | the [`image`](https://crates.io/crates/image) crate                                               |
 | Dedicated codecs | `avif`, `heif`/`heic`, `webp`             | the author's `avif-rs` / `heif-rs` / `webp-rs` crates (never the `image` crate's built-in codecs) |
-| Camera RAW *(decode only)* | `dng`, `nef`, `cr2`/`cr3`, `arw`, `raf`, `orf`, `rw2` and ~20 more | `zenraw` on its `rawler` backend — **behind the separate `image-raw` feature, which is copyleft.** See [RAW decoding](#raw-decoding-image-raw) |
+| Camera RAW *(decode only)* | `dng`, `nef`, `cr2`/`cr3`, `arw`, `raf`, `orf`, `rw2` and ~20 more | `zenraw` on its `rawler` backend — behind the separate `image-raw` feature. See [RAW decoding](#raw-decoding-image-raw) |
 
 ## Enabling
 
@@ -63,9 +63,6 @@ For both encoders, pass `options: None` to use the format's defaults. A `Some(_)
 ## RAW decoding (`image-raw`)
 
 Camera RAW is a **ninth family, decode only**, behind its own Cargo feature. A camera writes RAW and software reads it, so there is no encoder here and no `RawFormat` member of `ImageFormat`.
-
-> [!WARNING]
-> **Enabling `image-raw` changes the licence of your binary.** There is no permissively licensed RAW decoder in Rust: this links `zenraw` (`AGPL-3.0-only`, or a commercial Imazen licence) and `rawler`/`rawloader` (`LGPL-2.1`). rust-sak's own code stays Apache-2.0, but a binary built with the feature on must be distributed under those terms — for AGPL-3.0 that includes offering corresponding source to users who interact with it over a network — or under a commercial `zenraw` licence. That is why it is a separate feature: the obligation is acquired by asking for RAW by name, never as a side effect of `image`. See the [crate README](../../README.md#-licensing-of-the-image-raw-feature).
 
 ```toml
 rust-sak = { version = "2", features = ["image-raw"] }  # implies "image"

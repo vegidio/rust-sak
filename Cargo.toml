@@ -1,6 +1,6 @@
 [package]
 name = "rust-sak"
-version = "26.9.2"
+version = "26.9.3"
 edition = "2024"
 rust-version = "1.95"
 description = "A Swiss Army Knife of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry and hardware probes - each behind its own feature."
@@ -108,11 +108,6 @@ fs = [
     "dep:zip",
 ]
 image = ["dep:image", "dep:webp", "dep:avif", "dep:heif", "dep:thiserror"]
-# ⚠️ LICENSING: `image-raw` links `zenraw` (AGPL-3.0-only OR a commercial Imazen licence) and `rawler`
-# (LGPL-2.1). rust-sak's own code stays Apache-2.0, but a binary built with this feature on combines it with
-# AGPL-3.0 and LGPL-2.1 code and must be distributed under those terms (or under a commercial `zenraw`
-# licence). That is why RAW is its own feature rather than part of `image`: the obligation is acquired by
-# asking for RAW by name, never as a side effect of wanting image support.
 image-raw = ["image", "dep:zenraw", "dep:zenpixels", "dep:enough"]
 memo = ["dep:hex", "dep:moka", "dep:postcard", "dep:redb", "dep:serde", "dep:serde_json", "dep:sha2", "dep:thiserror"]
 memo-async = ["memo", "dep:tokio"]

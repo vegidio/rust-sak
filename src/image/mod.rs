@@ -33,27 +33,13 @@
 //! assert_eq!((decoded.width(), decoded.height()), (2, 2));
 //! ```
 //!
-//! # RAW decoding — and what enabling it obliges
+//! # RAW decoding
 //!
 //! Camera RAW/DNG decoding lives behind the **separate `image-raw` feature**, not `image`. Turning it on adds
 //! `decode_raw_bytes`/`decode_raw_file`, `probe_raw_bytes`/`probe_raw_file`, `RawFormat` and `RawImageInfo`, which
 //! decode 300-plus cameras' RAW files to the same [`DynamicImage`](::image::DynamicImage) the other eight formats
 //! produce. (Those names exist only when the feature is on, so they are written plainly here rather than linked.)
-//!
-//! <div class="warning">
-//!
-//! **Licensing.** This crate's own code is Apache-2.0 and stays Apache-2.0. But there is no permissively licensed
-//! RAW decoder in Rust, so `image-raw` links `zenraw` (**AGPL-3.0-only**, or a commercial Imazen licence) and
-//! `rawler`/`rawloader` (**LGPL-2.1**). **A binary built with `image-raw` on must be distributed under those terms**
-//! — for AGPL-3.0 that includes offering corresponding source to users who interact with it over a network — **or
-//! under a commercial `zenraw` licence.** The FSF also holds Apache-2.0 incompatible with LGPL-2.1 specifically,
-//! over the patent-termination clause.
-//!
-//! RAW is its own feature for exactly this reason: the obligation is acquired by asking for RAW by name, never as a
-//! side effect of wanting image support. Every RAW item is `#[cfg(feature = "image-raw")]`, so a build without the
-//! feature links none of it.
-//!
-//! </div>
+//! Every RAW item is `#[cfg(feature = "image-raw")]`, so a build without the feature links none of it.
 //!
 //! # Build notes
 //!
