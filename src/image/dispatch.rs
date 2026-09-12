@@ -126,6 +126,65 @@ pub(super) fn resolve_options(format: ImageFormat, options: Option<EncodeOptions
     }
 }
 
+/// Returns `image` converted to a colour type the `format` encoder accepts, or `None` when it already accepts the
+/// image as it stands (so the common case allocates nothing).
+///
+/// Every codec accepts a fixed set of colour types and answers `Unsupported` for the rest, which would otherwise make
+/// an ordinary picture — a developed camera RAW is 16-bit, a grayscale PNG has no colour — unwritable in some formats.
+/// The conversion loses as little as the target forces: depth is narrowed only where the encoder cannot hold it, alpha
+/// is kept wherever the format has an alpha channel, and grayscale is expanded to colour only where the format has no
+/// grayscale representation. So a 32-float picture written as PNG becomes 16-bit rather than 8-bit, and a
+/// grayscale-with-alpha picture written as TIFF — which has no grayscale-with-alpha at any depth — becomes RGBA at its
+/// original depth rather than being narrowed twice.
+///
+/// **BMP and JPEG are deliberately absent.** Both implement the `image` crate's own
+/// [`ImageEncoder::make_compatible_img`](::image::ImageEncoder::make_compatible_img) hook, which runs inside
+/// `write_with_encoder` *after* this; converting here as well would convert twice, and for JPEG to a worse result —
+/// its hook sends `La8` to luma, keeping grayscale, where a generic narrowing would send it to luma-alpha first.
+pub(super) fn make_compatible(image: &DynamicImage, format: ImageFormat) -> Option<DynamicImage> {
+    use DynamicImage::{
+        ImageLuma8, ImageLumaA8, ImageRgb8, ImageRgb16, ImageRgb32F, ImageRgba8, ImageRgba16, ImageRgba32F,
+    };
+
+    match format {
+        // Their own `make_compatible_img` already covers everything — see the note above.
+        ImageFormat::Bmp | ImageFormat::Jpeg => None,
+        // 8- and 16-bit, with or without alpha, grayscale or colour; only the 32-float types need narrowing, and 16 is
+        // as far as they have to come down.
+        ImageFormat::Png | ImageFormat::Avif | ImageFormat::Heif => match image {
+            ImageRgb32F(_) => Some(ImageRgb16(image.to_rgb16())),
+            ImageRgba32F(_) => Some(ImageRgba16(image.to_rgba16())),
+            _ => None,
+        },
+        // Every depth including 32-float, but no grayscale-with-alpha at any depth: alpha is what forces the move to
+        // RGBA, so the depth comes along rather than being given up with it.
+        ImageFormat::Tiff => match image {
+            ImageLumaA8(_) => Some(ImageRgba8(image.to_rgba8())),
+            DynamicImage::ImageLumaA16(_) => Some(ImageRgba16(image.to_rgba16())),
+            _ => None,
+        },
+        // `Rgb8`/`Rgba8` only — the narrowest of the eight. Everything else is 8-bit colour, keeping alpha where the
+        // source had it.
+        ImageFormat::Gif => match image {
+            ImageRgb8(_) | ImageRgba8(_) => None,
+            other if other.color().has_alpha() => Some(ImageRgba8(other.to_rgba8())),
+            other => Some(ImageRgb8(other.to_rgb8())),
+        },
+        // libwebp is 8-bit, which is a property of the codec rather than of this dispatch; the colour layout survives
+        // untouched, so grayscale stays grayscale.
+        ImageFormat::WebP => match image {
+            ImageLuma8(_) | ImageLumaA8(_) | ImageRgb8(_) | ImageRgba8(_) => None,
+            DynamicImage::ImageLuma16(_) => Some(ImageLuma8(image.to_luma8())),
+            DynamicImage::ImageLumaA16(_) => Some(ImageLumaA8(image.to_luma_alpha8())),
+            ImageRgb16(_) | ImageRgb32F(_) => Some(ImageRgb8(image.to_rgb8())),
+            ImageRgba16(_) | ImageRgba32F(_) => Some(ImageRgba8(image.to_rgba8())),
+            // `DynamicImage` is `#[non_exhaustive]`: a variant added later keeps its alpha and comes down to 8 bits.
+            other if other.color().has_alpha() => Some(ImageRgba8(other.to_rgba8())),
+            other => Some(ImageRgb8(other.to_rgb8())),
+        },
+    }
+}
+
 /// Serializes AVIF encodes against each other.
 ///
 /// The bundled SVT-AV1 encoder keeps per-encode global state, so two concurrent encodes with *different* options can
@@ -145,6 +204,10 @@ static AVIF_ENCODE: Mutex<()> = Mutex::new(());
 /// [`DynamicImage::write_to`](::image::DynamicImage::write_to) need `Write + Seek`, so they are the only ones that
 /// still buffer — see [`encode_to_vec`], which is what callers with a non-seekable sink use for them.
 pub(super) fn encode_into<W: Write>(image: &DynamicImage, options: EncodeOptions, writer: &mut W) -> Result<()> {
+    // Ahead of the `match`, so no codec below is reachable without it. See [`make_compatible`] for what it converts.
+    let converted = make_compatible(image, options.format());
+    let image = converted.as_ref().unwrap_or(image);
+
     match options {
         // These three need `Seek` as well, which a bare `Write` cannot offer.
         EncodeOptions::Bmp | EncodeOptions::Gif | EncodeOptions::Tiff => {
@@ -210,10 +273,19 @@ pub(super) fn encode_to_vec(image: &DynamicImage, options: EncodeOptions) -> Res
     let mut buffer = Vec::new();
 
     match options {
-        EncodeOptions::Bmp => image.write_to(&mut Cursor::new(&mut buffer), ::image::ImageFormat::Bmp)?,
-        EncodeOptions::Gif => image.write_to(&mut Cursor::new(&mut buffer), ::image::ImageFormat::Gif)?,
-        EncodeOptions::Tiff => image.write_to(&mut Cursor::new(&mut buffer), ::image::ImageFormat::Tiff)?,
-        // Not seek-bound, so these stream; the buffer is only here because this caller's sink cannot.
+        // The three seek-bound codecs are reached from here rather than through [`encode_into`], so the compatibility
+        // step runs on this path too — otherwise GIF, which needs it most, would be the one format that never got it.
+        EncodeOptions::Bmp | EncodeOptions::Gif | EncodeOptions::Tiff => {
+            let format = options
+                .format()
+                .to_image_format()
+                .expect("bmp, gif and tiff map to image::ImageFormat");
+            let converted = make_compatible(image, options.format());
+            let image = converted.as_ref().unwrap_or(image);
+            image.write_to(&mut Cursor::new(&mut buffer), format)?;
+        }
+        // Not seek-bound, so these stream; the buffer is only here because this caller's sink cannot. `encode_into`
+        // runs the compatibility step itself.
         other => encode_into(image, other, &mut buffer)?,
     }
 

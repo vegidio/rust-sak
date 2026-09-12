@@ -60,6 +60,18 @@ All are synchronous and return `Result<T, ImageError>`.
 
 For both encoders, pass `options: None` to use the format's defaults. A `Some(_)` whose variant targets a **different** format than the destination yields `ImageError::FormatMismatch`.
 
+#### Every format writes every picture
+
+Each codec natively accepts only some of `DynamicImage`'s ten colour types — GIF takes 8-bit colour and nothing else, libwebp is 8-bit throughout, TIFF has no grayscale-with-alpha at any depth. **You never have to care.** Before a picture reaches a codec it is converted to the colour type that codec accepts, so **every format encodes every picture**; there is no colour type that makes an encode fail.
+
+The conversion loses as little as the destination forces:
+
+- **Depth** comes down only where the encoder cannot hold it. `png`, `tiff`, `avif` and `heif` keep **16 bits per channel**; `bmp`, `gif`, `jpeg` and `webp` are **8-bit**, so a 16-bit picture is narrowed for those four. A 32-float picture written as PNG becomes 16-bit, not 8-bit.
+- **Transparency** is kept wherever the format has an alpha channel, and dropped only where it does not (`jpeg`).
+- **Grayscale** is expanded to colour only where the format has no grayscale representation (`gif`).
+
+A picture the target already accepts is **not** converted — it is handed to the codec as it stands, so a lossless format writes it byte for byte. This matters most for RAW, which always develops to 16-bit: a `.nef` exported as PNG or TIFF keeps its depth, and the same file exported as WebP or JPEG comes back 8-bit.
+
 ## RAW decoding (`image-raw`)
 
 Camera RAW is a **ninth family, decode only**, behind its own Cargo feature. A camera writes RAW and software reads it, so there is no encoder here and no `RawFormat` member of `ImageFormat`.

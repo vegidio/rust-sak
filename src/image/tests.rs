@@ -1,5 +1,6 @@
-use ::image::{DynamicImage, Rgb, RgbImage};
+use ::image::{ColorType, DynamicImage, Rgb, RgbImage};
 
+use super::dispatch::make_compatible;
 use super::*;
 
 /// An 8x8 RGB gradient — RGB (no alpha) so every format, including JPEG, can encode it.
@@ -330,6 +331,207 @@ fn probe_unrecognized_bytes_error() {
         probe_bytes(&[0, 1, 2, 3]),
         Err(ImageError::UnrecognizedFormat)
     ));
+}
+
+// ── Colour-type compatibility ──────────────────────────────────────────────────────────────────────────────────
+//
+// Every codec accepts a fixed set of colour types and refuses the rest, so an ordinary picture — a developed camera
+// RAW is 16-bit, a grayscale PNG has no colour — used to be unwritable in some formats. The dispatch converts to
+// what the target accepts before a codec is reached; these pin the table it follows and the invariant that nothing
+// reaches a codec without it.
+
+/// Every supported format, so the tests below enumerate rather than sample. The column order of [`CONVERSIONS`].
+const EVERY_FORMAT: [ImageFormat; 8] = [
+    ImageFormat::Bmp,
+    ImageFormat::Gif,
+    ImageFormat::Jpeg,
+    ImageFormat::Png,
+    ImageFormat::Tiff,
+    ImageFormat::Avif,
+    ImageFormat::Heif,
+    ImageFormat::WebP,
+];
+
+/// What each format converts each source colour type to, `None` where the encoder takes the picture as it stands.
+///
+/// Written out cell by cell rather than derived, so it is an independent statement of the intended behaviour rather
+/// than a second copy of the code under test. BMP and JPEG are `None` in every row because their own
+/// `make_compatible_img` hook runs afterwards; GIF is the narrowest column because its encoder takes 8-bit colour and
+/// nothing else; TIFF moves only grayscale-with-alpha, which it has at no depth.
+#[rustfmt::skip]
+const CONVERSIONS: [(ColorType, [Option<ColorType>; 8]); 10] = {
+    use ColorType::{L8, L16, La8, La16, Rgb8, Rgb16, Rgb32F, Rgba8, Rgba16, Rgba32F};
+
+    //        source     BMP   GIF                 JPEG  PNG                 TIFF                 AVIF                 HEIF                 WebP
+    [
+        (L8,      [None, Some(Rgb8),  None, None,          None,          None,          None,          None         ]),
+        (La8,     [None, Some(Rgba8), None, None,          Some(Rgba8),   None,          None,          None         ]),
+        (Rgb8,    [None, None,        None, None,          None,          None,          None,          None         ]),
+        (Rgba8,   [None, None,        None, None,          None,          None,          None,          None         ]),
+        (L16,     [None, Some(Rgb8),  None, None,          None,          None,          None,          Some(L8)     ]),
+        (La16,    [None, Some(Rgba8), None, None,          Some(Rgba16),  None,          None,          Some(La8)    ]),
+        (Rgb16,   [None, Some(Rgb8),  None, None,          None,          None,          None,          Some(Rgb8)   ]),
+        (Rgba16,  [None, Some(Rgba8), None, None,          None,          None,          None,          Some(Rgba8)  ]),
+        (Rgb32F,  [None, Some(Rgb8),  None, Some(Rgb16),   None,          Some(Rgb16),   Some(Rgb16),   Some(Rgb8)   ]),
+        (Rgba32F, [None, Some(Rgba8), None, Some(Rgba16),  None,          Some(Rgba16),  Some(Rgba16),  Some(Rgba8)  ]),
+    ]
+};
+
+/// One image of every `DynamicImage` variant, each holding the same picture at the given size.
+fn every_color_type(width: u32, height: u32) -> Vec<DynamicImage> {
+    let img = sample_image_sized(width, height);
+    vec![
+        DynamicImage::ImageLuma8(img.to_luma8()),
+        DynamicImage::ImageLumaA8(img.to_luma_alpha8()),
+        DynamicImage::ImageRgb8(img.to_rgb8()),
+        DynamicImage::ImageRgba8(img.to_rgba8()),
+        DynamicImage::ImageLuma16(img.to_luma16()),
+        DynamicImage::ImageLumaA16(img.to_luma_alpha16()),
+        DynamicImage::ImageRgb16(img.to_rgb16()),
+        DynamicImage::ImageRgba16(img.to_rgba16()),
+        DynamicImage::ImageRgb32F(img.to_rgb32f()),
+        DynamicImage::ImageRgba32F(img.to_rgba32f()),
+    ]
+}
+
+/// A 16-bit picture, which is what every developed camera RAW is and what half the table exists for.
+fn sixteen_bit_image() -> DynamicImage {
+    DynamicImage::ImageRgb16(sample_image().to_rgb16())
+}
+
+/// The same picture with a varying alpha channel, so that a codec keeping transparency is distinguishable from one
+/// that noticed the image was opaque and left the channel out.
+fn sixteen_bit_transparent_image() -> DynamicImage {
+    let mut img = sample_image().to_rgba16();
+    for (x, _, px) in img.enumerate_pixels_mut() {
+        px[3] = (x * 8192) as u16;
+    }
+    DynamicImage::ImageRgba16(img)
+}
+
+#[test]
+fn every_color_type_converts_to_what_its_target_format_accepts() {
+    let images = every_color_type(8, 8);
+    assert_eq!(
+        images.len(),
+        CONVERSIONS.len(),
+        "the table must have a row for every DynamicImage variant"
+    );
+
+    for image in images {
+        let source = image.color();
+        let row = CONVERSIONS
+            .iter()
+            .find(|(color, _)| *color == source)
+            .unwrap_or_else(|| panic!("{source:?} has no row in the table"))
+            .1;
+
+        for (format, expected) in EVERY_FORMAT.into_iter().zip(row) {
+            let actual = make_compatible(&image, format).map(|converted| converted.color());
+            assert_eq!(actual, expected, "{source:?} written as {format:?}");
+        }
+    }
+}
+
+#[test]
+fn every_color_type_encodes_in_every_format_through_both_paths() {
+    // Big enough for the AV1 encoder behind AVIF, which will not take a tiny frame.
+    let (width, height) = (32, 32);
+    let dir = std::env::temp_dir();
+
+    for image in every_color_type(width, height) {
+        let source = image.color();
+
+        for format in EVERY_FORMAT {
+            // A `Vec` is `Write` but not `Seek`, so this is the path BMP, GIF and TIFF buffer whole.
+            let mut bytes = Vec::new();
+            encode_writer(&image, &mut bytes, format, None)
+                .unwrap_or_else(|e| panic!("{source:?} as {format:?} through a writer: {e}"));
+            let decoded = decode_bytes_with_format(&bytes, format)
+                .unwrap_or_else(|e| panic!("{source:?} as {format:?} did not decode: {e}"));
+            assert_eq!(
+                (decoded.width(), decoded.height()),
+                (width, height),
+                "{source:?} as {format:?} through a writer"
+            );
+
+            // And the streaming path, which reaches the same dispatch by a different route.
+            let path = dir.join(format!(
+                "rust_sak_compat_{}_{source:?}.{}",
+                std::process::id(),
+                format.extension()
+            ));
+            encode_file(&image, &path, None).unwrap_or_else(|e| panic!("{source:?} as {format:?} to a file: {e}"));
+            let decoded = decode_file(&path).unwrap_or_else(|e| panic!("{source:?} as {format:?} from a file: {e}"));
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(
+                (decoded.width(), decoded.height()),
+                (width, height),
+                "{source:?} as {format:?} through a file"
+            );
+        }
+    }
+}
+
+#[test]
+fn depth_survives_where_the_target_format_holds_it() {
+    let image = sixteen_bit_image();
+    for format in [ImageFormat::Png, ImageFormat::Tiff] {
+        let info = probe_bytes(&encode(&image, format)).unwrap();
+        assert_eq!(info.bit_depth, 16, "format {format:?}");
+    }
+}
+
+#[test]
+fn depth_is_narrowed_only_where_the_target_format_forces_it() {
+    let image = sixteen_bit_image();
+    for format in [ImageFormat::Gif, ImageFormat::WebP] {
+        let bytes = encode(&image, format);
+        assert_eq!(probe_bytes(&bytes).unwrap().bit_depth, 8, "format {format:?}");
+        let decoded = decode_bytes_with_format(&bytes, format).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (8, 8), "format {format:?}");
+    }
+}
+
+#[test]
+fn alpha_survives_where_the_target_format_holds_it() {
+    // 16-bit *and* genuinely transparent: an opaque alpha channel is one a codec is free to leave out, so the
+    // fixture varies it to make keeping it observable. PNG keeps the depth as well; WebP has to give that up.
+    let image = sixteen_bit_transparent_image();
+    for format in [ImageFormat::Png, ImageFormat::WebP] {
+        let info = probe_bytes(&encode(&image, format)).unwrap();
+        assert!(
+            info.color_type.has_alpha(),
+            "format {format:?} dropped the alpha channel"
+        );
+    }
+}
+
+#[test]
+fn a_picture_the_format_accepts_is_written_unchanged() {
+    // Nothing to convert, so nothing is allocated and the pixels survive a lossless round trip exactly.
+    let image = sample_image();
+    assert!(make_compatible(&image, ImageFormat::Png).is_none());
+
+    let decoded = decode_bytes_with_format(&encode(&image, ImageFormat::Png), ImageFormat::Png).unwrap();
+    assert_eq!(decoded, image);
+}
+
+#[test]
+fn bmp_and_jpeg_write_a_sixteen_bit_picture_with_their_own_hook() {
+    // The dispatch leaves these two alone because each implements the `image` crate's `make_compatible_img`, which
+    // runs inside `write_with_encoder` afterwards. If a future `image` release drops either hook, the encode starts
+    // failing and this test is where it shows up rather than a caller's export.
+    let image = sixteen_bit_image();
+    for format in [ImageFormat::Bmp, ImageFormat::Jpeg] {
+        assert!(
+            make_compatible(&image, format).is_none(),
+            "the dispatch must not convert for {format:?}"
+        );
+        let decoded = decode_bytes_with_format(&encode(&image, format), format)
+            .unwrap_or_else(|e| panic!("{format:?} no longer converts 16-bit input itself: {e}"));
+        assert_eq!((decoded.width(), decoded.height()), (8, 8), "format {format:?}");
+    }
 }
 
 // ── RAW ────────────────────────────────────────────────────────────────────────────────────────────────────────
