@@ -12,7 +12,7 @@ rust-sak = { version = "2", features = ["fetch"] }
 ```
 
 ```rust
-use rust_sak::fetch::{Fetch, RequestOptions, Download, DownloadMode, DownloadError, DigestAlgorithm, Progress};
+use rust_sak::fetch::{Fetch, RequestOptions, Response, Download, DownloadMode, DownloadError, DigestAlgorithm, Progress};
 ```
 
 ## Overview
@@ -20,6 +20,8 @@ use rust_sak::fetch::{Fetch, RequestOptions, Download, DownloadMode, DownloadErr
 - **`Fetch`** — the client. Configure it **once** with a fluent builder, then **reuse** it for many requests. It lazily builds and caches an internal `reqwest::Client` (and its connection pool) on the first request.
 - **`RequestOptions`** — per-request overrides (method, query, headers, body, retries, download mode) that take priority over the `Fetch` defaults.
 - **`Download` / `Progress` / `DownloadMode` / `DownloadError`** — the streaming-download support returned by `Fetch::download`.
+- **`reqwest`** — re-exported, because this module's API is stated in its types (`reqwest::Error`, `StatusCode`, `HeaderMap`); name them as `rust_sak::fetch::reqwest::…` rather than depending on `reqwest` directly, which would risk two unrelated copies.
+- **`Response`** — a response with its metadata intact (body + status + headers), returned by the `*_response` methods, for when the answer is not only in the body.
 
 The split between **config builders** (consume `self`, return `Self` — set up once) and **request methods** (take `&self` — call many times) is what makes a single `Fetch` shareable.
 
@@ -84,6 +86,10 @@ All take `&self`. Each request method comes in two forms: a short form that uses
 | `text_with_options`     | `async fn text_with_options(&self, url, options) -> Result<String, reqwest::Error>`       | Same as `text` but applies the per-request `options`.                                                                                                                                                                                           |
 | `json`                  | `async fn json<T: DeserializeOwned>(&self, url) -> Result<T, reqwest::Error>`             | Same as `text` but deserializes the JSON body into `T`.                                                                                                                                                                                         |
 | `json_with_options`     | `async fn json_with_options<T: DeserializeOwned>(&self, url, options) -> Result<T, …>`    | Same as `json` but applies the per-request `options`.                                                                                                                                                                                           |
+| `text_response`         | `async fn text_response(&self, url) -> Result<Response<String>, reqwest::Error>`          | Same as `text` but returns the whole `Response` — body, status and headers. See [Response metadata](#response-metadata).                                                                                        |
+| `text_response_with_options` | `async fn text_response_with_options(&self, url, options) -> Result<Response<String>, …>` | Same as `text_response` but applies the per-request `options`.                                                                                                                                            |
+| `json_response`         | `async fn json_response<T: DeserializeOwned>(&self, url) -> Result<Response<T>, …>`       | Same as `json` but returns the whole `Response`.                                                                                                                                                              |
+| `json_response_with_options` | `async fn json_response_with_options<T>(&self, url, options) -> Result<Response<T>, …>` | Same as `json_response` but applies the per-request `options`.                                                                                                                                              |
 | `download`              | `fn download(&self, url, path) -> Download`                                               | **Non-async, infallible.** Spawns a background task to stream the body to `path` and returns a `Download` handle immediately. Setup errors (bad URL, client build) surface through the handle. **Panics** if not called within a Tokio runtime. |
 | `download_with_options` | `fn download_with_options(&self, url, path, options) -> Download`                         | Same as `download` but applies the per-request `options` (including `download_mode`).                                                                                                                                                          |
 
@@ -103,6 +109,50 @@ A consuming builder. Anything left unset is inherited from the `Fetch` struct. H
 | `.download_mode(DownloadMode)`          | Override the download mode (no effect on `text`/`json`).                                                              |
 | `.resume_key(impl Into<String>)`        | Identify a download's bytes beyond their URL, so a partial recorded under a different key is discarded rather than resumed. A pinned content hash is the natural value. |
 | `.digest(DigestAlgorithm)`              | Hash a download's bytes as they are written; read the result from `Download::digest()`. See [Content digests](#content-digests). |
+
+## Response metadata
+
+`text` and `json` reduce a response to its body, which is what almost every caller wants. The four `*_response`
+methods hand back a `Response<T>` instead — the body, the status it arrived with, and every header — for the cases
+where the body is not the whole answer: a pagination cursor in a `Link` header, a checksum in an `ETag`, a rate limit
+to read before the next request is sent. They are the same requests otherwise: same header merging, same query
+parameters, same Fibonacci-backoff retries, and a `4xx`/`5xx` is still an error rather than a response.
+
+| Field / method            | What it is                                                                       |
+|---------------------------|----------------------------------------------------------------------------------|
+| `body: T`                 | The body, as text or deserialized into `T`.                                      |
+| `status: StatusCode`      | The status it arrived with — always a success status.                            |
+| `headers: HeaderMap`      | Every response header, as received.                                              |
+| `.header(name)`           | The first value of one header as `&str`, matched case-insensitively.             |
+| `.link(rel)`              | The target of the `Link` header with that relation type. See below.              |
+
+### Following pagination to exhaustion
+
+`Response::link` is what makes a paginated collection readable in full: request a page, ask for `link("next")`, stop
+when there is no answer. The alternative — a `limit` parameter chosen to be larger than the collection — is a bound
+that is eventually wrong, and silently returns a prefix when it is.
+
+```rust,no_run
+use rust_sak::fetch::Fetch;
+
+# async fn run() -> Result<(), reqwest::Error> {
+let fetch = Fetch::new();
+let mut url = Some("https://api.example.com/items?limit=50".to_string());
+let mut pages = Vec::new();
+
+while let Some(next) = url {
+    let page = fetch.text_response(&next).await?;
+    url = page.link("next").map(str::to_string);
+    pages.push(page.body);
+}
+# Ok(())
+# }
+```
+
+`link` parses per RFC 8288: every `Link` header on the response is considered, each may carry several
+comma-separated links, and a relation may be quoted or bare and may list several types (`rel="next last"` answers to
+both), matched case-insensitively. A comma inside the target does not split the link — which matters, because an
+opaque cursor is exactly where one turns up — and a malformed value yields `None` rather than a guess.
 
 ## Downloads
 

@@ -1,6 +1,6 @@
 [package]
 name = "rust-sak"
-version = "26.9.4"
+version = "26.9.5"
 edition = "2024"
 rust-version = "1.95"
 description = "A Swiss Army Knife of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry and hardware probes - each behind its own feature."

@@ -34,6 +34,20 @@ pub(super) async fn write_response(stream: &mut TcpStream, status: &str, body: &
     stream.flush().await.unwrap();
 }
 
+/// Writes a 200 response carrying `headers` — each an already-formatted `Name: value` line — alongside `body`.
+///
+/// What makes a response's *metadata* observable rather than only its body: a `Link` header to paginate from, an
+/// `ETag` to compare against.
+pub(super) async fn write_response_with_headers(stream: &mut TcpStream, headers: &[&str], body: &str) {
+    let extra: String = headers.iter().map(|header| format!("{header}\r\n")).collect();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
 /// Writes a 200 response whose body is `len` bytes delivered in `chunk` -sized writes.
 ///
 /// Sending the body in many small writes is what makes the receiving side see many stream chunks, which is how the

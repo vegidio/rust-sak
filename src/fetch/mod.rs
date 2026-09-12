@@ -2,7 +2,9 @@
 //!
 //! This module exposes [`Fetch`], a configurable HTTP request builder. It holds the default configuration (headers,
 //! retries, HTTP/2 toggle) and sends requests via [`Fetch::text`] (raw body) or [`Fetch::json`] (deserialized into a
-//! caller-chosen type), retrying with Fibonacci backoff. [`Fetch::download`] instead streams a response body to a file
+//! caller-chosen type), retrying with Fibonacci backoff. The `*_response` forms of both return a [`Response`] instead
+//! — the body with its status and headers, for an answer that is not only in the body, such as a `Link` pagination
+//! cursor. [`Fetch::download`] instead streams a response body to a file
 //! and returns a [`Download`] handle immediately, exposing live progress as a [`Progress`] snapshot (and surfacing
 //! failures as a [`DownloadError`]). Individual requests can override the defaults — including attaching a JSON request
 //! body — by passing [`RequestOptions`].
@@ -17,6 +19,7 @@ mod partial;
 mod prepared;
 mod proxy;
 mod request;
+mod response;
 mod retry;
 
 #[cfg(test)]
@@ -24,10 +27,17 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+// Re-exported because this module's public API is stated in `reqwest`'s types: every request method reports a
+// `reqwest::Error`, `Response::status` is a `reqwest::StatusCode` and `Response::headers` a `reqwest::header::HeaderMap`.
+// Without this a consumer cannot name what it is handed without depending on `reqwest` itself and keeping the version
+// aligned with this crate's — and two versions would make these two unrelated types.
+pub use reqwest;
+
 pub use digest::DigestAlgorithm;
 pub use download::{Download, DownloadError, DownloadMode, Progress};
 pub use proxy::ProxySettings;
 pub use request::RequestOptions;
+pub use response::Response;
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -440,6 +450,157 @@ impl Fetch {
         let prepared = self.prepare(url, options)?;
         retry::with_fibonacci_backoff(prepared.retries, || async {
             prepared.request().send().await?.error_for_status()?.json::<T>().await
+        })
+        .await
+    }
+
+    /// Sends a `GET` request to `url` with default per-request options and returns the whole [`Response`] — the body
+    /// as a `String`, plus its status and headers.
+    ///
+    /// Use this where the body is not the whole answer: a pagination cursor in a `Link` header, a checksum in an
+    /// `ETag`, a rate limit to read before the next request. [`Fetch::text`] is the same request reduced to its body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// is not valid UTF-8 text.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// let fetch = Fetch::new();
+    /// let mut url = Some("https://api.example.com/items".to_string());
+    ///
+    /// // Following the pagination to exhaustion, rather than bounding it with a large `limit`.
+    /// while let Some(next) = url {
+    ///     let page = fetch.text_response(&next).await?;
+    ///     println!("{}", page.body);
+    ///     url = page.link("next").map(str::to_string);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn text_response(&self, url: impl reqwest::IntoUrl) -> Result<Response<String>, reqwest::Error> {
+        self.text_response_with_options(url, RequestOptions::default()).await
+    }
+
+    /// Sends a request to `url` and returns the whole [`Response`] — the body as a `String`, plus its status and
+    /// headers.
+    ///
+    /// Behaves exactly like [`Fetch::text_with_options`] — same header merging, query parameters, optional
+    /// [`RequestOptions::body`], method default, and Fibonacci-backoff retries — but hands back the response's
+    /// metadata alongside its body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// is not valid UTF-8 text.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::{Fetch, RequestOptions};
+    ///
+    /// let page = Fetch::new()
+    ///     .text_response_with_options("https://api.example.com/items", RequestOptions::new().query("limit", "50"))
+    ///     .await?;
+    ///
+    /// assert!(page.status.is_success());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn text_response_with_options(
+        &self,
+        url: impl reqwest::IntoUrl,
+        options: RequestOptions,
+    ) -> Result<Response<String>, reqwest::Error> {
+        let prepared = self.prepare(url, options)?;
+        retry::with_fibonacci_backoff(prepared.retries, || async {
+            let response = prepared.request().send().await?.error_for_status()?;
+            // Taken before the body, which consumes the response.
+            let (status, headers) = (response.status(), response.headers().clone());
+
+            Ok(Response {
+                body: response.text().await?,
+                status,
+                headers,
+            })
+        })
+        .await
+    }
+
+    /// Sends a `GET` request to `url` with default per-request options and returns the whole [`Response`] — the JSON
+    /// body deserialized into `T`, plus its status and headers.
+    ///
+    /// [`Fetch::json`] is the same request reduced to its body; see [`Fetch::text_response`] for when the metadata is
+    /// what a caller is after.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// cannot be deserialized into `T`.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::Fetch;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct Item {
+    ///     name: String,
+    /// }
+    ///
+    /// let page = Fetch::new().json_response::<Vec<Item>>("https://api.example.com/items").await?;
+    /// println!("{} items, more at {:?}", page.body.len(), page.link("next"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn json_response<T: serde::de::DeserializeOwned>(
+        &self,
+        url: impl reqwest::IntoUrl,
+    ) -> Result<Response<T>, reqwest::Error> {
+        self.json_response_with_options(url, RequestOptions::default()).await
+    }
+
+    /// Sends a request to `url` and returns the whole [`Response`] — the JSON body deserialized into `T`, plus its
+    /// status and headers.
+    ///
+    /// Behaves exactly like [`Fetch::json_with_options`], but hands back the response's metadata alongside its body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last [`reqwest::Error`] if the client cannot be built, every attempt fails, or the response body
+    /// cannot be deserialized into `T`.
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), reqwest::Error> {
+    /// use rust_sak::fetch::{Fetch, RequestOptions};
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct Item {
+    ///     name: String,
+    /// }
+    ///
+    /// let page: rust_sak::fetch::Response<Vec<Item>> = Fetch::new()
+    ///     .json_response_with_options("https://api.example.com/items", RequestOptions::new().query("limit", "50"))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn json_response_with_options<T: serde::de::DeserializeOwned>(
+        &self,
+        url: impl reqwest::IntoUrl,
+        options: RequestOptions,
+    ) -> Result<Response<T>, reqwest::Error> {
+        let prepared = self.prepare(url, options)?;
+        retry::with_fibonacci_backoff(prepared.retries, || async {
+            let response = prepared.request().send().await?.error_for_status()?;
+            let (status, headers) = (response.status(), response.headers().clone());
+
+            Ok(Response {
+                body: response.json::<T>().await?,
+                status,
+                headers,
+            })
         })
         .await
     }

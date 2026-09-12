@@ -43,7 +43,7 @@ fn headers_replaces_map() {
 
 use super::test_support::{
     read_request, write_partial_response, write_range_not_satisfiable, write_response, write_response_in_chunks,
-    write_response_no_length,
+    write_response_no_length, write_response_with_headers,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -422,6 +422,167 @@ async fn text_sends_request_body() {
         "request was:\n{request}"
     );
     assert!(request.contains(r#"{"name":"rust"}"#), "request was:\n{request}");
+}
+
+// --- response tests ---
+//
+// The `*_response` forms differ from `text`/`json` only in handing back the status and headers alongside the body, so
+// these cover that metadata and the pagination it exists for rather than re-testing the request path.
+
+#[tokio::test]
+async fn text_response_carries_the_status_and_headers_beside_the_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response_with_headers(&mut stream, &["ETag: \"a1b2\""], "hello world").await;
+    });
+
+    let response = Fetch::new().text_response(format!("http://{addr}")).await.unwrap();
+
+    assert_eq!(response.body, "hello world");
+    assert_eq!(response.status, reqwest::StatusCode::OK);
+    assert_eq!(response.header("etag"), Some("\"a1b2\""));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn json_response_deserializes_the_body_and_still_carries_the_headers() {
+    #[derive(serde::Deserialize)]
+    struct Item {
+        name: String,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response_with_headers(
+            &mut stream,
+            &["Link: <http://example.com/p2>; rel=\"next\""],
+            r#"[{"name":"first"}]"#,
+        )
+        .await;
+    });
+
+    let response = Fetch::new()
+        .json_response::<Vec<Item>>(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.body.len(), 1);
+    assert_eq!(response.body[0].name, "first");
+    assert_eq!(response.link("next"), Some("http://example.com/p2"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_link_header_paginates_a_collection_to_exhaustion() {
+    // The whole reason the metadata is exposed: the cursor is in the header, so a caller reading only the body would
+    // have to bound the collection with a `limit` it cannot know is large enough.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        // The first page points at the second...
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        let next = format!("Link: <http://{addr}/page/2>; rel=\"next\"");
+        write_response_with_headers(&mut stream, &[&next], "one").await;
+        // ...and the second points nowhere, which is what ends the loop.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        write_response_with_headers(&mut stream, &[], "two").await;
+        request
+    });
+
+    let fetch = Fetch::new();
+    let mut url = Some(format!("http://{addr}/page/1"));
+    let mut pages = Vec::new();
+
+    while let Some(next) = url {
+        let page = fetch.text_response(&next).await.unwrap();
+        url = page.link("next").map(str::to_string);
+        pages.push(page.body);
+    }
+
+    assert_eq!(pages, vec!["one", "two"]);
+    let second = server.await.unwrap();
+    assert!(
+        second.contains("/page/2"),
+        "the second request did not follow the link:\n{second}"
+    );
+}
+
+#[tokio::test]
+async fn a_response_form_errors_on_a_failure_status_like_its_body_only_counterpart() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "500 Internal Server Error", "nope").await;
+    });
+
+    let error = Fetch::new().text_response(format!("http://{addr}")).await.unwrap_err();
+
+    assert_eq!(error.status(), Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_response_form_retries_with_the_configured_backoff() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response(&mut stream, "500 Internal Server Error", "fail").await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        write_response_with_headers(&mut stream, &["ETag: \"recovered\""], "recovered").await;
+    });
+
+    let response = Fetch::new()
+        .retries(1)
+        .text_response(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.body, "recovered");
+    assert_eq!(response.header("etag"), Some("\"recovered\""));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_response_form_applies_per_request_options() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        write_response_with_headers(&mut stream, &[], "ok").await;
+        request
+    });
+
+    let response = Fetch::new()
+        .text_response_with_options(format!("http://{addr}"), RequestOptions::new().query("limit", "50"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.body, "ok");
+    let request = server.await.unwrap();
+    assert!(
+        request.contains("limit=50"),
+        "the query parameter was not sent:\n{request}"
+    );
 }
 
 // --- download tests ---
