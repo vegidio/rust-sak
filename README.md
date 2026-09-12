@@ -30,6 +30,7 @@ The crate is a collection of independent modules, each gated behind its own Carg
 | `fetch`      | [`fetch`](src/fetch/README.md)     | Reusable `reqwest` client with Fibonacci-backoff retries and resumable streaming downloads with live progress    | **yes** (Tokio) |
 | `fs`         | [`fs`](src/fs/README.md)           | Filesystem helpers, RAII temp handles, and a hardened ZIP/7z/TAR.XZ extractor that treats every entry as hostile | no              |
 | `image`      | [`image`](src/image/README.md)     | Encode and decode 8 image formats behind one uniform API — bmp, gif, jpeg, png, tiff, avif, heif, webp           | no              |
+| `image-raw`  |                                    | Adds camera RAW/DNG decoding to `image` — **[copyleft, see below](#-licensing-of-the-image-raw-feature)**        | no              |
 | `memo`       | [`memo`](src/memo/README.md)       | Memoization with pluggable storage: memory, disk, or memory-over-disk, with concurrent calls coalesced           | no              |
 | `memo-async` |                                    | Adds `Memo::get_or_compute_async` for computations that are themselves futures                                   | **yes** (Tokio) |
 | `o11y`       | [`o11y`](src/o11y/README.md)       | Structured OTLP log records to an OpenTelemetry collector, exported on a background thread                       | no              |
@@ -43,6 +44,23 @@ The minimum supported Rust version is **1.95**. Most features need nothing beyon
 
 - **`fs`** compiles xz from vendored C sources on first build, so a **C compiler** is required.
 - **`image`** downloads prebuilt static avif/heif/webp codec binaries on first build, so an **internet connection** is required — or point `AVIF_BINARIES_DIR`, `HEIF_BINARIES_DIR` and `WEBP_BINARIES_DIR` at pre-extracted archives for an offline build. They link statically, so no system libraries are needed at runtime.
+- **`image-raw`** needs no toolchain or system libraries — the RAW decoder is pure Rust — but it **changes the licence of your binary**. See below.
+
+## ⚠️ Licensing of the `image-raw` feature
+
+**rust-sak's own code is Apache-2.0 and stays Apache-2.0.** Enabling `image-raw` is the one thing that changes what you may do with the binary you build, because there is no permissively licensed camera RAW decoder in Rust to depend on:
+
+| Crate | Licence |
+|---|---|
+| [`zenraw`](https://crates.io/crates/zenraw) | `AGPL-3.0-only` **OR** a commercial Imazen licence |
+| [`rawler`](https://crates.io/crates/rawler) | `LGPL-2.1` |
+| [`rawloader`](https://crates.io/crates/rawloader) | `LGPL-2.1` |
+
+**A binary built with `image-raw` on combines your code with AGPL-3.0 and LGPL-2.1 code, and must be distributed under those terms** — which for AGPL-3.0 includes offering the corresponding source to users who interact with it over a network — **or under a commercial `zenraw` licence.** Note also that the FSF considers Apache-2.0 incompatible with LGPL-2.1 specifically, over the patent-termination clause.
+
+This is why RAW is its own feature rather than part of `image`: **nobody acquires the obligation by asking for image support — only by asking for RAW by name.** Every RAW item is behind `#[cfg(feature = "image-raw")]`, so a build without the feature links none of it.
+
+If those terms do not suit your project, leave `image-raw` off; the other eight formats are unaffected.
 
 ## 🤖 Development
 

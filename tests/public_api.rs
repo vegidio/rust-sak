@@ -238,3 +238,46 @@ mod fetch {
             .body(serde_json::json!({ "ok": true }));
     }
 }
+
+#[cfg(feature = "image-raw")]
+mod image_raw {
+    use rust_sak::image::{
+        ImageError, RawFormat, RawImageInfo, decode_raw_bytes, decode_raw_file, is_raw_bytes, probe_raw_bytes,
+        probe_raw_file,
+    };
+
+    #[test]
+    fn the_raw_surface_is_reachable_from_outside_the_crate() {
+        // Names only — the in-crate suite is what exercises the behaviour. What this catches is a `pub use` that was
+        // never added, or a type that cannot be spelled from a downstream crate because a field's type is private.
+        assert_eq!(RawFormat::from_extension("NEF"), Some(RawFormat::Nef));
+        assert_eq!(RawFormat::from_path("/pictures/a.cr3"), Some(RawFormat::Cr3));
+        assert_eq!(RawFormat::Dng.extension(), "dng");
+        assert_eq!(RawFormat::from_magic(b"not raw"), None);
+        assert!(!is_raw_bytes(b"not raw"));
+
+        // A caller must be able to construct and read the info struct, not just receive one.
+        let info = RawImageInfo {
+            format: Some(RawFormat::Dng),
+            width: 4,
+            height: 4,
+            bit_depth: None,
+            make: String::new(),
+            model: String::new(),
+            is_dng: true,
+        };
+        assert_eq!(info.width, 4);
+
+        // And the entry points, including that the RAW-specific error variants are nameable and matchable.
+        assert!(matches!(decode_raw_bytes(b"not raw"), Err(ImageError::NotRaw)));
+        assert!(matches!(probe_raw_bytes(b"not raw"), Err(ImageError::NotRaw)));
+        assert!(matches!(
+            decode_raw_file("/tmp/x.png"),
+            Err(ImageError::UnknownExtension)
+        ));
+        assert!(matches!(
+            probe_raw_file("/tmp/x.png"),
+            Err(ImageError::UnknownExtension)
+        ));
+    }
+}

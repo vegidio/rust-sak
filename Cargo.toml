@@ -1,6 +1,6 @@
 [package]
 name = "rust-sak"
-version = "26.9.1"
+version = "26.9.2"
 edition = "2024"
 rust-version = "1.95"
 description = "A Swiss Army Knife of reusable Rust building blocks: hashing, HTTP fetching, hardened archive extraction, image codecs, memoization, OTLP telemetry and hardware probes - each behind its own feature."
@@ -30,6 +30,7 @@ dbg_macro = "warn"
 avif = { package = "avif-rs", version = "26.7.1", optional = true }
 cap-std = { version = "4.0.3", optional = true }
 dirs = { version = "7.0", optional = true }
+enough = { version = "0.4", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 heif = { package = "heif-rs", version = "26.7", optional = true }
 hex = { version = "0.4.3", optional = true }
@@ -57,6 +58,8 @@ twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_
 uuid = { version = "1.26.0", default-features = false, features = ["v4"], optional = true }
 walkdir = { version = "2.5", optional = true }
 webp = { package = "webp-rs", version = "26.7", optional = true }
+zenpixels = { version = "0.2", default-features = false, optional = true }
+zenraw = { version = "0.2", default-features = false, features = ["rawler", "rawloader"], optional = true }
 zip = { version = "8.6", default-features = false, features = [
     "aes-crypto",
     "bzip2",
@@ -105,6 +108,12 @@ fs = [
     "dep:zip",
 ]
 image = ["dep:image", "dep:webp", "dep:avif", "dep:heif", "dep:thiserror"]
+# ⚠️ LICENSING: `image-raw` links `zenraw` (AGPL-3.0-only OR a commercial Imazen licence) and `rawler`
+# (LGPL-2.1). rust-sak's own code stays Apache-2.0, but a binary built with this feature on combines it with
+# AGPL-3.0 and LGPL-2.1 code and must be distributed under those terms (or under a commercial `zenraw`
+# licence). That is why RAW is its own feature rather than part of `image`: the obligation is acquired by
+# asking for RAW by name, never as a side effect of wanting image support.
+image-raw = ["image", "dep:zenraw", "dep:zenpixels", "dep:enough"]
 memo = ["dep:hex", "dep:moka", "dep:postcard", "dep:redb", "dep:serde", "dep:serde_json", "dep:sha2", "dep:thiserror"]
 memo-async = ["memo", "dep:tokio"]
 o11y = [

@@ -1,11 +1,12 @@
 # `image` module
 
-Encode and decode images across **8 formats** behind one small, uniform, synchronous API. Decoding always yields a `image::DynamicImage`; encoding takes one.
+Encode and decode images across **8 formats** behind one small, uniform, synchronous API — plus **camera RAW decoding** behind the optional `image-raw` feature. Decoding always yields a `image::DynamicImage`; encoding takes one.
 
 | Family           | Formats                                   | Backed by                                                                                         |
 |------------------|-------------------------------------------|---------------------------------------------------------------------------------------------------|
 | Native           | `bmp`, `gif`, `jpeg`/`jpg`, `png`, `tiff` | the [`image`](https://crates.io/crates/image) crate                                               |
 | Dedicated codecs | `avif`, `heif`/`heic`, `webp`             | the author's `avif-rs` / `heif-rs` / `webp-rs` crates (never the `image` crate's built-in codecs) |
+| Camera RAW *(decode only)* | `dng`, `nef`, `cr2`/`cr3`, `arw`, `raf`, `orf`, `rw2` and ~20 more | `zenraw` on its `rawler` backend — **behind the separate `image-raw` feature, which is copyleft.** See [RAW decoding](#raw-decoding-image-raw) |
 
 ## Enabling
 
@@ -59,6 +60,40 @@ All are synchronous and return `Result<T, ImageError>`.
 
 For both encoders, pass `options: None` to use the format's defaults. A `Some(_)` whose variant targets a **different** format than the destination yields `ImageError::FormatMismatch`.
 
+## RAW decoding (`image-raw`)
+
+Camera RAW is a **ninth family, decode only**, behind its own Cargo feature. A camera writes RAW and software reads it, so there is no encoder here and no `RawFormat` member of `ImageFormat`.
+
+> [!WARNING]
+> **Enabling `image-raw` changes the licence of your binary.** There is no permissively licensed RAW decoder in Rust: this links `zenraw` (`AGPL-3.0-only`, or a commercial Imazen licence) and `rawler`/`rawloader` (`LGPL-2.1`). rust-sak's own code stays Apache-2.0, but a binary built with the feature on must be distributed under those terms — for AGPL-3.0 that includes offering corresponding source to users who interact with it over a network — or under a commercial `zenraw` licence. That is why it is a separate feature: the obligation is acquired by asking for RAW by name, never as a side effect of `image`. See the [crate README](../../README.md#-licensing-of-the-image-raw-feature).
+
+```toml
+rust-sak = { version = "2", features = ["image-raw"] }  # implies "image"
+```
+
+| Function          | Signature                                                            | What it does                                                                                            |
+|-------------------|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| `decode_raw_bytes` | `fn decode_raw_bytes(bytes: &[u8]) -> Result<DynamicImage>`         | Develops RAW bytes into a display-ready picture. `NotRaw` if they are not RAW.                          |
+| `decode_raw_file`  | `fn decode_raw_file(path: impl AsRef<Path>) -> Result<DynamicImage>` | Same, for a file. `UnknownExtension` if the path names no RAW format.                                   |
+| `probe_raw_bytes`  | `fn probe_raw_bytes(bytes: &[u8]) -> Result<RawImageInfo>`          | Metadata without decoding pixels. Leaves `format` as `None` for the TIFF-based formats — see below.     |
+| `probe_raw_file`   | `fn probe_raw_file(path: impl AsRef<Path>) -> Result<RawImageInfo>` | Same, for a file; always names the `format`, from the extension. **Reads the whole file** (see below).  |
+| `is_raw_bytes`     | `fn is_raw_bytes(bytes: &[u8]) -> bool`                             | Cheap header check. **A plain TIFF answers `true`** — see below.                                         |
+
+**Decoding always yields `DynamicImage::ImageRgb16`** — 16 bits per channel, sRGB. The decoder runs its full pipeline to get there: black/white-level normalisation, demosaic, white balance, the camera's colour matrix, tone curve and sRGB gamma, then the crop and EXIF orientation the camera recorded. Sixteen bits are kept rather than narrowed to eight because a RAW file exists precisely because the sensor recorded more than eight.
+
+### Three things worth knowing
+
+- **The extension is what distinguishes RAW formats, not the content.** Nearly every RAW format is a TIFF container, so a NEF, an ARW, a CR2 and a PEF all open with the same four bytes. `RawFormat::from_magic` therefore resolves only the containers that identify themselves (DNG, CR3, RAF, RW2, ORF) and returns `None` for the rest rather than guessing, and `is_raw_bytes` cannot tell an ordinary `.tiff` photograph from a NEF. **Route on the file extension**, not on content, or a genuine TIFF ends up in the RAW decoder.
+- **`probe_raw_file` reads the whole file**, where `probe_file` reads only a header. That is the backend's constraint, not a choice: RAW metadata lives in IFD chains whose offsets routinely point deep into a 40 MB file, so a bounded prefix would miss more often than it hit. Worth knowing if you are listing a directory of RAWs.
+- **A camera the backend does not know is a refusal, never a wrong picture.** `rawler` reads 300-plus cameras; one outside that set comes back as `ImageError::Raw` naming the failure.
+
+### Types
+
+| Type           | What it is                                                                                                                            |
+|----------------|-----------------------------------------------------------------------------------------------------------------------------------------|
+| `RawFormat`    | The decode-only format enum — `Dng`, `Nef`, `Cr2`, `Cr3`, `Arw`, `Raf`, `Orf`, `Rw2` and ~17 more, with `from_extension`/`from_path`/`extension`/`from_magic`. |
+| `RawImageInfo` | `format: Option<RawFormat>`, `width`, `height`, `bit_depth: Option<u8>`, `make`, `model`, `is_dng`. Separate from `ImageInfo` because `ImageInfo::format` has no RAW member, and because make and model are what a photographer's file listing wants. |
+
 ## Types
 
 ### `ImageFormat`
@@ -106,6 +141,8 @@ Supporting enums:
 - `Preset`, `Chroma` — re-exported from the `heif` crate (HEIF x265 speed preset and chroma subsampling).
 
 ### `ImageError` / `Result<T>`
+
+With `image-raw` on, two further variants appear: `Raw(zenraw::RawError)` for a decode or probe that failed, and `NotRaw` for bytes that are recognisable and are not RAW.
 
 `Result<T>` is an alias for `std::result::Result<T, ImageError>`. `ImageError` variants:
 

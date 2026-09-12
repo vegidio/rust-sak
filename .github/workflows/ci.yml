@@ -64,6 +64,7 @@ jobs:
           - fetch
           - fs
           - image
+          - image-raw
           - memo
           - memo-async
           - o11y
