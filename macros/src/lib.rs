@@ -19,8 +19,10 @@ mod instrument;
 /// - `#[instrument(skip(a, b))]` leaves those arguments out of the captured fields.
 /// - `#[instrument(skip_all)]` captures no arguments at all.
 ///
-/// An argument is captured with its `Debug` representation, so every captured argument must implement [`Debug`]. Skip
-/// the ones that do not, or that are too large or too sensitive to record.
+/// An argument that converts into an `o11y::Value` on its own — every integer and float, `bool`, `&str`, `String` —
+/// is captured in that variant directly, so a `u64` arrives as an integer rather than as a decimal string and costs
+/// no formatting. Anything else is captured with its `Debug` representation, so an argument that is neither must
+/// implement [`Debug`]. Skip the ones that do not, or that are too large or too sensitive to record.
 ///
 /// # Panics
 ///

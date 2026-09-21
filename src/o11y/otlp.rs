@@ -84,13 +84,30 @@ fn base64(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Encodes a set of fields as an OTLP `KeyValue` list.
-fn key_values(fields: &[(Cow<'static, str>, Value)]) -> Json {
+/// Encodes a sequence of attributes as an OTLP `KeyValue` list.
+///
+/// Takes the values already encoded, because that is the only thing its two kinds of caller disagree on: a log or
+/// span field is an arbitrary [`Value`], while a metric tag is always a string. Everything else about a `KeyValue`
+/// — and anything later added to it, such as key truncation or an attribute-count cap — belongs here, once.
+fn key_values<'a>(attributes: impl IntoIterator<Item = (&'a str, Json)>) -> Json {
     Json::Array(
-        fields
-            .iter()
-            .map(|(key, value)| json!({ "key": key, "value": any_value(value) }))
+        attributes
+            .into_iter()
+            .map(|(key, value)| json!({ "key": key, "value": value }))
             .collect(),
+    )
+}
+
+/// Encodes a set of log or span fields as an OTLP `KeyValue` list.
+fn field_values(fields: &[(Cow<'static, str>, Value)]) -> Json {
+    key_values(fields.iter().map(|(key, value)| (&**key, any_value(value))))
+}
+
+/// Encodes a metric's tag set as an OTLP `KeyValue` list. Tag values are always strings.
+fn tag_values(tags: &[(Box<str>, Box<str>)]) -> Json {
+    key_values(
+        tags.iter()
+            .map(|(key, value)| (&**key, json!({ "stringValue": &**value }))),
     )
 }
 
@@ -103,7 +120,7 @@ fn resource(base: &[(Cow<'static, str>, Value)], enrichment: &Attributes) -> Jso
     let mut attributes = base.to_vec();
     attributes.extend(enrichment.iter().cloned());
 
-    json!({ "attributes": key_values(&attributes) })
+    json!({ "attributes": field_values(&attributes) })
 }
 
 /// The instrumentation scope block.
@@ -147,7 +164,7 @@ pub(super) fn logs(records: Vec<LogRecord>, base: &[(Cow<'static, str>, Value)])
                         "severityNumber": record.level.severity_number(),
                         "severityText": record.level.severity_text(),
                         "body": { "stringValue": record.body },
-                        "attributes": key_values(&record.fields),
+                        "attributes": field_values(&record.fields),
                     });
 
                     // Omitted entirely rather than sent empty when the record was emitted outside a span: an empty
@@ -186,7 +203,7 @@ pub(super) fn traces(records: Vec<SpanRecord>, base: &[(Cow<'static, str>, Value
                             json!({
                                 "timeUnixNano": big_int(event.time_unix_nano),
                                 "name": event.name,
-                                "attributes": key_values(&event.attributes),
+                                "attributes": field_values(&event.attributes),
                             })
                         })
                         .collect();
@@ -198,7 +215,7 @@ pub(super) fn traces(records: Vec<SpanRecord>, base: &[(Cow<'static, str>, Value
                         "kind": SPAN_KIND_INTERNAL,
                         "startTimeUnixNano": big_int(record.start_unix_nano),
                         "endTimeUnixNano": big_int(record.end_unix_nano),
-                        "attributes": key_values(&record.attributes),
+                        "attributes": field_values(&record.attributes),
                         "events": events,
                     });
 
@@ -257,13 +274,13 @@ pub(super) fn metrics(
                         })).collect::<Vec<_>>(),
                     }
                 }),
-                MetricData::Histogram(points) => json!({
+                MetricData::Histogram { bounds, points } => json!({
                     "histogram": {
                         "aggregationTemporality": CUMULATIVE,
                         "dataPoints": points.iter().map(|point| {
                             debug_assert_eq!(
                                 point.bucket_counts.len(),
-                                point.bounds.len() + 1,
+                                bounds.len() + 1,
                                 "a histogram needs one more bucket than it has bounds",
                             );
 
@@ -273,7 +290,7 @@ pub(super) fn metrics(
                                 "timeUnixNano": big_int(now_unix_nano),
                                 "count": big_int(point.count),
                                 "sum": point.sum,
-                                "explicitBounds": point.bounds,
+                                "explicitBounds": bounds,
                                 "bucketCounts": point.bucket_counts.iter().copied().map(big_int).collect::<Vec<_>>(),
                             })
                         }).collect::<Vec<_>>(),
@@ -281,12 +298,16 @@ pub(super) fn metrics(
                 }),
             };
 
-            let mut encoded = json!({ "name": snapshot.name });
-            if let (Some(object), Some(extra)) = (encoded.as_object_mut(), data.as_object()) {
-                object.extend(extra.clone());
+            // `data` is already owned, and the arms above always build an object, so the name goes straight into
+            // it. Building a second object and merging a *clone* of this one into it would copy every data point,
+            // attribute and bucket count for the sake of one key. Key order carries no meaning in JSON, so nothing
+            // on the wire changes.
+            let mut data = data;
+            if let Some(object) = data.as_object_mut() {
+                object.insert("name".to_string(), Json::String(snapshot.name.clone()));
             }
 
-            encoded
+            data
         })
         .collect();
 
@@ -296,13 +317,4 @@ pub(super) fn metrics(
             "scopeMetrics": [{ "scope": scope(), "metrics": metrics }],
         }]
     })
-}
-
-/// Encodes a metric's tag set as an OTLP `KeyValue` list.
-fn tag_values(tags: &[(String, String)]) -> Json {
-    Json::Array(
-        tags.iter()
-            .map(|(key, value)| json!({ "key": key, "value": { "stringValue": value } }))
-            .collect(),
-    )
 }

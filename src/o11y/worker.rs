@@ -8,7 +8,7 @@ use serde_json::Value as Json;
 
 use super::pipeline::Shared;
 use super::record::now_unix_nano;
-use super::{O11yError, Signal, level, metric, otlp};
+use super::{O11yError, Signal, gate, metric, otlp};
 
 /// The longest the worker will wait between attempts after repeated failures.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -34,21 +34,19 @@ fn run(shared: Arc<Shared>) {
     // Built here rather than in `init` so that every request happens on this thread. A `reqwest::blocking` client
     // owns a runtime of its own, and constructing or calling it from inside someone else's async context is the
     // documented way to deadlock.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(shared.timeout)
-        .build()
-        .unwrap_or_default();
+    let client = client(shared.config.timeout);
 
     let mut backoff = Duration::ZERO;
 
     loop {
         let shutting_down = wait(&shared, backoff);
 
-        match export(&client, &shared) {
-            true => backoff = Duration::ZERO,
+        backoff = if export(&client, &shared) {
+            Duration::ZERO
+        } else {
             // An unreachable collector must not mean a full-timeout attempt every interval forever.
-            false => backoff = next_backoff(backoff, shared.flush_interval),
-        }
+            next_backoff(backoff, shared.config.flush_interval)
+        };
 
         {
             let mut control = shared.control.lock().unwrap_or_else(PoisonError::into_inner);
@@ -68,7 +66,7 @@ struct Sentinel;
 
 impl Drop for Sentinel {
     fn drop(&mut self) {
-        level::silence();
+        gate::close();
     }
 }
 
@@ -77,7 +75,7 @@ impl Drop for Sentinel {
 /// Three things end the wait: the flush interval elapsing, a producer pushing the record that reaches
 /// `max_batch_size`, and [`shutdown`](super::shutdown).
 fn wait(shared: &Shared, backoff: Duration) -> bool {
-    let deadline = Instant::now() + shared.flush_interval + backoff;
+    let deadline = Instant::now() + shared.config.flush_interval + backoff;
     let mut control = shared.control.lock().unwrap_or_else(PoisonError::into_inner);
 
     loop {
@@ -143,12 +141,10 @@ pub(super) fn export(client: &reqwest::blocking::Client, shared: &Shared) -> boo
 
 /// Posts one payload, reporting any failure through the callback. Returns whether it was accepted.
 fn post(client: &reqwest::blocking::Client, shared: &Shared, signal: Signal, payload: Json) -> bool {
-    let url = format!("{}{}", shared.endpoint.trim_end_matches('/'), signal.path());
-    let mut request = client.post(url).json(&payload);
-
-    for (name, value) in &shared.headers {
-        request = request.header(name, value);
-    }
+    let url = format!("{}{}", shared.config.endpoint.trim_end_matches('/'), signal.path());
+    // Already-parsed names and values, so nothing is re-validated per request; cloning a `HeaderMap` copies a
+    // little bookkeeping and bumps the ref-count on each value's bytes.
+    let request = client.post(url).json(&payload).headers(shared.headers.clone());
 
     match request.send() {
         Ok(response) if response.status().is_success() => true,
@@ -177,7 +173,7 @@ fn report_drops(shared: &Shared, signal: Signal, count: u64) {
 
 /// Hands an error to the configured callback.
 fn report(shared: &Shared, error: &O11yError) {
-    (shared.on_export_error)(error);
+    (shared.config.on_export_error)(error);
 }
 
 /// The next wait after a failure: double it, starting at the flush interval, capped at [`MAX_BACKOFF`].
@@ -192,10 +188,15 @@ fn next_backoff(current: Duration, flush_interval: Duration) -> Duration {
 /// Runs one export cycle against `shared`, building a client for it. Test-only.
 #[cfg(test)]
 pub(super) fn export_once(shared: &Shared) -> bool {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(shared.timeout)
-        .build()
-        .unwrap_or_default();
+    export(&client(shared.config.timeout), shared)
+}
 
-    export(&client, shared)
+/// Builds the blocking client the export thread posts through. Always called *from* that thread — see the note at
+/// its one production call site. A client that fails to build falls back to the default rather than taking the
+/// export thread down with it.
+fn client(timeout: Duration) -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default()
 }

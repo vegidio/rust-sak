@@ -20,16 +20,11 @@
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rust_sak_o11y_span {
-    ($name:expr) => {
+    // One arm for both the field and no-field forms: the fields macro types its own empty case, so
+    // `__rust_sak_o11y_fields!()` is already a `Vec` with a concrete element type.
+    ($name:expr $(, $($fields:tt)*)?) => {
         if $crate::o11y::trace::__enabled() {
-            $crate::o11y::trace::Span::__enter($name, ::std::vec::Vec::new())
-        } else {
-            $crate::o11y::trace::Span::__disabled()
-        }
-    };
-    ($name:expr, $($fields:tt)*) => {
-        if $crate::o11y::trace::__enabled() {
-            $crate::o11y::trace::Span::__enter($name, $crate::__rust_sak_o11y_fields!($($fields)*))
+            $crate::o11y::trace::Span::__enter($name, $crate::__rust_sak_o11y_fields!($($($fields)*)?))
         } else {
             $crate::o11y::trace::Span::__disabled()
         }

@@ -4,17 +4,30 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 /// One tag set, owned, as stored against a series.
-pub(super) type Tags = Vec<(String, String)>;
+///
+/// Behind an `Arc` because the exporter takes a copy of every series' tags on every flush, and a tag set never
+/// changes after the series is created. A `Vec<(String, String)>` would mean two heap allocations per tag per
+/// series per flush — roughly seven thousand of them for a counter at the series cap with three tags each — to
+/// reproduce bytes that already exist. Cloning this is a ref-count bump.
+pub(super) type Tags = Arc<[(Box<str>, Box<str>)]>;
 
 /// The most distinct tag sets one instrument will track before folding the rest into an overflow series.
 pub(crate) const MAX_SERIES: usize = 1024;
 
+/// The tag set of a series that carries no tags: the untagged one.
+pub(super) fn no_tags() -> Tags {
+    static NO_TAGS: LazyLock<Tags> = LazyLock::new(|| Arc::from([]));
+    Arc::clone(&NO_TAGS)
+}
+
 /// The tag set reported for samples that arrived after [`MAX_SERIES`] was reached.
 pub(super) fn overflow_tags() -> Tags {
-    vec![("o11y.series_overflow".to_string(), "true".to_string())]
+    static OVERFLOW: LazyLock<Tags> =
+        LazyLock::new(|| Arc::from([(Box::from("o11y.series_overflow"), Box::from("true"))]));
+    Arc::clone(&OVERFLOW)
 }
 
 /// A map from a tag set to whatever that series accumulates into.
@@ -124,12 +137,12 @@ fn same_tags(stored: &Tags, probe: &[(&str, &str)]) -> bool {
     stored.len() == probe.len()
         && probe
             .iter()
-            .all(|(key, value)| stored.iter().any(|(k, v)| k == key && v == value))
+            .all(|(key, value)| stored.iter().any(|(k, v)| &**k == *key && &**v == *value))
 }
 
 /// Copies a borrowed tag set into an owned one, for storage.
 fn owned(tags: &[(&str, &str)]) -> Tags {
     tags.iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .map(|(key, value)| (Box::from(*key), Box::from(*value)))
         .collect()
 }

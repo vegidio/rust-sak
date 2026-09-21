@@ -3,8 +3,8 @@ use super::RawFormat;
 /// Metadata describing a camera RAW image, read **without decoding the pixels**.
 ///
 /// Returned by [`probe_raw_file`](super::probe_raw_file) and [`probe_raw_bytes`](super::probe_raw_bytes). This is
-/// deliberately not [`ImageInfo`](super::ImageInfo), for two reasons that pull the same way: `ImageInfo::format` is
-/// an [`ImageFormat`](super::ImageFormat), which has no RAW member and cannot honestly be given one, and RAW files
+/// deliberately not [`ImageInfo`](super::super::ImageInfo), for two reasons that pull the same way: `ImageInfo::format` is
+/// an [`ImageFormat`](super::super::ImageFormat), which has no RAW member and cannot honestly be given one, and RAW files
 /// carry two facts — the camera's make and model — that a photographer's file listing wants and that no `ImageInfo`
 /// field holds. Widening `ImageInfo` to fit would also cost it its `Copy`, which the eight native formats have no
 /// reason to give up.

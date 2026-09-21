@@ -35,11 +35,22 @@
 //!
 //! # RAW decoding
 //!
-//! Camera RAW/DNG decoding lives behind the **separate `image-raw` feature**, not `image`. Turning it on adds
-//! `decode_raw_bytes`/`decode_raw_file`, `probe_raw_bytes`/`probe_raw_file`, `RawFormat` and `RawImageInfo`, which
-//! decode 300-plus cameras' RAW files to the same [`DynamicImage`](::image::DynamicImage) the other eight formats
+//! Camera RAW/DNG decoding lives behind the **separate `image-raw` feature**, not `image`. Turning it on teaches
+//! [`decode_file`] and [`decode_bytes`] to open RAW as well, and adds `decode_raw_bytes`/`decode_raw_file`,
+//! `probe_raw_bytes`/`probe_raw_file`, `RawFormat` and `RawImageInfo` for callers that want RAW specifically —
+//! 300-plus cameras' files, decoded to the same [`DynamicImage`](::image::DynamicImage) the other eight formats
 //! produce. (Those names exist only when the feature is on, so they are written plainly here rather than linked.)
-//! Every RAW item is `#[cfg(feature = "image-raw")]`, so a build without the feature links none of it.
+//! All of it lives in one `#[cfg(feature = "image-raw")]` module, so a build without the feature links none of it.
+//!
+//! **By name, RAW is fully resolved; by content, only partly.** [`decode_file`] routes on the extension, which is
+//! unambiguous, so all of them open. [`decode_bytes`] has only the header, and the TIFF-based formats (NEF, ARW,
+//! CR2, PEF, DNG) open exactly as an ordinary TIFF does — nothing in the bytes distinguishes them, so they decode
+//! as TIFF, and only the containers with a signature of their own (CR3, RAF, RW2, ORF) route to RAW. A native
+//! extension always wins over a RAW one, so a `.tiff` is never claimed for RAW.
+//!
+//! Probing stays split: `probe_file` returns an [`ImageInfo`], whose `format` is an [`ImageFormat`] with no RAW
+//! member, while a RAW file's metadata includes the camera make and model that no `ImageInfo` field holds. See
+//! `RawImageInfo` for why widening the one type was the worse trade.
 //!
 //! # Build notes
 //!
@@ -56,10 +67,6 @@
 mod decode_bytes;
 mod decode_bytes_with_format;
 mod decode_file;
-#[cfg(feature = "image-raw")]
-mod decode_raw_bytes;
-#[cfg(feature = "image-raw")]
-mod decode_raw_file;
 mod dispatch;
 mod encode_file;
 mod encode_writer;
@@ -71,23 +78,11 @@ mod options;
 mod probe_bytes;
 mod probe_file;
 #[cfg(feature = "image-raw")]
-mod probe_raw_bytes;
-#[cfg(feature = "image-raw")]
-mod probe_raw_file;
-#[cfg(feature = "image-raw")]
-mod raw_dispatch;
-#[cfg(feature = "image-raw")]
-mod raw_format;
-#[cfg(feature = "image-raw")]
-mod raw_info;
+mod raw;
 
 pub use decode_bytes::decode_bytes;
 pub use decode_bytes_with_format::decode_bytes_with_format;
 pub use decode_file::decode_file;
-#[cfg(feature = "image-raw")]
-pub use decode_raw_bytes::decode_raw_bytes;
-#[cfg(feature = "image-raw")]
-pub use decode_raw_file::decode_raw_file;
 pub use encode_file::encode_file;
 pub use encode_writer::encode_writer;
 pub use error::{ImageError, Result};
@@ -98,13 +93,9 @@ pub use options::{Chroma, EncodeOptions, PngCompression, PngFilter, Preset};
 pub use probe_bytes::probe_bytes;
 pub use probe_file::probe_file;
 #[cfg(feature = "image-raw")]
-pub use probe_raw_bytes::probe_raw_bytes;
-#[cfg(feature = "image-raw")]
-pub use probe_raw_file::probe_raw_file;
-#[cfg(feature = "image-raw")]
-pub use raw_format::{RawFormat, is_raw_bytes};
-#[cfg(feature = "image-raw")]
-pub use raw_info::RawImageInfo;
+pub use raw::{
+    RawFormat, RawImageInfo, decode_raw_bytes, decode_raw_file, is_raw_bytes, probe_raw_bytes, probe_raw_file,
+};
 
 #[cfg(test)]
 mod tests;

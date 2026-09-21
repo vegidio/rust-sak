@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::registry::{Instrument, MetricData, MetricSnapshot, SumPoint, register};
-use super::tags::{TagMap, overflow_tags};
+use super::tags::{TagMap, no_tags, overflow_tags};
 
 /// A monotonically increasing total, such as a request or error count.
 ///
@@ -87,7 +87,7 @@ impl Counter {
 impl Instrument for CounterState {
     fn snapshot(&self) -> MetricSnapshot {
         let mut points = vec![SumPoint {
-            tags: Vec::new(),
+            tags: no_tags(),
             value: self.untagged.load(Ordering::Relaxed),
         }];
 

@@ -18,21 +18,32 @@ struct ErrorSink(Mutex<Vec<String>>);
 
 impl ErrorSink {
     /// A handler that appends every error's `Display` form to this sink.
-    fn handler(self: &Arc<Self>) -> super::config::ExportErrorHandler {
+    fn handler(self: &Arc<Self>) -> impl Fn(&O11yError) + Send + Sync + 'static {
         let sink = Arc::clone(self);
 
-        Arc::new(move |error: &O11yError| {
+        move |error: &O11yError| {
             sink.0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(error.to_string());
-        })
+        }
     }
 
     /// Everything reported so far.
     fn taken(&self) -> Vec<String> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
+}
+
+/// The configuration the export-cycle tests share: a collector to post at, a recording error handler, and a
+/// timeout short enough that an unreachable endpoint does not stall the suite.
+fn test_config(endpoint: &str, sink: &Arc<ErrorSink>) -> Config {
+    Config::builder(endpoint, NO_HEADERS)
+        .service_name("test-service")
+        .service_version("1.2.3")
+        .timeout(Duration::from_secs(5))
+        .on_export_error(sink.handler())
+        .build()
 }
 
 /// A finished span, built directly rather than by closing a guard, whose `Drop` routes to the process globals.
@@ -324,7 +335,7 @@ fn side_effect() -> u64 {
 fn fields_are_not_evaluated_when_the_level_gate_is_closed() {
     let _guard = global_lock();
 
-    level::silence();
+    gate::close();
     SIDE_EFFECTS.store(0, Ordering::SeqCst);
 
     log::debug!("never recorded", value = side_effect());
@@ -343,7 +354,7 @@ fn fields_are_not_evaluated_when_the_level_gate_is_closed() {
 fn a_record_at_or_above_the_threshold_evaluates_its_fields() {
     let _guard = global_lock();
 
-    level::set_threshold(Level::Warn);
+    gate::open(Level::Warn);
     SIDE_EFFECTS.store(0, Ordering::SeqCst);
 
     log::debug!("below", value = side_effect());
@@ -351,7 +362,7 @@ fn a_record_at_or_above_the_threshold_evaluates_its_fields() {
     log::warn!("at", value = side_effect());
     log::error!("above", value = side_effect());
 
-    level::silence();
+    gate::close();
 
     assert_eq!(SIDE_EFFECTS.load(Ordering::SeqCst), 2);
 }
@@ -359,7 +370,7 @@ fn a_record_at_or_above_the_threshold_evaluates_its_fields() {
 #[test]
 fn nothing_passes_the_gate_before_init() {
     let _guard = global_lock();
-    level::silence();
+    gate::close();
 
     assert!(
         !log::enabled(Level::Error),
@@ -642,7 +653,7 @@ fn a_histogram_files_values_into_the_bucket_they_fall_in() {
     histogram.record(500.0);
 
     let snapshot = metric::snapshot().into_iter().find(|s| s.name == "values").unwrap();
-    let metric::MetricData::Histogram(points) = &snapshot.data else {
+    let metric::MetricData::Histogram { points, .. } = &snapshot.data else {
         panic!("expected a histogram")
     };
 
@@ -660,11 +671,11 @@ fn with_buckets_given_out_of_order_bounds_sorts_them() {
     histogram.record(50.0);
 
     let snapshot = metric::snapshot().into_iter().find(|s| s.name == "unsorted").unwrap();
-    let metric::MetricData::Histogram(points) = &snapshot.data else {
+    let metric::MetricData::Histogram { bounds, points } = &snapshot.data else {
         panic!("expected a histogram")
     };
 
-    assert_eq!(points[0].bounds, vec![10.0, 100.0]);
+    assert_eq!(**bounds, [10.0, 100.0]);
     assert_eq!(points[0].bucket_counts, vec![0, 1, 0]);
 }
 
@@ -769,7 +780,7 @@ fn an_export_posts_each_signal_to_its_own_otlp_path() {
 
     let (endpoint, captured) = spawn_recording_collector(3, "200 OK");
     let sink = Arc::new(ErrorSink::default());
-    let shared = pipeline::test_shared(&endpoint, sink.handler());
+    let shared = pipeline::test_shared(test_config(&endpoint, &sink));
 
     shared.logs.push(log_record("order received"));
     shared.spans.push(span_record("charge_card"));
@@ -801,7 +812,7 @@ fn a_rejected_payload_reaches_the_error_callback() {
 
     let (endpoint, _captured) = spawn_recording_collector(1, "503 Service Unavailable");
     let sink = Arc::new(ErrorSink::default());
-    let shared = pipeline::test_shared(&endpoint, sink.handler());
+    let shared = pipeline::test_shared(test_config(&endpoint, &sink));
 
     shared.logs.push(log_record("order received"));
 
@@ -823,7 +834,7 @@ fn an_unreachable_collector_reports_rather_than_blocking_or_panicking() {
 
     let sink = Arc::new(ErrorSink::default());
     // Port 1 on loopback refuses immediately, which is the connect-error path rather than the timeout one.
-    let shared = pipeline::test_shared("http://127.0.0.1:1", sink.handler());
+    let shared = pipeline::test_shared(test_config("http://127.0.0.1:1", &sink));
 
     shared.logs.push(log_record("never delivered"));
 
@@ -837,7 +848,7 @@ fn discarded_records_are_reported_through_the_callback() {
     metric::clear();
 
     let sink = Arc::new(ErrorSink::default());
-    let shared = pipeline::test_shared("http://127.0.0.1:1", sink.handler());
+    let shared = pipeline::test_shared(test_config("http://127.0.0.1:1", &sink));
 
     // A buffer of its own, sized so the overflow is deterministic rather than depending on the default.
     let buffer = Buffer::new(2);
@@ -915,7 +926,7 @@ fn the_exported_log_payload_has_the_shape_a_collector_expects() {
 
     let (endpoint, captured) = spawn_recording_collector(1, "200 OK");
     let sink = Arc::new(ErrorSink::default());
-    let shared = pipeline::test_shared(&endpoint, sink.handler());
+    let shared = pipeline::test_shared(test_config(&endpoint, &sink));
 
     let mut record = log_record("order received");
     record.enrichment = shared.enrichment.attributes();
@@ -958,12 +969,13 @@ fn the_export_request_carries_the_configured_headers_and_content_type() {
 
     let (endpoint, captured) = spawn_recording_collector(1, "200 OK");
     let sink = Arc::new(ErrorSink::default());
-    let mut shared = pipeline::test_shared(&endpoint, sink.handler());
-
-    Arc::get_mut(&mut shared)
-        .unwrap()
-        .headers
-        .insert("Authorization".to_string(), "Bearer secret".to_string());
+    let shared = pipeline::test_shared(
+        Config::builder(&endpoint, [("Authorization", "Bearer secret")])
+            .service_name("test-service")
+            .timeout(Duration::from_secs(5))
+            .on_export_error(sink.handler())
+            .build(),
+    );
 
     shared.logs.push(log_record("order received"));
     assert!(worker::export_once(&shared));
@@ -1042,7 +1054,7 @@ fn the_series_cap_folds_the_overflow_into_a_single_marked_series() {
 
     let overflow = points
         .iter()
-        .find(|point| point.tags.iter().any(|(key, _)| key == "o11y.series_overflow"))
+        .find(|point| point.tags.iter().any(|(key, _)| &**key == "o11y.series_overflow"))
         .expect("samples past the cap fold into an overflow series");
 
     assert_eq!(
@@ -1054,4 +1066,98 @@ fn the_series_cap_folds_the_overflow_into_a_single_marked_series() {
         "memory stays bounded: {} series",
         points.len(),
     );
+}
+
+// The explicit `&` on each call is load-bearing, not redundant: it is the borrow `#[instrument]` emits, and it is
+// what puts method resolution at the step where `ValueViaInto` is found before `ValueViaDebug`. Clippy sees only
+// that the compiler would autoref anyway.
+#[allow(clippy::needless_borrow)]
+#[test]
+fn argument_capture_prefers_a_value_conversion_over_debug() {
+    use crate::o11y::{ValueViaDebug, ValueViaInto};
+
+    /// A type with no `Into<Value>`, so it can only reach the `Debug` fallback.
+    #[derive(Debug)]
+    struct Opaque {
+        // Read only by the derived `Debug`, which is the whole point of the type.
+        #[allow(dead_code)]
+        id: u8,
+    }
+
+    // Integers, floats, bools and strings take the cheap path and land in their proper variant rather than being
+    // formatted into a string.
+    assert_eq!((&7u64).o11y_value(), Value::Int(7));
+    assert_eq!((&(-3i32)).o11y_value(), Value::Int(-3));
+    assert_eq!((&1.5f64).o11y_value(), Value::Double(1.5));
+    assert_eq!((&true).o11y_value(), Value::Bool(true));
+    assert_eq!((&"hello").o11y_value(), Value::String("hello".to_string()));
+
+    // Anything else still works, through `Debug`.
+    assert_eq!(
+        (&Opaque { id: 9 }).o11y_value(),
+        Value::String("Opaque { id: 9 }".to_string())
+    );
+
+    // A reference argument — the shape `#[instrument] fn f(req: &Request)` produces — also reaches the fallback.
+    let opaque = Opaque { id: 4 };
+    assert_eq!((&&opaque).o11y_value(), Value::String("Opaque { id: 4 }".to_string()));
+}
+
+#[test]
+fn instrument_captures_each_argument_in_its_natural_value_variant() {
+    let _guard = global_lock();
+
+    /// Returns what the span opened around its own body captured, so the assertions can read it directly.
+    #[trace::instrument]
+    fn charge(order_id: &str, attempt: u32, amount: f64) -> Option<(Cow<'static, str>, record::Fields)> {
+        trace::current_span()
+    }
+
+    gate::open(Level::Debug);
+    let captured = charge("ord_8812", 2, 12.5);
+    gate::close();
+
+    let (name, fields) = captured.expect("the span is open for the whole body");
+
+    assert_eq!(name, "charge", "the span is named after the function");
+    assert_eq!(
+        fields,
+        vec![
+            (Cow::Borrowed("order_id"), Value::String("ord_8812".to_string())),
+            // The point of the test: an integer and a float keep their own variants rather than arriving as
+            // `Value::String("2")` and `Value::String("12.5")`, which is what formatting every argument through
+            // `Debug` would produce.
+            (Cow::Borrowed("attempt"), Value::Int(2)),
+            (Cow::Borrowed("amount"), Value::Double(12.5)),
+        ]
+    );
+}
+
+#[test]
+fn instrument_honours_skip_and_leaves_the_rest_captured() {
+    let _guard = global_lock();
+
+    #[trace::instrument(name = "sign_in", skip(password))]
+    fn sign_in(user: &str, password: &str) -> Option<(Cow<'static, str>, record::Fields)> {
+        let _ = password;
+        trace::current_span()
+    }
+
+    #[trace::instrument(skip_all)]
+    fn silent(user: &str) -> Option<(Cow<'static, str>, record::Fields)> {
+        let _ = user;
+        trace::current_span()
+    }
+
+    gate::open(Level::Debug);
+    let signed_in = sign_in("ada", "hunter2");
+    let quiet = silent("ada");
+    gate::close();
+
+    let (name, fields) = signed_in.expect("the span is open for the whole body");
+    assert_eq!(name, "sign_in", "`name = \"..\"` overrides the function's own name");
+    assert_eq!(fields, vec![(Cow::Borrowed("user"), Value::String("ada".to_string()))]);
+
+    let (_, fields) = quiet.expect("the span is open for the whole body");
+    assert!(fields.is_empty(), "`skip_all` captures nothing");
 }

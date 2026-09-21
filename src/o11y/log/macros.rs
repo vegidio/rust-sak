@@ -1,5 +1,9 @@
 //! The four log macros.
 //!
+//! All four share one body, [`__rust_sak_o11y_log`], and differ only in the [`Level`](crate::o11y::Level) they pass
+//! it; each public name is a one-line forwarder carrying its own documentation. Writing the gate and the `__emit`
+//! call once is what keeps a change to the emit shape from being a four-place edit.
+//!
 //! # Why the names are mangled
 //!
 //! `#[macro_export]` places a `macro_rules!` macro at the **crate root**, whatever module it was written in, and
@@ -10,6 +14,24 @@
 //! re-export it at the intended path with `pub use`. Two constraints follow: every path inside a macro body must be
 //! `$crate`-rooted or absolute (`::std::format!`, not `format!`, which the caller may have shadowed), and the
 //! functions the bodies call must be `pub`, because expansion happens in the caller's crate.
+
+/// The shared body of the four log macros. Macro plumbing; not API.
+///
+/// The fields macro types its own empty case (see the `@acc []` rule), so the no-field call needs no separate arm
+/// here — `__rust_sak_o11y_fields!()` is already a `Vec` with a concrete element type.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rust_sak_o11y_log {
+    ($level:expr, $message:expr $(, $($fields:tt)*)?) => {
+        if $crate::o11y::log::enabled($level) {
+            $crate::o11y::log::__emit(
+                $level,
+                $message,
+                $crate::__rust_sak_o11y_fields!($($($fields)*)?),
+            );
+        }
+    };
+}
 
 /// Records a message at [`Level::Debug`](crate::o11y::Level).
 ///
@@ -22,20 +44,7 @@
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rust_sak_o11y_debug {
-    ($message:expr) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Debug) {
-            $crate::o11y::log::__emit($crate::o11y::Level::Debug, $message, ::std::vec::Vec::new());
-        }
-    };
-    ($message:expr, $($fields:tt)*) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Debug) {
-            $crate::o11y::log::__emit(
-                $crate::o11y::Level::Debug,
-                $message,
-                $crate::__rust_sak_o11y_fields!($($fields)*),
-            );
-        }
-    };
+    ($($args:tt)*) => { $crate::__rust_sak_o11y_log!($crate::o11y::Level::Debug, $($args)*) };
 }
 
 /// Records a message at [`Level::Info`](crate::o11y::Level).
@@ -50,20 +59,7 @@ macro_rules! __rust_sak_o11y_debug {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rust_sak_o11y_info {
-    ($message:expr) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Info) {
-            $crate::o11y::log::__emit($crate::o11y::Level::Info, $message, ::std::vec::Vec::new());
-        }
-    };
-    ($message:expr, $($fields:tt)*) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Info) {
-            $crate::o11y::log::__emit(
-                $crate::o11y::Level::Info,
-                $message,
-                $crate::__rust_sak_o11y_fields!($($fields)*),
-            );
-        }
-    };
+    ($($args:tt)*) => { $crate::__rust_sak_o11y_log!($crate::o11y::Level::Info, $($args)*) };
 }
 
 /// Records a message at [`Level::Warn`](crate::o11y::Level).
@@ -77,20 +73,7 @@ macro_rules! __rust_sak_o11y_info {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rust_sak_o11y_warn {
-    ($message:expr) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Warn) {
-            $crate::o11y::log::__emit($crate::o11y::Level::Warn, $message, ::std::vec::Vec::new());
-        }
-    };
-    ($message:expr, $($fields:tt)*) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Warn) {
-            $crate::o11y::log::__emit(
-                $crate::o11y::Level::Warn,
-                $message,
-                $crate::__rust_sak_o11y_fields!($($fields)*),
-            );
-        }
-    };
+    ($($args:tt)*) => { $crate::__rust_sak_o11y_log!($crate::o11y::Level::Warn, $($args)*) };
 }
 
 /// Records a message at [`Level::Error`](crate::o11y::Level).
@@ -105,18 +88,5 @@ macro_rules! __rust_sak_o11y_warn {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __rust_sak_o11y_error {
-    ($message:expr) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Error) {
-            $crate::o11y::log::__emit($crate::o11y::Level::Error, $message, ::std::vec::Vec::new());
-        }
-    };
-    ($message:expr, $($fields:tt)*) => {
-        if $crate::o11y::log::enabled($crate::o11y::Level::Error) {
-            $crate::o11y::log::__emit(
-                $crate::o11y::Level::Error,
-                $message,
-                $crate::__rust_sak_o11y_fields!($($fields)*),
-            );
-        }
-    };
+    ($($args:tt)*) => { $crate::__rust_sak_o11y_log!($crate::o11y::Level::Error, $($args)*) };
 }

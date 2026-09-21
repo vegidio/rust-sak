@@ -21,7 +21,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -311,14 +311,21 @@ pub(super) async fn run(
     mode: DownloadMode,
     resume_key: Option<String>,
     algorithm: Option<DigestAlgorithm>,
-    digest: Arc<OnceLock<String>>,
+    digest_out: Arc<OnceLock<String>>,
 ) -> Result<(), DownloadError> {
-    let result = stream_to_file(prepared, path, &tx, mode, resume_key, algorithm, &digest).await;
+    let result = stream_to_file(prepared, path, &tx, mode, resume_key, algorithm).await;
+
+    // The single place a digest is published, so it cannot be set from a path that did not finish the transfer.
+    if let Ok(Some(digest)) = &result {
+        let _ = digest_out.set(digest.clone());
+    }
+
     tx.send_modify(|p| {
         p.completed = true;
         p.failed = result.is_err();
     });
-    result
+
+    result.map(|_| ())
 }
 
 /// Returns the size of the file at `path`, or `0` when it does not exist.
@@ -327,11 +334,49 @@ pub(super) async fn run(
 /// is surfaced rather than silently treated as an empty file, which would otherwise let `Resume` truncate an existing
 /// but un-stat'able file.
 async fn file_len(path: &Path) -> std::io::Result<u64> {
+    Ok(existing_len(path).await?.unwrap_or(0))
+}
+
+/// Returns the size of the file at `path`, or `None` when there is no file there.
+///
+/// One `metadata` call answers both "is it there" and "how big is it". Asking `try_exists` and then `file_len`
+/// stats the same inode twice, and each stat is its own hop onto tokio's blocking pool.
+///
+/// Only a `NotFound` error maps to `None`; any other stat failure is surfaced, for the reason [`file_len`] gives.
+async fn existing_len(path: &Path) -> std::io::Result<Option<u64>> {
     match tokio::fs::metadata(path).await {
-        Ok(meta) => Ok(meta.len()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+/// Brings `checkpoint` up to the first `offset` bytes of the partial at `part`, reading back only the gap it does
+/// not already cover, and hands back the hash to continue with.
+///
+/// The carried hash is taken only when it covers no more than `offset`: a checkpoint claiming *more* bytes than the
+/// partial now holds describes an artifact that is no longer on disk, and there is no way to un-hash the excess, so
+/// that case starts over.
+async fn hash_prefix(
+    checkpoint: &Mutex<Option<(Hasher, u64)>>,
+    algorithm: DigestAlgorithm,
+    part: &Path,
+    offset: u64,
+) -> Result<Hasher, DownloadError> {
+    // A `Mutex` rather than a `RefCell` only because the transfer runs in a spawned task, which has to be
+    // `Send`. It is never contended, and the guard is never held across an `await`.
+    let carried = checkpoint
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .filter(|(_, hashed)| *hashed <= offset);
+    let (mut hasher, hashed) = carried.unwrap_or_else(|| (Hasher::new(algorithm), 0));
+
+    if hashed < offset {
+        hasher.update_range(part, hashed, offset).await?;
+    }
+
+    Ok(hasher)
 }
 
 /// Reads a response's `ETag`, if it carried one that is valid UTF-8.
@@ -351,7 +396,6 @@ fn response_etag(response: &reqwest::Response) -> Option<String> {
 ///
 /// The offset is re-read from disk at the start of each attempt, so a retry resumes from whatever bytes are already
 /// present rather than restarting.
-#[allow(clippy::too_many_arguments)]
 async fn stream_to_file(
     prepared: Result<PreparedRequest, reqwest::Error>,
     path: PathBuf,
@@ -359,8 +403,7 @@ async fn stream_to_file(
     mode: DownloadMode,
     resume_key: Option<String>,
     algorithm: Option<DigestAlgorithm>,
-    digest: &OnceLock<String>,
-) -> Result<(), DownloadError> {
+) -> Result<Option<String>, DownloadError> {
     let prepared = prepared?;
     let part = partial::part_path(&path);
     let sidecar = partial::sidecar_path(&path);
@@ -368,10 +411,11 @@ async fn stream_to_file(
     // Nothing but the final rename ever writes to `path`, so a file there is finished. Both modes that respect an
     // existing file stop here — which is what makes `Skip` sound: it can no longer mistake a truncated transfer for a
     // complete download.
-    if mode != DownloadMode::Overwrite && tokio::fs::try_exists(&path).await? {
-        let len = file_len(&path).await?;
+    if mode != DownloadMode::Overwrite
+        && let Some(len) = existing_len(&path).await?
+    {
         tx.send_replace(Progress::in_flight(Some(len), len));
-        return Ok(());
+        return Ok(None);
     }
 
     let identity = partial::Identity {
@@ -386,6 +430,15 @@ async fn stream_to_file(
     } else {
         partial::reconcile(&part, &sidecar, &identity).await?;
     }
+
+    // The hash of the artifact prefix that is known to be on disk, carried from one attempt to the next.
+    //
+    // Building it fresh per attempt means re-reading and re-hashing the *whole* partial every time a transfer
+    // drops — for a 500 MB download that fails twice, close to a gigabyte of reads and SHA-256 to reproduce a
+    // hash the previous attempt had already computed. It is written only immediately after a flush, so the byte
+    // count it claims is never more than the next attempt will find on disk, and the gap it does not cover is
+    // bounded by one progress interval rather than by the size of the file.
+    let checkpoint: Mutex<Option<(Hasher, u64)>> = Mutex::new(None);
 
     retry::with_fibonacci_backoff(prepared.retries, || async {
         // The offset is re-read each attempt, so a retry resumes from whatever is already on disk.
@@ -416,15 +469,15 @@ async fn stream_to_file(
         // is promoted rather than transferred again.
         if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
             // The partial already is the whole artifact, so no byte of it streams past the hasher on this attempt:
-            // what is on disk is read back before the promotion moves it.
-            if let Some(algorithm) = algorithm {
-                let mut hasher = Hasher::new(algorithm);
-                hasher.update_prefix(&part, offset).await?;
-                let _ = digest.set(hasher.finish());
-            }
+            // whatever the checkpoint does not already cover is read back before the promotion moves it.
+            let digest = match algorithm {
+                Some(algorithm) => Some(hash_prefix(&checkpoint, algorithm, &part, offset).await?.finish()),
+                None => None,
+            };
+
             partial::promote(&part, &sidecar, &path).await?;
             tx.send_replace(Progress::in_flight(Some(offset), offset));
-            return Ok(());
+            return Ok(digest);
         }
 
         let response = response.error_for_status()?;
@@ -460,15 +513,11 @@ async fn stream_to_file(
         };
 
         // Keyed off `resuming`, not the offset: it is the response that decides whether the bytes already on disk are
-        // part of this artifact, since a server that answered `200` just had them truncated away.
+        // part of this artifact, since a server that answered `200` just had them truncated away — which is also why
+        // a carried checkpoint is only reachable through the resuming branch.
         let mut hasher = match algorithm {
-            Some(algorithm) => {
-                let mut hasher = Hasher::new(algorithm);
-                if resuming {
-                    hasher.update_prefix(&part, offset).await?;
-                }
-                Some(hasher)
-            }
+            Some(algorithm) if resuming => Some(hash_prefix(&checkpoint, algorithm, &part, offset).await?),
+            Some(algorithm) => Some(Hasher::new(algorithm)),
             None => None,
         };
 
@@ -512,6 +561,16 @@ async fn stream_to_file(
                 tx.send_replace(Progress::in_flight(total, downloaded));
                 reported = downloaded;
                 reported_at = Instant::now();
+
+                // Flushed *before* the hash is recorded, so the checkpoint describes bytes a retry will actually
+                // find in the partial. This is what makes the checkpoint usable rather than what makes it safe:
+                // recording it first would leave it covering bytes still in the writer's buffer, `hash_prefix`
+                // would reject it as covering more than the partial holds, and the attempt would fall back to
+                // re-reading the whole prefix — correct, but exactly the work this exists to avoid.
+                if let Some(hasher) = hasher.as_ref() {
+                    file.flush().await?;
+                    *checkpoint.lock().unwrap_or_else(PoisonError::into_inner) = Some((hasher.clone(), downloaded));
+                }
             }
         }
 
@@ -520,11 +579,9 @@ async fn stream_to_file(
         file.into_inner().sync_all().await?;
         partial::promote(&part, &sidecar, &path).await?;
 
-        // Published only once the bytes are at the target path, so a digest is never readable for a transfer that did
-        // not finish.
-        if let Some(hasher) = hasher {
-            let _ = digest.set(hasher.finish());
-        }
+        // Returned rather than written through a handle, so "a digest exists only for a transfer that finished" is
+        // a property of the type instead of one of where the statement happens to sit.
+        let digest = hasher.map(Hasher::finish);
 
         // The final count always goes out, whatever the thresholds said, so an observer's last update matches what is
         // actually on disk — `track` in particular relies on seeing it.
@@ -532,7 +589,7 @@ async fn stream_to_file(
             tx.send_replace(Progress::in_flight(total, downloaded));
         }
 
-        Ok::<(), DownloadError>(())
+        Ok::<Option<String>, DownloadError>(digest)
     })
     .await
 }

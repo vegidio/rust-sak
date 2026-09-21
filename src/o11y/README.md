@@ -199,8 +199,10 @@ alternative is an `Option` that every call site has to unwrap, for something tha
 
 ### `#[instrument]`
 
-Wraps the whole function body, naming the span after the function and capturing its arguments as fields — by their
-`Debug` form, so every captured argument must implement `Debug`.
+Wraps the whole function body, naming the span after the function and capturing its arguments as fields. An
+argument that converts into a `Value` on its own — every integer and float, `bool`, `&str`, `String` — is captured
+in that variant directly, costing no formatting; anything else falls back to its `Debug` form, so an argument that
+is neither must implement `Debug`.
 
 ```rust
 use rust_sak::o11y::trace;

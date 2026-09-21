@@ -1,4 +1,5 @@
 use std::io::{Cursor, Write};
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use ::image::codecs::jpeg::JpegEncoder;
@@ -8,6 +9,71 @@ use ::image::{DynamicImage, ImageDecoder, ImageReader};
 use super::error::{ImageError, Result};
 use super::info::ImageInfo;
 use super::{EncodeOptions, ImageFormat};
+
+/// What a decode should be routed to: one of the formats [`ImageFormat`] names, or camera RAW.
+///
+/// This is what lets [`decode_file`](super::decode_file) and [`decode_bytes`](super::decode_bytes) open everything
+/// the build can open, instead of RAW being a parallel set of entry points a caller has to know to reach for. It is
+/// deliberately **not** a variant added to [`ImageFormat`], which is the encode target as well as the decode source
+/// — see the note on [`RawFormat`](super::RawFormat) for why no RAW format belongs there.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DecodeFormat {
+    /// One of the eight formats with an encoder to match.
+    Image(ImageFormat),
+    /// Camera RAW. Carries no format: [`raw_dispatch::decode_raw`](super::raw::dispatch::decode_raw) works from the
+    /// bytes alone, and which RAW format it is only matters for reporting.
+    #[cfg(feature = "image-raw")]
+    Raw,
+}
+
+impl DecodeFormat {
+    /// Resolves the format from a path's extension.
+    ///
+    /// A native extension wins: `.tiff` is an ordinary TIFF even though nearly every RAW format is a TIFF
+    /// container underneath, which is the same call [`RawFormat::from_extension`](super::RawFormat::from_extension)
+    /// makes from the other side.
+    pub(super) fn from_path(path: &Path) -> Option<Self> {
+        if let Some(format) = ImageFormat::from_path(path) {
+            return Some(DecodeFormat::Image(format));
+        }
+
+        #[cfg(feature = "image-raw")]
+        if super::RawFormat::from_path(path).is_some() {
+            return Some(DecodeFormat::Raw);
+        }
+
+        None
+    }
+
+    /// Resolves the format from leading magic bytes.
+    ///
+    /// **This finds far less RAW than [`from_path`](DecodeFormat::from_path) does, and cannot do better.** The
+    /// TIFF-based RAW formats — NEF, ARW, CR2, PEF, DNG — open with the same four bytes as an ordinary TIFF, so
+    /// they are claimed as TIFF here and there is no byte to tell them apart; a file name is the only thing that
+    /// does. What this does pick up is the containers carrying a signature of their own (CR3, RAF, RW2, ORF),
+    /// which no native format matches and which therefore used to be refused outright.
+    pub(super) fn from_magic(bytes: &[u8]) -> Option<Self> {
+        if let Some(format) = ImageFormat::from_magic(bytes) {
+            return Some(DecodeFormat::Image(format));
+        }
+
+        #[cfg(feature = "image-raw")]
+        if super::RawFormat::from_magic(bytes).is_some() {
+            return Some(DecodeFormat::Raw);
+        }
+
+        None
+    }
+}
+
+/// Decodes `bytes` through whichever codec `format` names. The one decode path.
+pub(super) fn decode_any(bytes: &[u8], format: DecodeFormat) -> Result<DynamicImage> {
+    match format {
+        DecodeFormat::Image(format) => decode_with_format(bytes, format),
+        #[cfg(feature = "image-raw")]
+        DecodeFormat::Raw => super::raw::dispatch::decode_raw(bytes),
+    }
+}
 
 /// Decodes `bytes` known to be in `format`, routing native formats through the `image` crate and `avif`/`heif`/`webp`
 /// through their dedicated codecs. Shared by every decode entry point.
@@ -202,16 +268,26 @@ static AVIF_ENCODE: Mutex<()> = Mutex::new(());
 /// Every codec here except BMP, GIF and TIFF takes a plain [`Write`], so the encoded bytes go to the destination as
 /// they are produced rather than being accumulated first. The three that go through
 /// [`DynamicImage::write_to`](::image::DynamicImage::write_to) need `Write + Seek`, so they are the only ones that
-/// still buffer — see [`encode_to_vec`], which is what callers with a non-seekable sink use for them.
+/// buffer, into a `Cursor` of their own — which keeps that requirement from reaching the caller's sink.
 pub(super) fn encode_into<W: Write>(image: &DynamicImage, options: EncodeOptions, writer: &mut W) -> Result<()> {
     // Ahead of the `match`, so no codec below is reachable without it. See [`make_compatible`] for what it converts.
     let converted = make_compatible(image, options.format());
     let image = converted.as_ref().unwrap_or(image);
 
     match options {
-        // These three need `Seek` as well, which a bare `Write` cannot offer.
+        // These three need `Seek` as well, which a bare `Write` cannot offer, so they encode into a rewindable
+        // buffer and the bytes are handed on from there. Done inline rather than through a second entry point that
+        // called straight back into this one: the two were mutually recursive, and the compatibility step above had
+        // to be stated at both ends to cover whichever was entered first.
         EncodeOptions::Bmp | EncodeOptions::Gif | EncodeOptions::Tiff => {
-            writer.write_all(&encode_to_vec(image, options)?)?;
+            let format = options
+                .format()
+                .to_image_format()
+                .expect("bmp, gif and tiff map to image::ImageFormat");
+
+            let mut seekable = Cursor::new(Vec::new());
+            image.write_to(&mut seekable, format)?;
+            writer.write_all(&seekable.into_inner())?;
         }
         EncodeOptions::Jpeg { quality } => {
             image.write_with_encoder(JpegEncoder::new_with_quality(writer, quality))?;
@@ -262,32 +338,4 @@ pub(super) fn encode_into<W: Write>(image: &DynamicImage, options: EncodeOptions
     }
 
     Ok(())
-}
-
-/// Encodes `image` into a fresh byte buffer using the codec selected by `options`.
-///
-/// Only BMP, GIF and TIFF genuinely need this: their encoder wants `Write + Seek`, so the bytes have to land somewhere
-/// rewindable. Everything else reaches here only from a caller whose sink is not seekable, and streams through
-/// [`encode_into`] otherwise.
-pub(super) fn encode_to_vec(image: &DynamicImage, options: EncodeOptions) -> Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-
-    match options {
-        // The three seek-bound codecs are reached from here rather than through [`encode_into`], so the compatibility
-        // step runs on this path too — otherwise GIF, which needs it most, would be the one format that never got it.
-        EncodeOptions::Bmp | EncodeOptions::Gif | EncodeOptions::Tiff => {
-            let format = options
-                .format()
-                .to_image_format()
-                .expect("bmp, gif and tiff map to image::ImageFormat");
-            let converted = make_compatible(image, options.format());
-            let image = converted.as_ref().unwrap_or(image);
-            image.write_to(&mut Cursor::new(&mut buffer), format)?;
-        }
-        // Not seek-bound, so these stream; the buffer is only here because this caller's sink cannot. `encode_into`
-        // runs the compatibility step itself.
-        other => encode_into(image, other, &mut buffer)?,
-    }
-
-    Ok(buffer)
 }

@@ -1740,3 +1740,92 @@ async fn a_transfer_short_circuited_by_an_existing_file_reports_no_digest() {
 
     clean(&path).await;
 }
+
+#[tokio::test]
+async fn a_transfer_that_drops_mid_stream_digests_the_whole_artifact_after_resuming() {
+    // The guard on carrying the hash across attempts. A transfer that drops part-way through resumes from what it
+    // managed to flush, so the second attempt never sees the bytes the first one already hashed — and the digest
+    // must still describe the whole artifact. Getting this wrong (a checkpoint covering bytes that were still in
+    // the writer's buffer when the connection died) produces a digest of an artifact nobody received, which no
+    // amount of comparing the *file* would catch.
+    //
+    // The body has to outrun `PROGRESS_BYTES` for a checkpoint to be taken at all, hence the size.
+    const TOTAL: usize = 600 * 1024;
+    const DELIVERED: usize = 400 * 1024;
+
+    let body: Vec<u8> = (0..TOTAL).map(|index| (index % 251) as u8).collect();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}");
+    clean(&path).await;
+
+    use tokio::io::AsyncWriteExt as _;
+
+    let served = body.clone();
+    let server = tokio::spawn(async move {
+        // Attempt one: promise the whole artifact, deliver part of it, then hang up.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {TOTAL}\r\nConnection: close\r\n\r\n");
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&served[..DELIVERED]).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        // Attempt two: serve exactly the range the client asks to continue from.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        let start: usize = request
+            .split("bytes=")
+            .nth(1)
+            .expect("the retry should carry a Range header")
+            .split('-')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let rest = &served[start..];
+        let end = TOTAL - 1;
+        let head = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{TOTAL}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            rest.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(rest).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        start
+    });
+
+    let mut download = Fetch::new().retries(1).download_with_options(
+        &url,
+        &path,
+        RequestOptions::new().digest(DigestAlgorithm::Sha256),
+    );
+    let progress = drain(&mut download).await;
+    let resumed_from = server.await.unwrap();
+
+    assert!(
+        !progress.failed,
+        "the retry should have carried the transfer to completion"
+    );
+    assert!(
+        resumed_from > 0,
+        "the first attempt should have flushed something for the second to resume from",
+    );
+
+    assert_settled(&path, &body).await;
+
+    // The digest of the artifact as a whole, computed in one pass, is what the split transfer must agree with.
+    let mut expected = super::digest::Hasher::new(DigestAlgorithm::Sha256);
+    expected.update(&body);
+    assert_eq!(download.digest(), Some(expected.finish()));
+
+    #[cfg(feature = "crypto")]
+    assert_eq!(download.digest(), crate::crypto::sha256_file(&path).ok());
+
+    clean(&path).await;
+}

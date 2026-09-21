@@ -33,7 +33,12 @@
 
 mod macros;
 
-pub use super::level::{Level, enabled};
+// Only `enabled` is re-exported: the log macros name it, and expansion happens in the caller's crate, so it has
+// to be reachable at this path. `Level` is deliberately not re-exported here — it already lives at `o11y::Level`,
+// and a second public path for one type is a second thing for the docs and `tests/public_api.rs` to track.
+pub use super::gate::enabled;
+
+use super::level::Level;
 
 #[doc(inline)]
 pub use crate::__rust_sak_o11y_debug as debug;

@@ -1,7 +1,7 @@
 use ::image::DynamicImage;
 
-use super::error::{ImageError, Result};
-use super::raw_dispatch::decode_raw;
+use super::super::error::Result;
+use super::dispatch::decode_raw;
 
 /// Decodes the camera RAW file in `bytes` into a [`DynamicImage`], developing it into a display-ready picture.
 ///
@@ -27,8 +27,5 @@ use super::raw_dispatch::decode_raw;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn decode_raw_bytes(bytes: &[u8]) -> Result<DynamicImage> {
-    if !::zenraw::is_raw_file(bytes) {
-        return Err(ImageError::NotRaw);
-    }
     decode_raw(bytes)
 }

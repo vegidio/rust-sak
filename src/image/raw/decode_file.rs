@@ -3,8 +3,8 @@ use std::path::Path;
 
 use ::image::DynamicImage;
 
-use super::error::{ImageError, Result};
-use super::raw_dispatch::decode_raw;
+use super::super::error::{ImageError, Result};
+use super::dispatch::decode_raw;
 
 /// Decodes the camera RAW file at `path` into a [`DynamicImage`], developing it into a display-ready picture.
 ///
@@ -12,14 +12,14 @@ use super::raw_dispatch::decode_raw;
 /// [`DynamicImage::ImageRgb16`].
 ///
 /// The whole file is read, because a RAW decode needs all of it. Unlike
-/// [`decode_file`](super::decode_file) the extension is not what selects the codec — the backend identifies the
+/// [`decode_file`](super::super::decode_file) the extension is not what selects the codec — the backend identifies the
 /// camera from the contents — but it is still checked, so a PNG handed to this function is refused by name rather
 /// than by failing somewhere inside the decoder.
 ///
 /// # Errors
 ///
 /// Returns [`ImageError::UnknownExtension`] if the path has no recognized RAW extension,
-/// [`ImageError::Io`](super::ImageError::Io) if the file cannot be read, [`ImageError::NotRaw`] if its contents are
+/// [`ImageError::Io`](super::super::ImageError::Io) if the file cannot be read, [`ImageError::NotRaw`] if its contents are
 /// not RAW, and [`ImageError::Raw`] if the decode itself fails.
 ///
 /// ```no_run
@@ -31,12 +31,7 @@ use super::raw_dispatch::decode_raw;
 /// ```
 pub fn decode_raw_file(path: impl AsRef<Path>) -> Result<DynamicImage> {
     let path = path.as_ref();
-    if super::RawFormat::from_path(path).is_none() {
-        return Err(ImageError::UnknownExtension);
-    }
+    super::RawFormat::from_path(path).ok_or(ImageError::UnknownExtension)?;
     let bytes = fs::read(path)?;
-    if !::zenraw::is_raw_file(&bytes) {
-        return Err(ImageError::NotRaw);
-    }
     decode_raw(&bytes)
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::registry::{GaugePoint, Instrument, MetricData, MetricSnapshot, register};
-use super::tags::{TagMap, overflow_tags};
+use super::tags::{TagMap, no_tags, overflow_tags};
 
 /// A value that moves in both directions, such as a queue depth or a cache size.
 ///
@@ -92,7 +92,7 @@ impl Instrument for GaugeState {
 
         if self.untagged_set.load(Ordering::Relaxed) {
             points.push(GaugePoint {
-                tags: Vec::new(),
+                tags: no_tags(),
                 value: f64::from_bits(self.untagged.load(Ordering::Relaxed)),
             });
         }

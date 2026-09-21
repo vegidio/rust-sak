@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::Path;
 
+use super::super::error::{ImageError, Result};
 use super::RawFormat;
-use super::error::{ImageError, Result};
-use super::raw_dispatch::probe_raw;
-use super::raw_info::RawImageInfo;
+use super::dispatch::probe_raw;
+use super::info::RawImageInfo;
 
 /// Reads the metadata of the camera RAW file at `path` (dimensions, sensor bit depth, camera make and model)
 /// **without decoding the pixels**.
@@ -25,7 +25,7 @@ use super::raw_info::RawImageInfo;
 /// # Errors
 ///
 /// Returns [`ImageError::UnknownExtension`] if the path has no recognized RAW extension,
-/// [`ImageError::Io`](super::ImageError::Io) if the file cannot be read, [`ImageError::NotRaw`] if its contents are
+/// [`ImageError::Io`](super::super::ImageError::Io) if the file cannot be read, [`ImageError::NotRaw`] if its contents are
 /// not RAW, and [`ImageError::Raw`] if its metadata cannot be read.
 ///
 /// ```no_run
@@ -39,8 +39,5 @@ pub fn probe_raw_file(path: impl AsRef<Path>) -> Result<RawImageInfo> {
     let path = path.as_ref();
     let format = RawFormat::from_path(path).ok_or(ImageError::UnknownExtension)?;
     let bytes = fs::read(path)?;
-    if !::zenraw::is_raw_file(&bytes) {
-        return Err(ImageError::NotRaw);
-    }
     probe_raw(&bytes, Some(format))
 }

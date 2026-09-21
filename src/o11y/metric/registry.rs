@@ -1,7 +1,7 @@
 //! The process-wide list of live instruments, and the snapshot the exporter reads from it.
 
 use std::fmt;
-use std::sync::{LazyLock, Mutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use super::tags::Tags;
 
@@ -32,18 +32,26 @@ pub(super) fn register(instrument: Weak<dyn Instrument>) {
 
 /// Reads every live instrument, pruning any that have been dropped since the last flush.
 pub(crate) fn snapshot() -> Vec<MetricSnapshot> {
-    let mut instruments = INSTRUMENTS.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut snapshots = Vec::with_capacity(instruments.len());
+    // The lock is held only long enough to upgrade the weak handles and drop the dead ones. Reading an instrument
+    // walks all of its series and takes its own `TagMap` lock, and doing that here would block `register` — and so
+    // the first touch of any `LazyLock` instrument anywhere in the process — for a window that grows with the
+    // total number of series. The upgraded `Arc`s keep every instrument alive until the snapshot is finished.
+    let live: Vec<Arc<dyn Instrument>> = {
+        let mut instruments = INSTRUMENTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut live = Vec::with_capacity(instruments.len());
 
-    instruments.retain(|weak| match weak.upgrade() {
-        Some(instrument) => {
-            snapshots.push(instrument.snapshot());
-            true
-        }
-        None => false,
-    });
+        instruments.retain(|weak| match weak.upgrade() {
+            Some(instrument) => {
+                live.push(instrument);
+                true
+            }
+            None => false,
+        });
 
-    snapshots
+        live
+    };
+
+    live.iter().map(|instrument| instrument.snapshot()).collect()
 }
 
 /// Removes every registered instrument. Test-only, so one test's instruments cannot show up in another's snapshot.
@@ -69,7 +77,15 @@ pub(crate) enum MetricData {
     /// A value that moves in both directions.
     Gauge(Vec<GaugePoint>),
     /// A distribution over fixed buckets.
-    Histogram(Vec<HistogramPoint>),
+    ///
+    /// The bounds sit here rather than on each point: every series of one histogram shares the single `Layout`
+    /// they come from, so carrying them per point copied the same vector once per series per flush.
+    Histogram {
+        /// The upper bounds of every bucket but the last, which catches everything above the final bound.
+        bounds: Box<[f64]>,
+        /// One series per tag set.
+        points: Vec<HistogramPoint>,
+    },
 }
 
 /// One series of a counter.
@@ -99,8 +115,6 @@ pub(crate) struct HistogramPoint {
     pub(crate) count: u64,
     /// Their total.
     pub(crate) sum: f64,
-    /// The upper bounds of every bucket but the last, which catches everything above the final bound.
-    pub(crate) bounds: Vec<f64>,
-    /// One count per bucket, always one longer than `bounds`.
+    /// One count per bucket, always one longer than the enclosing [`MetricData::Histogram`]'s `bounds`.
     pub(crate) bucket_counts: Vec<u64>,
 }

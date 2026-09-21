@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The severity of a log record, and the threshold the log macros gate on.
 ///
@@ -47,32 +46,4 @@ impl fmt::Display for Level {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.severity_text())
     }
-}
-
-/// The active threshold, as a severity number. Records at or above it are emitted.
-///
-/// Starts at [`u8::MAX`], which no level reaches, so a process that never calls [`init`](super::init) — or one that
-/// disabled telemetry — discards everything after a single relaxed load. [`init`](super::init) lowers it, and
-/// [`shutdown`](super::shutdown) raises it back so late records are not queued into a drained buffer.
-static THRESHOLD: AtomicU8 = AtomicU8::new(u8::MAX);
-
-/// Whether a record at `level` would be recorded.
-///
-/// This is the whole of the disabled-path cost: one relaxed load and a comparison, which the log macros perform
-/// *before* evaluating any of their field arguments. `Relaxed` is the right ordering because a racing
-/// [`init`](super::init) only decides whether one record near the boundary is kept, and no other memory is being
-/// published through this flag.
-#[inline]
-pub fn enabled(level: Level) -> bool {
-    THRESHOLD.load(Ordering::Relaxed) <= level as u8
-}
-
-/// Lowers the threshold so records at or above `level` are recorded.
-pub(super) fn set_threshold(level: Level) {
-    THRESHOLD.store(level as u8, Ordering::Relaxed);
-}
-
-/// Raises the threshold so nothing is recorded.
-pub(super) fn silence() {
-    THRESHOLD.store(u8::MAX, Ordering::Relaxed);
 }

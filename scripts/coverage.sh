@@ -33,7 +33,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-FEATURES=(crypto fetch fs image memo,memo-async o11y sysinfo)
+FEATURES=(crypto fetch fs image image-raw memo,memo-async o11y sysinfo)
 
 # Ensure the LLVM coverage tooling is available.
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
@@ -51,7 +51,9 @@ case "${1:-}" in
     --by-feature)
         for feature in "${FEATURES[@]}"; do
             echo
-            echo "=== feature: $feature (src/${feature%%,*}) ==="
+            # `memo,memo-async` and `image-raw` both cover the directory their first word names.
+            dir="${feature%%,*}"
+            echo "=== feature: $feature (src/${dir%-raw}) ==="
             cargo llvm-cov --no-default-features --features "$feature" --summary-only
         done
         ;;

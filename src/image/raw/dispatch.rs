@@ -1,7 +1,7 @@
 use ::image::{DynamicImage, ImageBuffer};
 use ::zenpixels::{PixelBuffer, PixelDescriptor};
 
-use super::error::{ImageError, Result};
+use super::super::error::{ImageError, Result};
 use super::{RawFormat, RawImageInfo};
 
 /// Converts the decoder's [`PixelBuffer`] into a [`DynamicImage::ImageRgb16`]. Shared by every RAW decode entry
@@ -16,7 +16,7 @@ use super::{RawFormat, RawImageInfo};
 /// skew every row after the first by a few pixels and produce a sheared picture that still looks plausible enough
 /// to ship. The contiguous case is taken when the buffer says it holds, and the general case copies row by row
 /// through `row(y)`, which returns exactly `width * bpp` bytes with the padding already excluded.
-pub(super) fn image_from_pixel_buffer(buffer: &PixelBuffer) -> Result<DynamicImage> {
+pub(in crate::image) fn image_from_pixel_buffer(buffer: &PixelBuffer) -> Result<DynamicImage> {
     let pixels = buffer.as_slice();
     let descriptor = pixels.descriptor();
 
@@ -73,15 +73,33 @@ fn decode_config() -> ::zenraw::RawDecodeConfig {
 ///
 /// Cancellation is [`Unstoppable`](::enough::Unstoppable): this module is synchronous throughout, and threading a
 /// cancellation token through one decoder out of nine would be an inconsistency no caller asked for.
-pub(super) fn decode_raw(bytes: &[u8]) -> Result<DynamicImage> {
+pub(in crate::image) fn decode_raw(bytes: &[u8]) -> Result<DynamicImage> {
+    ensure_raw(bytes)?;
+
     let output =
         ::zenraw::decode(bytes, &decode_config(), &::enough::Unstoppable).map_err(|error| error.decompose().0)?;
     image_from_pixel_buffer(&output.pixels)
 }
 
+/// Rejects bytes that do not look like a RAW file.
+///
+/// Placed here, in the body every entry point already funnels through, rather than at each of them: what counts as
+/// RAW is one decision, and repeating it per entry point meant a fifth one could quietly ship without it. It goes
+/// through the module's own [`is_raw_bytes`](super::is_raw_bytes) rather than the backend directly, so the
+/// predicate callers are handed and the check performed here cannot disagree.
+fn ensure_raw(bytes: &[u8]) -> Result<()> {
+    if super::is_raw_bytes(bytes) {
+        Ok(())
+    } else {
+        Err(ImageError::NotRaw)
+    }
+}
+
 /// Probes `bytes` already known to be RAW, with `format` resolved by whatever the caller had to go on. Shared by
 /// both probe entry points.
 pub(super) fn probe_raw(bytes: &[u8], format: Option<RawFormat>) -> Result<RawImageInfo> {
+    ensure_raw(bytes)?;
+
     let info = ::zenraw::probe(bytes, &::enough::Unstoppable).map_err(|error| error.decompose().0)?;
 
     Ok(RawImageInfo {

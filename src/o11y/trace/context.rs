@@ -95,6 +95,12 @@ pub(super) fn with_current<R>(visit: impl FnOnce(&mut SpanState) -> R) -> Option
 }
 
 /// How many spans are open on this thread. Used by the tests to prove entering and exiting balance.
+/// The innermost open span's name and captured fields. Test-only.
+#[cfg(test)]
+pub(in crate::o11y) fn current_span() -> Option<(Cow<'static, str>, Fields)> {
+    STACK.with_borrow(|stack| stack.last().map(|span| (span.name.clone(), span.attributes.clone())))
+}
+
 #[cfg(test)]
 pub(in crate::o11y) fn depth() -> usize {
     STACK.with_borrow(Vec::len)

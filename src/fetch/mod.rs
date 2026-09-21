@@ -304,6 +304,41 @@ impl Fetch {
     /// # Errors
     ///
     /// Returns a [`reqwest::Error`] if the client cannot be built or `url` is invalid.
+    /// Sends a prepared request with retries and captures the whole response: its status, its headers, and
+    /// whatever `extract` makes of its body.
+    ///
+    /// The one place the request pipeline is written. Everything that accretes here later — honouring `Retry-After`,
+    /// retrying only on 5xx, a per-attempt timeout, a span around each attempt — lands once rather than in the four
+    /// public methods that used to spell this out individually.
+    async fn send_retrying<T, Fut>(
+        &self,
+        url: impl reqwest::IntoUrl,
+        options: RequestOptions,
+        extract: impl Fn(reqwest::Response) -> Fut,
+    ) -> Result<Response<T>, reqwest::Error>
+    where
+        Fut: Future<Output = Result<T, reqwest::Error>>,
+    {
+        let prepared = self.prepare(url, options)?;
+
+        retry::with_fibonacci_backoff(prepared.retries, || async {
+            let mut response = prepared.request().send().await?.error_for_status()?;
+
+            // Taken before the body, which consumes the response. Moved rather than cloned: the response is dropped
+            // either way, so nothing observes the emptied map, and a paginating caller is not copying a header map
+            // per page for no one.
+            let status = response.status();
+            let headers = std::mem::take(response.headers_mut());
+
+            Ok(Response {
+                body: extract(response).await?,
+                status,
+                headers,
+            })
+        })
+        .await
+    }
+
     fn prepare(&self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<PreparedRequest, reqwest::Error> {
         let client = self.client()?.clone();
         let method = options.method.unwrap_or(reqwest::Method::GET);
@@ -376,11 +411,7 @@ impl Fetch {
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
     ) -> Result<String, reqwest::Error> {
-        let prepared = self.prepare(url, options)?;
-        retry::with_fibonacci_backoff(prepared.retries, || async {
-            prepared.request().send().await?.error_for_status()?.text().await
-        })
-        .await
+        Ok(self.text_response_with_options(url, options).await?.body)
     }
 
     /// Sends a `GET` request to `url` with default per-request options and deserializes the JSON response body into `T`.
@@ -447,11 +478,7 @@ impl Fetch {
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
     ) -> Result<T, reqwest::Error> {
-        let prepared = self.prepare(url, options)?;
-        retry::with_fibonacci_backoff(prepared.retries, || async {
-            prepared.request().send().await?.error_for_status()?.json::<T>().await
-        })
-        .await
+        Ok(self.json_response_with_options(url, options).await?.body)
     }
 
     /// Sends a `GET` request to `url` with default per-request options and returns the whole [`Response`] — the body
@@ -514,19 +541,7 @@ impl Fetch {
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
     ) -> Result<Response<String>, reqwest::Error> {
-        let prepared = self.prepare(url, options)?;
-        retry::with_fibonacci_backoff(prepared.retries, || async {
-            let response = prepared.request().send().await?.error_for_status()?;
-            // Taken before the body, which consumes the response.
-            let (status, headers) = (response.status(), response.headers().clone());
-
-            Ok(Response {
-                body: response.text().await?,
-                status,
-                headers,
-            })
-        })
-        .await
+        self.send_retrying(url, options, reqwest::Response::text).await
     }
 
     /// Sends a `GET` request to `url` with default per-request options and returns the whole [`Response`] — the JSON
@@ -591,18 +606,7 @@ impl Fetch {
         url: impl reqwest::IntoUrl,
         options: RequestOptions,
     ) -> Result<Response<T>, reqwest::Error> {
-        let prepared = self.prepare(url, options)?;
-        retry::with_fibonacci_backoff(prepared.retries, || async {
-            let response = prepared.request().send().await?.error_for_status()?;
-            let (status, headers) = (response.status(), response.headers().clone());
-
-            Ok(Response {
-                body: response.json::<T>().await?,
-                status,
-                headers,
-            })
-        })
-        .await
+        self.send_retrying(url, options, reqwest::Response::json::<T>).await
     }
 
     /// Streams a request to `url`, writing the response body to `path`, and returns a [`Download`] handle immediately.

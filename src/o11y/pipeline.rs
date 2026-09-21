@@ -5,22 +5,19 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::buffer::Buffer;
-use super::config::ExportErrorHandler;
 use super::enrichment::{Attributes, Enrichment};
 use super::geolocation::fetch_geolocation_with;
 use super::record::{Fields, LogRecord, SpanRecord, now_unix_nano};
-use super::{Config, Level, O11yError, Result, Value, level, worker};
+use super::{Config, Level, O11yError, Result, Value, gate, worker};
 
 /// The installed pipeline, or nothing if telemetry was never started.
 ///
 /// Reached only after a gate has already passed, so the common uninitialised path never touches it.
 static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
-
-/// Whether spans are being recorded. A dedicated flag so opening a span is one load, not a level comparison.
-static TRACING: AtomicBool = AtomicBool::new(false);
 
 /// Whether [`init`] has already been claimed, including by a call that disabled telemetry.
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -29,7 +26,20 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static NO_ENRICHMENT: LazyLock<Attributes> = LazyLock::new(|| Arc::new(Vec::new()));
 
 /// Everything the export thread and the emitting threads share.
+#[derive(Debug)]
 pub(super) struct Shared {
+    /// The configuration this pipeline was built from, held whole.
+    ///
+    /// Copying the half-dozen fields the worker reads into this struct would mean declaring them twice, keeping two
+    /// constructors in step, and hand-writing a second `Debug` to work around the same un-`Debug`-able callback
+    /// `Config` already works around. Holding it costs one extra field access at each use.
+    pub(super) config: Config,
+    /// The export headers, parsed once here rather than on every request.
+    ///
+    /// `Config::headers` is a `HashMap<String, String>`, which `reqwest` would re-validate and re-parse into a
+    /// `HeaderName`/`HeaderValue` pair for every POST, forever. They are already being parsed at startup to
+    /// validate them, so this keeps what that parse produced.
+    pub(super) headers: HeaderMap,
     /// Buffered log records awaiting export.
     pub(super) logs: Buffer<LogRecord>,
     /// Buffered spans awaiting export.
@@ -38,18 +48,6 @@ pub(super) struct Shared {
     pub(super) enrichment: Arc<Enrichment>,
     /// The configuration-derived resource attributes: `service.*` and the deployment environment.
     pub(super) resource: Vec<(Cow<'static, str>, Value)>,
-    /// The collector's base URL.
-    pub(super) endpoint: String,
-    /// Headers put on every export request.
-    pub(super) headers: HashMap<String, String>,
-    /// How long one export attempt may take.
-    pub(super) timeout: Duration,
-    /// How long the worker waits between exports.
-    pub(super) flush_interval: Duration,
-    /// How many buffered records trigger an early export.
-    pub(super) max_batch_size: usize,
-    /// Where export failures are reported.
-    pub(super) on_export_error: ExportErrorHandler,
     /// When this process started recording, reported as every metric's start time.
     pub(super) start_unix_nano: u64,
     /// What the worker should do next.
@@ -69,21 +67,6 @@ pub(super) struct Control {
     pub(super) generation: u64,
 }
 
-// Hand-written for the same reason as `Config`'s: the error callback is a trait object with no `Debug` bound.
-impl std::fmt::Debug for Shared {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Shared")
-            .field("endpoint", &self.endpoint)
-            .field("headers", &self.headers.keys().collect::<Vec<_>>())
-            .field("timeout", &self.timeout)
-            .field("flush_interval", &self.flush_interval)
-            .field("max_batch_size", &self.max_batch_size)
-            .field("enrichment", &self.enrichment)
-            .field("control", &self.control)
-            .finish_non_exhaustive()
-    }
-}
-
 /// The installed pipeline: the shared state, plus the handle needed to join the worker.
 #[derive(Debug)]
 struct Pipeline {
@@ -96,7 +79,7 @@ struct Pipeline {
 /// Starts telemetry. See [`init`](super::init) for the public documentation.
 pub(super) fn init(config: Config) -> Result<()> {
     validate_endpoint(&config.endpoint)?;
-    validate_headers(&config.headers)?;
+    let headers = validate_headers(&config.headers)?;
 
     if INITIALIZED.swap(true, Ordering::SeqCst) {
         return Err(O11yError::AlreadyInitialized);
@@ -123,21 +106,8 @@ pub(super) fn init(config: Config) -> Result<()> {
         });
     }
 
-    let shared = Arc::new(Shared {
-        logs: Buffer::new(config.max_buffered),
-        spans: Buffer::new(config.max_buffered),
-        enrichment,
-        resource: resource_attributes(&config),
-        endpoint: config.endpoint,
-        headers: config.headers,
-        timeout: config.timeout,
-        flush_interval: config.flush_interval,
-        max_batch_size: config.max_batch_size,
-        on_export_error: config.on_export_error,
-        start_unix_nano: now_unix_nano(),
-        control: Mutex::new(Control::default()),
-        wake: Condvar::new(),
-    });
+    let min_level = config.min_level;
+    let shared = shared_from(config, headers, enrichment);
 
     let worker = worker::spawn(Arc::clone(&shared));
 
@@ -146,10 +116,8 @@ pub(super) fn init(config: Config) -> Result<()> {
         worker: Mutex::new(Some(worker)),
     });
 
-    // Published last: a producer that passes a gate must find a pipeline behind it. `OnceLock::get` is an acquire
-    // load, so the store above is visible to anything that gets past these.
-    level::set_threshold(config.min_level);
-    TRACING.store(true, Ordering::Release);
+    // Published last: a producer that passes a gate must find a pipeline behind it.
+    gate::open(min_level);
 
     Ok(())
 }
@@ -193,24 +161,28 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
 ///
 /// Failing here points straight at a misspelled authentication header, which would otherwise look like a
 /// server-side rejection much later, on a thread the caller never sees.
-fn validate_headers(headers: &HashMap<String, String>) -> Result<()> {
-    for (name, value) in headers {
-        let valid = reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
-            && reqwest::header::HeaderValue::from_str(value).is_ok();
+fn validate_headers(headers: &HashMap<String, String>) -> Result<HeaderMap> {
+    let mut parsed = HeaderMap::with_capacity(headers.len());
 
-        if !valid {
+    for (name, value) in headers {
+        let parse = HeaderName::from_bytes(name.as_bytes())
+            .ok()
+            .zip(HeaderValue::from_str(value).ok());
+
+        let Some((name, value)) = parse else {
             return Err(O11yError::InvalidHeader { name: name.clone() });
-        }
+        };
+
+        parsed.insert(name, value);
     }
 
-    Ok(())
+    Ok(parsed)
 }
 
 /// Stops telemetry, draining what is buffered. See [`shutdown`](super::shutdown).
 pub(super) fn shutdown() {
     // Shut the gates first, so nothing new is queued behind the drain.
-    level::silence();
-    TRACING.store(false, Ordering::Release);
+    gate::close();
 
     let Some(pipeline) = PIPELINE.get() else { return };
 
@@ -247,7 +219,7 @@ pub(super) fn flush() {
         let (guard, timeout) = pipeline
             .shared
             .wake
-            .wait_timeout(control, pipeline.shared.timeout)
+            .wait_timeout(control, pipeline.shared.config.timeout)
             .unwrap_or_else(PoisonError::into_inner);
 
         control = guard;
@@ -262,10 +234,7 @@ pub(super) fn flush() {
 pub(super) fn record_log(level: Level, message: String, fields: Fields) {
     let Some(pipeline) = PIPELINE.get() else { return };
 
-    let (trace_id, span_id) = match super::trace::current_ids() {
-        Some((trace_id, span_id)) => (Some(trace_id), Some(span_id)),
-        None => (None, None),
-    };
+    let (trace_id, span_id) = super::trace::current_ids().unzip();
 
     let queued = pipeline.shared.logs.push(LogRecord {
         time_unix_nano: now_unix_nano(),
@@ -293,7 +262,7 @@ pub(super) fn record_span(record: SpanRecord) {
 /// Deliberately `==` rather than `>=`: a buffer that sits above the threshold while an export is in flight would
 /// otherwise notify on every single push, which is exactly the wrong behaviour under load.
 fn wake_if_batched(shared: &Shared, queued: usize) {
-    if queued == shared.max_batch_size {
+    if queued == shared.config.max_batch_size {
         shared.wake.notify_all();
     }
 }
@@ -304,12 +273,6 @@ pub(super) fn attributes() -> Attributes {
         Some(pipeline) => pipeline.shared.enrichment.attributes(),
         None => Arc::clone(&NO_ENRICHMENT),
     }
-}
-
-/// Whether spans are being recorded.
-#[inline]
-pub(super) fn tracing_enabled() -> bool {
-    TRACING.load(Ordering::Relaxed)
 }
 
 /// Whether telemetry is installed and exporting.
@@ -336,23 +299,23 @@ pub(super) fn renew_session() {
 /// without calling [`init`], which can only succeed once per process and would otherwise force the whole suite
 /// through a single global.
 #[cfg(test)]
-pub(super) fn test_shared(endpoint: &str, on_export_error: ExportErrorHandler) -> Arc<Shared> {
-    let config = Config::builder(endpoint, super::NO_HEADERS)
-        .service_name("test-service")
-        .service_version("1.2.3")
-        .build();
+pub(super) fn test_shared(config: Config) -> Arc<Shared> {
+    let headers = validate_headers(&config.headers).expect("a test supplies valid headers");
+    let enrichment = Arc::new(Enrichment::new(&config.service_name));
 
+    shared_from(config, headers, enrichment)
+}
+
+/// Assembles the shared state. The one place a [`Shared`] is built, so [`init`] and the tests cannot drift apart —
+/// a field added above is filled once, for both.
+fn shared_from(config: Config, headers: HeaderMap, enrichment: Arc<Enrichment>) -> Arc<Shared> {
     Arc::new(Shared {
         logs: Buffer::new(config.max_buffered),
         spans: Buffer::new(config.max_buffered),
-        enrichment: Arc::new(Enrichment::new(&config.service_name)),
+        enrichment,
         resource: resource_attributes(&config),
-        endpoint: config.endpoint,
-        headers: config.headers,
-        timeout: Duration::from_secs(5),
-        flush_interval: config.flush_interval,
-        max_batch_size: config.max_batch_size,
-        on_export_error,
+        headers,
+        config,
         start_unix_nano: now_unix_nano(),
         control: Mutex::new(Control::default()),
         wake: Condvar::new(),

@@ -543,7 +543,7 @@ fn bmp_and_jpeg_write_a_sixteen_bit_picture_with_their_own_hook() {
 mod raw {
     use super::super::*;
     use super::{encode, sample_image};
-    use crate::image::raw_dispatch::image_from_pixel_buffer;
+    use crate::image::raw::dispatch::image_from_pixel_buffer;
     use ::image::DynamicImage;
 
     /// Every extension the backend accepts, paired with the variant it must map to. This is the table `rawler`
@@ -1225,5 +1225,42 @@ mod raw {
         // the function's own docs say so, and this is the test that keeps that statement true.
         let tiff = encode(&sample_image(), ImageFormat::Tiff);
         assert!(is_raw_bytes(&tiff));
+    }
+
+    #[test]
+    fn decode_file_opens_raw_through_the_one_entry_point() {
+        // The point of routing RAW through the ordinary dispatch: a caller opening whatever a user handed it does
+        // not have to work out which of the two decoders a file needs. Before this, a `.dng` reached
+        // `UnknownExtension` in a build that could decode it perfectly well.
+        let path = std::env::temp_dir().join(format!("rust_sak_unified_{}.dng", std::process::id()));
+        std::fs::write(&path, red_dng()).unwrap();
+
+        let unified = decode_file(&path).unwrap();
+        let narrow = decode_raw_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!((unified.width(), unified.height()), (64, 64));
+        assert_eq!(
+            unified.as_bytes(),
+            narrow.as_bytes(),
+            "the general entry point and the narrow one decode the same pixels",
+        );
+    }
+
+    #[test]
+    fn a_native_extension_still_wins_over_raw() {
+        // The other half of the routing decision, and the one with something to lose: nearly every RAW format is a
+        // TIFF container, so a `.tiff` must keep reaching the TIFF decoder rather than being claimed for RAW.
+        let path = std::env::temp_dir().join(format!("rust_sak_native_{}.tiff", std::process::id()));
+        let original = sample_image();
+        std::fs::write(&path, encode(&original, ImageFormat::Tiff)).unwrap();
+
+        let decoded = decode_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (original.width(), original.height())
+        );
     }
 }

@@ -8,112 +8,22 @@
 
 #![cfg(feature = "o11y")]
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+mod common;
+
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use common::{UNBOUNDED, spawn_recording_collector, wait_until};
 
 use rust_sak::o11y::{self, Config, Environment, Level, log, metric, trace};
-
-/// A captured export request: its path and its parsed JSON body.
-#[derive(Debug)]
-struct Captured {
-    /// The OTLP path it was posted to.
-    path: String,
-    /// The payload.
-    body: serde_json::Value,
-}
-
-/// Spawns a collector that answers `200 OK` and records every request until the test ends.
-fn spawn_collector() -> (String, Arc<Mutex<Vec<Captured>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let captured = Arc::new(Mutex::new(Vec::new()));
-
-    {
-        let captured = Arc::clone(&captured);
-
-        std::thread::spawn(move || {
-            while let Ok((stream, _)) = listener.accept() {
-                if let Some(request) = serve(stream) {
-                    captured.lock().unwrap_or_else(PoisonError::into_inner).push(request);
-                }
-            }
-        });
-    }
-
-    (format!("http://{address}"), captured)
-}
-
-/// Reads one HTTP/1.1 request, answers it, and returns what it carried.
-fn serve(mut stream: TcpStream) -> Option<Captured> {
-    let mut raw = Vec::new();
-    let mut chunk = [0; 4096];
-
-    // Read until the headers are complete, then until the declared body has arrived.
-    loop {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-
-        raw.extend_from_slice(&chunk[..read]);
-
-        let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
-            continue;
-        };
-
-        let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
-        let length: usize = head
-            .lines()
-            .find_map(|line| {
-                line.to_lowercase()
-                    .strip_prefix("content-length:")
-                    .map(str::trim)
-                    .map(str::to_string)
-            })
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
-
-        if raw.len() >= header_end + 4 + length {
-            let body = &raw[header_end + 4..header_end + 4 + length];
-            let path = head.split_whitespace().nth(1).unwrap_or_default().to_string();
-
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            let _ = stream.flush();
-
-            return Some(Captured {
-                path,
-                body: serde_json::from_slice(body).expect("the collector should receive valid json"),
-            });
-        }
-    }
-
-    None
-}
-
-/// Blocks until `condition` holds or `timeout` elapses.
-fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-
-    while Instant::now() < deadline {
-        if condition() {
-            return true;
-        }
-
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    condition()
-}
 
 /// How many times the export-error callback fired. It must not, in this test.
 static EXPORT_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn the_pipeline_records_and_exports_all_three_signals() {
-    let (endpoint, captured) = spawn_collector();
+    let (endpoint, captured) = spawn_recording_collector(UNBOUNDED, "200 OK");
 
     // A counter touched *before* `init`, which is what a `static LazyLock` does in a real application.
     let orders = metric::counter("orders_total");
@@ -167,11 +77,18 @@ fn the_pipeline_records_and_exports_all_three_signals() {
     );
 
     let requests = captured.lock().unwrap_or_else(PoisonError::into_inner);
-    let find = |path: &str| requests.iter().find(|request| request.path == path).unwrap();
+    // Parsed once per signal: `body_json` returns an owned value, so indexing it inline would borrow a temporary.
+    let find = |path: &str| {
+        requests
+            .iter()
+            .find(|request| request.path() == path)
+            .unwrap_or_else(|| panic!("no export was posted to {path}"))
+            .body_json()
+    };
 
     // --- logs ---
     let logs = find("/v1/logs");
-    let resource = &logs.body["resourceLogs"][0]["resource"]["attributes"];
+    let resource = &logs["resourceLogs"][0]["resource"]["attributes"];
     let attribute = |key: &str| {
         resource
             .as_array()
@@ -186,7 +103,7 @@ fn the_pipeline_records_and_exports_all_three_signals() {
     assert_eq!(attribute("deployment.environment.name").as_deref(), Some("production"));
     assert_eq!(attribute("session.id").as_deref(), Some(session.as_str()));
 
-    let records = logs.body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+    let records = logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
         .as_array()
         .unwrap();
     assert_eq!(records.len(), 2);
@@ -208,7 +125,7 @@ fn the_pipeline_records_and_exports_all_three_signals() {
 
     // --- traces ---
     let traces = find("/v1/traces");
-    let span = &traces.body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    let span = &traces["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
 
     assert_eq!(span["name"], "charge_card");
     assert_eq!(span["traceId"], trace_id);
@@ -229,7 +146,7 @@ fn the_pipeline_records_and_exports_all_three_signals() {
 
     // --- metrics ---
     let metrics = find("/v1/metrics");
-    let all = metrics.body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+    let all = metrics["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
         .as_array()
         .unwrap();
     let orders_metric = all.iter().find(|metric| metric["name"] == "orders_total").unwrap();

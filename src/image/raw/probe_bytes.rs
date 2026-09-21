@@ -1,6 +1,6 @@
-use super::error::{ImageError, Result};
-use super::raw_dispatch::probe_raw;
-use super::raw_info::RawImageInfo;
+use super::super::error::Result;
+use super::dispatch::probe_raw;
+use super::info::RawImageInfo;
 
 /// Reads the metadata of the camera RAW file in `bytes` (dimensions, sensor bit depth, camera make and model)
 /// **without decoding the pixels**.
@@ -23,9 +23,6 @@ use super::raw_info::RawImageInfo;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn probe_raw_bytes(bytes: &[u8]) -> Result<RawImageInfo> {
-    if !::zenraw::is_raw_file(bytes) {
-        return Err(ImageError::NotRaw);
-    }
     // No file name, so `None` leaves `probe_raw` to resolve what it can from the magic bytes alone.
     probe_raw(bytes, None)
 }

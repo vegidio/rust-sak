@@ -80,6 +80,15 @@ Camera RAW is a **ninth family, decode only**, behind its own Cargo feature. A c
 rust-sak = { version = "2", features = ["image-raw"] }  # implies "image"
 ```
 
+With the feature on, **`decode_file` and `decode_bytes` open RAW too** — RAW is another arm of the ordinary decode path, not a parallel one, so code that opens whatever a user supplied needs no RAW-versus-native triage of its own:
+
+```rust,ignore
+// Works for png, jpeg, webp, avif, heif… and for nef, cr3, dng, arw.
+let image = rust_sak::image::decode_file(path)?;
+```
+
+The functions below stay as the **narrow** forms, for a caller that wants anything non-RAW refused, and for the RAW-only metadata that `ImageInfo` cannot carry.
+
 | Function          | Signature                                                            | What it does                                                                                            |
 |-------------------|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
 | `decode_raw_bytes` | `fn decode_raw_bytes(bytes: &[u8]) -> Result<DynamicImage>`         | Develops RAW bytes into a display-ready picture. `NotRaw` if they are not RAW.                          |
@@ -93,6 +102,8 @@ rust-sak = { version = "2", features = ["image-raw"] }  # implies "image"
 ### Three things worth knowing
 
 - **The extension is what distinguishes RAW formats, not the content.** Nearly every RAW format is a TIFF container, so a NEF, an ARW, a CR2 and a PEF all open with the same four bytes. `RawFormat::from_magic` therefore resolves only the containers that identify themselves (DNG, CR3, RAF, RW2, ORF) and returns `None` for the rest rather than guessing, and `is_raw_bytes` cannot tell an ordinary `.tiff` photograph from a NEF. **Route on the file extension**, not on content, or a genuine TIFF ends up in the RAW decoder.
+
+  This is why `decode_file` opens every RAW format while `decode_bytes` opens only the self-identifying containers: given a name the answer is unambiguous, given bytes it is not. A native extension always wins, so a `.tiff` is never claimed for RAW. When you have the bytes and know they are RAW, call `decode_raw_bytes` and say so.
 - **`probe_raw_file` reads the whole file**, where `probe_file` reads only a header. That is the backend's constraint, not a choice: RAW metadata lives in IFD chains whose offsets routinely point deep into a 40 MB file, so a bounded prefix would miss more often than it hit. Worth knowing if you are listing a directory of RAWs.
 - **A camera the backend does not know is a refusal, never a wrong picture.** `rawler` reads 300-plus cameras; one outside that set comes back as `ImageError::Raw` naming the failure.
 

@@ -35,10 +35,12 @@
 #![doc = include_str!("README.md")]
 
 mod buffer;
+mod capture;
 mod config;
 mod enrichment;
 mod environment;
 mod error;
+mod gate;
 mod geolocation;
 mod ids;
 mod level;
@@ -60,6 +62,10 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+// Named by the `#[instrument]` expansion, which happens in the caller's crate, so they have to be reachable from
+// outside. Plumbing, not API.
+#[doc(hidden)]
+pub use capture::{ValueViaDebug, ValueViaInto};
 pub use config::{Config, ConfigBuilder, NO_HEADERS};
 pub use environment::Environment;
 pub use error::{O11yError, Result};

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::registry::{HistogramPoint, Instrument, MetricData, MetricSnapshot, register};
-use super::tags::{TagMap, overflow_tags};
+use super::tags::{TagMap, Tags, no_tags, overflow_tags};
 
 /// The bucket bounds used when [`Histogram::with_buckets`] was never called.
 ///
@@ -113,13 +113,13 @@ impl Buckets {
         }
     }
 
-    /// Reads the series into an exportable point.
-    fn snapshot(&self, tags: Vec<(String, String)>, bounds: &[f64]) -> HistogramPoint {
+    /// Reads the series into an exportable point. The bucket bounds are the enclosing instrument's, so they are
+    /// recorded once beside the points rather than copied into each one.
+    fn snapshot(&self, tags: Tags) -> HistogramPoint {
         HistogramPoint {
             tags,
             count: self.count.load(Ordering::Relaxed),
             sum: f64::from_bits(self.sum.load(Ordering::Relaxed)),
-            bounds: bounds.to_vec(),
             bucket_counts: self.counts.iter().map(|count| count.load(Ordering::Relaxed)).collect(),
         }
     }
@@ -194,27 +194,33 @@ impl Instrument for HistogramState {
         let Some(layout) = self.layout.get() else {
             return MetricSnapshot {
                 name: self.name.clone(),
-                data: MetricData::Histogram(Vec::new()),
+                data: MetricData::Histogram {
+                    bounds: Box::from([]),
+                    points: Vec::new(),
+                },
             };
         };
 
         let mut points = Vec::new();
 
         if layout.untagged.count.load(Ordering::Relaxed) > 0 {
-            points.push(layout.untagged.snapshot(Vec::new(), &layout.bounds));
+            points.push(layout.untagged.snapshot(no_tags()));
         }
 
         self.tagged.each(|tags, series| {
-            points.push(series.snapshot(tags.clone(), &layout.bounds));
+            points.push(series.snapshot(tags.clone()));
         });
 
         if let Some(overflow) = self.overflow.get() {
-            points.push(overflow.snapshot(overflow_tags(), &layout.bounds));
+            points.push(overflow.snapshot(overflow_tags()));
         }
 
         MetricSnapshot {
             name: self.name.clone(),
-            data: MetricData::Histogram(points),
+            data: MetricData::Histogram {
+                bounds: layout.bounds.clone(),
+                points,
+            },
         }
     }
 }

@@ -55,25 +55,13 @@ pub use crate::__rust_sak_o11y_span as span;
 pub(in crate::o11y) use context::current_ids;
 
 #[cfg(test)]
-pub(in crate::o11y) use context::depth;
+pub(in crate::o11y) use context::{current_span, depth};
 
 /// Whether spans are being recorded. Macro plumbing; not API.
 #[doc(hidden)]
 #[inline]
 pub fn __enabled() -> bool {
-    super::pipeline::tracing_enabled()
-}
-
-/// Opens a span for `#[instrument]`, which cannot expand to a `macro_rules!` call. Macro plumbing; not API.
-#[doc(hidden)]
-pub fn __span(name: &'static str, attributes: super::record::Fields) -> Span {
-    Span::__enter(name, attributes)
-}
-
-/// A span that records nothing, for `#[instrument]` when tracing is off. Macro plumbing; not API.
-#[doc(hidden)]
-pub fn __disabled() -> Span {
-    Span::__disabled()
+    super::gate::tracing_enabled()
 }
 
 /// Attaches `span` to `future` for `#[instrument]` on an `async fn`. Macro plumbing; not API.

@@ -29,14 +29,16 @@ fn try_expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let fields = captured_fields(&function.sig, &options);
     let body = &function.block;
 
-    // Built behind the same gate the `span!` macro uses, so a build with tracing off never formats an argument. The
-    // binding has to sit outside the `if`, which is why both arms produce a `Span` rather than the `if` being a
-    // statement.
+    // Expands to the `span!` macro rather than restating what it does. That keeps the gate, the field
+    // representation and the `Span` construction in one place — the attribute would otherwise be a second
+    // implementation of all three, in a different language, free to drift from the macro it mirrors.
+    //
+    // The `use` is what lets the argument capture below resolve; it is scoped to this block, so it cannot disturb
+    // anything the instrumented function's own body imports.
     let open = quote! {
-        let __o11y_span = if ::rust_sak::o11y::trace::__enabled() {
-            ::rust_sak::o11y::trace::__span(#name, #fields)
-        } else {
-            ::rust_sak::o11y::trace::__disabled()
+        let __o11y_span = {
+            use ::rust_sak::o11y::{ValueViaDebug as _, ValueViaInto as _};
+            ::rust_sak::o11y::trace::span!(#name #fields)
         };
     };
 
@@ -60,13 +62,16 @@ fn try_expand(args: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     Ok(quote! { #function })
 }
 
-/// Builds the `Vec<(Cow<str>, Value)>` expression holding the arguments captured as span fields.
+/// Builds the trailing `, key = value` arguments handed to `span!` for the captured parameters.
+///
+/// Empty when there is nothing to capture, which is exactly the no-field `span!(name)` form — so no special case is
+/// needed here or in the macro.
 ///
 /// Only plain `name: Type` parameters are captured. A `self` receiver carries no useful name, and a destructuring
 /// pattern such as `(x, y): (u32, u32)` has no single one, so both are skipped rather than guessed at.
 fn captured_fields(signature: &Signature, options: &Options) -> TokenStream {
     if options.skip_all {
-        return quote! { ::std::vec::Vec::new() };
+        return TokenStream::new();
     }
 
     let entries: Vec<TokenStream> = signature
@@ -81,23 +86,17 @@ fn captured_fields(signature: &Signature, options: &Options) -> TokenStream {
                 return None;
             }
 
-            let key = name.to_string();
-
+            // The parameter's own identifier is the field key: `span!` stringifies it, which gives the same name
+            // the signature wrote.
+            //
             // Captured by reference, so instrumenting a function never moves an argument out from under its body.
-            Some(quote! {
-                (
-                    ::std::borrow::Cow::Borrowed(#key),
-                    ::rust_sak::o11y::Value::String(::std::format!("{:?}", &#name)),
-                )
-            })
+            // `o11y_value` picks the cheap conversion for anything that has one and falls back to `Debug` for the
+            // rest — see `o11y::capture`.
+            Some(quote! { #name = (&#name).o11y_value() })
         })
         .collect();
 
-    if entries.is_empty() {
-        quote! { ::std::vec::Vec::new() }
-    } else {
-        quote! { ::std::vec![#(#entries),*] }
-    }
+    quote! { #(, #entries)* }
 }
 
 /// The parsed `#[instrument(..)]` arguments.
