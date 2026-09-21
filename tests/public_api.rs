@@ -81,7 +81,7 @@ mod fs {
 #[cfg(feature = "image")]
 mod image {
     use rust_sak::image::{
-        EncodeOptions, ImageError, ImageFormat, decode_bytes, encode_writer, format_from_bytes, probe_bytes,
+        EncodeOptions, ImageError, ImageFormat, decode_bytes, encode_writer, format_from_bytes, probe_bytes, rotate,
     };
 
     #[test]
@@ -104,6 +104,16 @@ mod image {
         )
         .unwrap_err();
         assert!(matches!(err, ImageError::FormatMismatch { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn rotate_is_reachable_and_expands_the_canvas() {
+        let original = image::DynamicImage::ImageRgb8(image::RgbImage::new(240, 120));
+        let rotated = rotate(&original, 30.0);
+
+        assert_eq!((rotated.width(), rotated.height()), (268, 224));
+        // Rotating always yields alpha, so a downstream caller can name the promoted type.
+        assert!(matches!(rotated, image::DynamicImage::ImageRgba8(_)));
     }
 }
 

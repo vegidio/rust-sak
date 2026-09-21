@@ -33,7 +33,8 @@ use rust_sak::image::{
 
 ## Public functions
 
-All are synchronous and return `Result<T, ImageError>`.
+All are synchronous. Every one that touches a file or a codec returns `Result<T, ImageError>`; `rotate` is pure
+pixel arithmetic with nothing to fail, so it returns its picture directly.
 
 ### Decoding → `DynamicImage`
 
@@ -50,6 +51,28 @@ All are synchronous and return `Result<T, ImageError>`.
 | `format_from_bytes` | `fn format_from_bytes(bytes: &[u8]) -> Result<ImageFormat>`  | Sniffs the format from magic bytes **without decoding pixels**. `UnrecognizedFormat` if no match.                         |
 | `probe_bytes`       | `fn probe_bytes(bytes: &[u8]) -> Result<ImageInfo>`          | Reads metadata (dimensions, color type, bit depth) from the header; format guessed from **magic bytes**. No pixel decode. |
 | `probe_file`        | `fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo>` | Same, for a file; format from the **extension**. Reads the file bytes but never decodes pixels.                           |
+
+### Transforming
+
+| Function | Signature                                                      | What it does                                                                                                                     |
+|----------|------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| `rotate` | `fn rotate(image: &DynamicImage, degrees: f64) -> DynamicImage` | Turns an image by **any** angle onto a canvas expanded to contain it. **Positive is clockwise.** The result **carries alpha**. |
+
+The `image` crate already flips (`imageops::flip_horizontal`, `flip_vertical`), turns by quarter turns
+(`rotate90`/`180`/`270`) and crops (`crop_imm`), and this module does not wrap any of them — `rotate` is only the
+piece that was missing.
+
+- **Positive is clockwise**, matching CSS `transform: rotate()` and the direction an on-screen rotation control
+  reports, so no caller has to negate. Angles are taken modulo 360.
+- **The canvas grows to the rotated bounding box**, `ceil(w·|cos t| + h·|sin t|)` by `ceil(w·|sin t| + h·|cos t|)`,
+  with the source's centre on the destination's centre.
+- **The result carries alpha**, because a turn produces pixels no source pixel covers and an opaque type cannot
+  represent them: `Rgb8` → `Rgba8`, `Rgb16` → `Rgba16`, `Luma8` → `LumaA8`, `Rgb32F` → `Rgba32F`; an input that
+  already has alpha keeps its own type. **Bit depth is preserved** — a 16-bit picture stays 16-bit.
+- **The uncovered area is fully transparent.** There is no fill-colour parameter.
+- **Sampling is bilinear**, weighted by each neighbour's own alpha so a transparent one cannot bleed its colour
+  into the edge. The exact quarter turns take the `image` crate's own exact rotations instead, so they neither
+  interpolate nor gain a row.
 
 ### Encoding
 

@@ -12,6 +12,8 @@
 //! - [`format_from_bytes`] — detect the [`ImageFormat`] from magic bytes without decoding.
 //! - [`probe_bytes`] / [`probe_file`] — read an image's metadata ([`ImageInfo`]: dimensions, color type, bit
 //!   depth) from its header without decoding the pixels.
+//! - [`rotate`] — turn an image by any angle onto a canvas expanded to contain it, clockwise for a positive
+//!   angle, with the uncovered area left transparent.
 //! - [`encode_file`] — encode and save to a path, format chosen from its extension.
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
 //!
@@ -79,6 +81,7 @@ mod probe_bytes;
 mod probe_file;
 #[cfg(feature = "image-raw")]
 mod raw;
+mod rotate;
 
 pub use decode_bytes::decode_bytes;
 pub use decode_bytes_with_format::decode_bytes_with_format;
@@ -96,6 +99,7 @@ pub use probe_file::probe_file;
 pub use raw::{
     RawFormat, RawImageInfo, decode_raw_bytes, decode_raw_file, is_raw_bytes, probe_raw_bytes, probe_raw_file,
 };
+pub use rotate::rotate;
 
 #[cfg(test)]
 mod tests;
