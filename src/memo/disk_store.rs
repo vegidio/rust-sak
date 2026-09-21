@@ -183,6 +183,15 @@ impl DiskStore {
     }
 }
 
+/// Clears [`DiskStore::sweeping`] when a sweep ends, however it ends.
+struct SweepGuard<'a>(&'a AtomicBool);
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl Store for DiskStore {
     fn get(&self, key: &str) -> Result<Option<Entry>> {
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
@@ -249,10 +258,13 @@ impl Store for DiskStore {
             return Ok(());
         }
 
-        let result = self.sweep();
-        self.sweeping.store(false, Ordering::Release);
+        // The flag is cleared through a guard rather than by the line after the call, so it survives `sweep`
+        // unwinding. Clearing it only on the success path would let one panicking sweep leave the flag set for the
+        // rest of the process, and every later `cleanup` would return `Ok(())` having reclaimed nothing - the same
+        // "one panic must not disable the subsystem" rule the `PoisonError::into_inner` handling here follows.
+        let _guard = SweepGuard(&self.sweeping);
 
-        result
+        self.sweep()
     }
 
     fn path(&self) -> Option<&Path> {

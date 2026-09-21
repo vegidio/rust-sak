@@ -31,7 +31,7 @@
 //! and mis-parents whatever is scheduled there next.
 //!
 //! For async work, attach the span to the future instead, with
-//! [`Instrument::instrument`](Instrument::instrument) or with `#[instrument]` on the `async fn` — both enter and
+//! [`Instrument::instrument`] or with `#[instrument]` on the `async fn` — both enter and
 //! exit the span around each poll, so it follows the task wherever it runs.
 
 mod context;

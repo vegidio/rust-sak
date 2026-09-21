@@ -14,9 +14,9 @@ use super::info::RawImageInfo;
 ///
 /// <div class="warning">
 ///
-/// **This reads the whole file**, where [`probe_file`](super::probe_file) reads only a header. That asymmetry is
+/// **This reads the whole file**, where [`probe_file`](super::super::probe_file) reads only a header. That asymmetry is
 /// the backend's rather than a choice made here: it probes a byte slice, and RAW metadata lives in IFD chains whose
-/// offsets routinely point deep into a 40 MB file. A bounded prefix — the trick [`probe_file`](super::probe_file)
+/// offsets routinely point deep into a 40 MB file. A bounded prefix — the trick [`probe_file`](super::super::probe_file)
 /// uses for AVIF, HEIF and WebP — would miss more often than it hit, making the whole-file re-read the normal path
 /// and the two reads more expensive than the one. Worth knowing if you are listing a directory of RAWs.
 ///

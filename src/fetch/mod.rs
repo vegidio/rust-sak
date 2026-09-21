@@ -293,23 +293,17 @@ impl Fetch {
         Ok(self.client.get_or_init(|| client))
     }
 
-    /// Resolves the per-request settings shared by [`Fetch::text`], [`Fetch::json`], and [`Fetch::download`] against
-    /// the reused client.
-    ///
-    /// The method defaults to `GET`; per-request headers are carried through to be applied at the request level (where
-    /// they override the client's default headers per-key); the retry count falls back to the struct's. Automatic
-    /// retries are restricted to idempotent methods unless [`RequestOptions::retry_non_idempotent`] opts in, so the
-    /// resolved retry count is forced to zero for a non-idempotent method otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`reqwest::Error`] if the client cannot be built or `url` is invalid.
     /// Sends a prepared request with retries and captures the whole response: its status, its headers, and
     /// whatever `extract` makes of its body.
     ///
     /// The one place the request pipeline is written. Everything that accretes here later — honouring `Retry-After`,
     /// retrying only on 5xx, a per-attempt timeout, a span around each attempt — lands once rather than in the four
     /// public methods that used to spell this out individually.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`reqwest::Error`] if the request cannot be prepared, every attempt fails, or the response carries
+    /// a non-success status.
     async fn send_retrying<T, Fut>(
         &self,
         url: impl reqwest::IntoUrl,
@@ -339,6 +333,17 @@ impl Fetch {
         .await
     }
 
+    /// Resolves the per-request settings shared by [`Fetch::text`], [`Fetch::json`], and [`Fetch::download`] against
+    /// the reused client.
+    ///
+    /// The method defaults to `GET`; per-request headers are carried through to be applied at the request level (where
+    /// they override the client's default headers per-key); the retry count falls back to the struct's. Automatic
+    /// retries are restricted to idempotent methods unless [`RequestOptions::retry_non_idempotent`] opts in, so the
+    /// resolved retry count is forced to zero for a non-idempotent method otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`reqwest::Error`] if the client cannot be built or `url` is invalid.
     fn prepare(&self, url: impl reqwest::IntoUrl, options: RequestOptions) -> Result<PreparedRequest, reqwest::Error> {
         let client = self.client()?.clone();
         let method = options.method.unwrap_or(reqwest::Method::GET);

@@ -11,7 +11,7 @@ use super::info::RawImageInfo;
 ///
 /// # Errors
 ///
-/// Returns [`ImageError::NotRaw`] if the bytes are not a RAW file, and [`ImageError::Raw`] if they are but their
+/// Returns [`ImageError::NotRaw`](super::super::ImageError::NotRaw) if the bytes are not a RAW file, and [`ImageError::Raw`](super::super::ImageError::Raw) if they are but their
 /// metadata cannot be read.
 ///
 /// ```no_run

@@ -1,6 +1,7 @@
 //! The process-wide list of live instruments, and the snapshot the exporter reads from it.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use super::tags::Tags;
@@ -22,12 +23,30 @@ pub(crate) trait Instrument: Send + Sync + fmt::Debug {
 /// and never leaks for a program that creates instruments dynamically.
 static INSTRUMENTS: LazyLock<Mutex<Vec<Weak<dyn Instrument>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// The length at which [`register`] prunes dead handles, doubled after each pass so pruning stays amortised O(1).
+///
+/// [`snapshot`] prunes too, but it runs only from the export thread — so a process that never called
+/// [`init`](crate::o11y::init), or called it with `enabled(false)`, would never prune at all. Registration is the
+/// only event guaranteed to happen in that process, which is why the watermark is checked here.
+static PRUNE_AT: AtomicUsize = AtomicUsize::new(MIN_PRUNE_AT);
+
+/// The smallest the watermark ever falls to. Below this, pruning would cost more than the handles it reclaims, and
+/// the intended usage — a handful of instruments in `static`s — never reaches it.
+const MIN_PRUNE_AT: usize = 64;
+
 /// Adds an instrument to the registry. Called once, when the instrument is created.
+///
+/// Dead handles are dropped here once the list has grown past [`PRUNE_AT`]. The `static`-instrument path the module
+/// documentation describes never trips it; a program creating instruments dynamically pays one retain per doubling.
 pub(super) fn register(instrument: Weak<dyn Instrument>) {
-    INSTRUMENTS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push(instrument);
+    let mut instruments = INSTRUMENTS.lock().unwrap_or_else(PoisonError::into_inner);
+    instruments.push(instrument);
+
+    if instruments.len() >= PRUNE_AT.load(Ordering::Relaxed) {
+        instruments.retain(|weak| weak.strong_count() > 0);
+        // Reset from what survived, so a list that is genuinely this long is not re-swept on every registration.
+        PRUNE_AT.store(instruments.len().saturating_mul(2).max(MIN_PRUNE_AT), Ordering::Relaxed);
+    }
 }
 
 /// Reads every live instrument, pruning any that have been dropped since the last flush.
@@ -58,6 +77,8 @@ pub(crate) fn snapshot() -> Vec<MetricSnapshot> {
 #[cfg(test)]
 pub(crate) fn clear() {
     INSTRUMENTS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    // Reset alongside the list, so one test's growth cannot move the next test's pruning point.
+    PRUNE_AT.store(MIN_PRUNE_AT, Ordering::Relaxed);
 }
 
 /// One instrument's readings at a point in time.

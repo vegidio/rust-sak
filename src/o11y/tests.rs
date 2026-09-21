@@ -606,6 +606,28 @@ fn tag_order_does_not_split_one_series_into_two() {
 }
 
 #[test]
+fn a_counter_used_only_with_tags_reports_no_untagged_point() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let counter = metric::counter("tagged_only");
+    counter.add_with_tags(4, &[("route", "/health")]);
+
+    let snapshot = metric::snapshot()
+        .into_iter()
+        .find(|s| s.name == "tagged_only")
+        .unwrap();
+    let metric::MetricData::Sum(points) = &snapshot.data else {
+        panic!("expected a sum")
+    };
+
+    assert!(
+        points.iter().all(|point| !point.tags.is_empty()),
+        "a counter that was never incremented untagged must not export an untagged zero"
+    );
+}
+
+#[test]
 fn an_untouched_gauge_reports_no_data_point() {
     let _guard = global_lock();
     metric::clear();

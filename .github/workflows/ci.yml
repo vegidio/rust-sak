@@ -50,6 +50,30 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
+  # `cargo test --doc` compiles the examples inside doc comments but says nothing about the prose around them, so
+  # a link to a renamed or private item fails silently and ships to docs.rs as plain text. Only rustdoc itself
+  # reports those, and only when asked — hence this job rather than a flag on an existing one.
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+
+      # `--no-deps` keeps this about this crate's own documentation; a broken link in a dependency is not
+      # actionable here. `private_intra_doc_links` catches the subtler half: a link that resolves for the author,
+      # because the target is visible inside the crate, but renders as bare text for everyone reading docs.rs.
+      - name: Build the documentation
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --all-features --no-deps --locked
+
   # Every feature is meant to be usable on its own, so each one is compiled on its own. `--all-features` alone would
   # hide a feature that only builds because a sibling happened to pull in what it needs.
   features:

@@ -132,12 +132,44 @@ fn hash_tags(tags: &[(&str, &str)]) -> u64 {
     })
 }
 
+/// How many tags [`same_tags`] can compare without allocating, set by the width of the claim mask it uses.
+const MASK_BITS: usize = u64::BITS as usize;
+
 /// Whether a stored tag set holds exactly the pairs in `probe`, in any order.
+///
+/// Matched from the **stored** side, claiming each probe pair at most once. Equal lengths plus "every probe pair
+/// appears in `stored`" is a subset test rather than an equality one: a probe that repeats a pair —
+/// `[("a", "1"), ("a", "1")]` — is covered twice by the single stored `("a", "1")`, so it would report equal to
+/// `[("a", "1"), ("b", "2")]`, a set it does not equal.
+///
+/// [`TagMap::with`] only ever compares sets that already landed in the same [`hash_tags`] bucket, and reaching that
+/// case needs a genuine hash collision, so this is a latent contract bug rather than a reachable one. It is written
+/// the strict way regardless: the guarantee belongs to this function, not to the hash in front of it, and a change
+/// to `hash_tags` must not be able to turn a helper that is merely unreachable into one that is wrong.
+///
+/// The claim set is a bitmask rather than a `Vec<bool>`, so the comparison stays allocation-free — it runs under the
+/// read lock on every tagged record, which is the path [`TagMap::with`] exists to keep cheap. Beyond [`MASK_BITS`]
+/// tags the mask cannot represent the set and the answer is conservatively `false`: a false negative costs a new
+/// series rather than a wrong one.
 fn same_tags(stored: &Tags, probe: &[(&str, &str)]) -> bool {
-    stored.len() == probe.len()
-        && probe
-            .iter()
-            .all(|(key, value)| stored.iter().any(|(k, v)| &**k == *key && &**v == *value))
+    if stored.len() != probe.len() || probe.len() > MASK_BITS {
+        return false;
+    }
+
+    let mut claimed: u64 = 0;
+
+    stored.iter().all(|(key, value)| {
+        let found = (0..probe.len())
+            .find(|index| claimed & (1 << index) == 0 && probe[*index].0 == &**key && probe[*index].1 == &**value);
+
+        match found {
+            Some(index) => {
+                claimed |= 1 << index;
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Copies a borrowed tag set into an owned one, for storage.
@@ -145,4 +177,58 @@ fn owned(tags: &[(&str, &str)]) -> Tags {
     tags.iter()
         .map(|(key, value)| (Box::from(*key), Box::from(*value)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(pairs: &[(&str, &str)]) -> Tags {
+        owned(pairs)
+    }
+
+    #[test]
+    fn a_set_equals_itself_in_any_order() {
+        let set = stored(&[("a", "1"), ("b", "2")]);
+
+        assert!(same_tags(&set, &[("a", "1"), ("b", "2")]));
+        assert!(same_tags(&set, &[("b", "2"), ("a", "1")]));
+    }
+
+    #[test]
+    fn a_repeated_probe_pair_does_not_match_a_set_of_distinct_pairs() {
+        // The case a subset-with-equal-length comparison gets wrong: both probe pairs are found in `stored`, but
+        // they are both found in the *same* one, so the two sets are not equal.
+        let set = stored(&[("a", "1"), ("b", "2")]);
+
+        assert!(!same_tags(&set, &[("a", "1"), ("a", "1")]));
+    }
+
+    #[test]
+    fn a_repeated_stored_pair_does_not_match_a_set_of_distinct_pairs() {
+        // The same asymmetry seen from the other side, which is the one the stored-side scan covers directly.
+        let set = stored(&[("a", "1"), ("a", "1")]);
+
+        assert!(!same_tags(&set, &[("a", "1"), ("b", "2")]));
+        assert!(same_tags(&set, &[("a", "1"), ("a", "1")]));
+    }
+
+    #[test]
+    fn sets_of_different_lengths_never_match() {
+        let set = stored(&[("a", "1")]);
+
+        assert!(!same_tags(&set, &[("a", "1"), ("b", "2")]));
+    }
+
+    #[test]
+    fn a_probe_wider_than_the_mask_is_refused_rather_than_guessed_at() {
+        let pairs: Vec<(String, String)> = (0..=MASK_BITS).map(|i| (i.to_string(), i.to_string())).collect();
+        let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let set = stored(&borrowed);
+
+        assert!(
+            !same_tags(&set, &borrowed),
+            "past the mask width the answer is conservatively false"
+        );
+    }
 }

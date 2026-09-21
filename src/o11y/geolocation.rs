@@ -1,8 +1,8 @@
 //! IP-based location enrichment.
 //!
 //! This is the only part of the module that reaches out to a third party, and it is **opt-in**: a
-//! [`Telemetry`](super::Telemetry) performs no lookup unless
-//! [`TelemetryBuilder::geolocation(true)`](super::TelemetryBuilder::geolocation) was set.
+//! [`Config`](super::Config) performs no lookup unless
+//! [`ConfigBuilder::geolocation(true)`](super::ConfigBuilder::geolocation) was set.
 
 use std::io::Read;
 use std::sync::LazyLock;
@@ -63,15 +63,15 @@ pub struct Geolocation {
 /// Looks up the location of this machine's public IP address via [ipinfo.io](https://ipinfo.io).
 ///
 /// > **Privacy:** this call discloses the caller's public IP address to a third party. A
-/// > [`Telemetry`](super::Telemetry) never calls it unless
-/// > [`TelemetryBuilder::geolocation(true)`](super::TelemetryBuilder::geolocation) was set — enabling telemetry alone
+/// > [`Config`](super::Config) never calls it unless
+/// > [`ConfigBuilder::geolocation(true)`](super::ConfigBuilder::geolocation) was set — enabling telemetry alone
 /// > is not enough.
 ///
 /// The request is given a one-second timeout and the response body is capped at 64 KiB.
 ///
 /// **This blocks the calling thread** for up to the timeout — it goes through `reqwest`'s blocking client, which its
 /// own documentation says should not be used inside an async runtime. Call it from a plain thread, or from
-/// `tokio::task::spawn_blocking`. A [`Telemetry`](super::Telemetry) that opts into geolocation runs it on a
+/// `tokio::task::spawn_blocking`. A [`Config`](super::Config) that opts into geolocation runs it on a
 /// background thread of its own, so this only concerns calling the function directly.
 ///
 /// # Errors

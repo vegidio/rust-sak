@@ -23,7 +23,7 @@ impl Memo {
     /// dispatching it would.
     ///
     /// Cancellation is honoured: dropping this future — under `tokio::time::timeout`, say — releases every caller
-    /// waiting on it with [`MemoError::ComputeAbandoned`] rather than stranding them.
+    /// waiting on it with [`MemoError::ComputeAbandoned`](super::MemoError::ComputeAbandoned) rather than stranding them.
     ///
     /// ```
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::registry::{Instrument, MetricData, MetricSnapshot, SumPoint, register};
 use super::tags::{TagMap, no_tags, overflow_tags};
@@ -37,6 +37,13 @@ struct CounterState {
     name: String,
     /// The series with no tags.
     untagged: AtomicU64,
+    /// Whether the untagged series has ever been incremented.
+    ///
+    /// A counter starts at zero and a legitimate `increment(0)` is indistinguishable from an untouched one, so the
+    /// flag is what separates "this series sits at zero" from "this series does not exist" — the same distinction
+    /// [`Gauge`](super::Gauge) draws with its own `untagged_set`. Without it, an instrument used only through
+    /// [`Counter::add_with_tags`] exports a permanent untagged `value: 0` that nothing ever wrote.
+    untagged_set: AtomicBool,
     /// One series per tag set seen.
     tagged: TagMap<AtomicU64>,
     /// Everything that arrived after the per-instrument series cap was reached.
@@ -51,6 +58,7 @@ pub fn counter(name: impl Into<String>) -> Counter {
     let state = Arc::new(CounterState {
         name: name.into(),
         untagged: AtomicU64::new(0),
+        untagged_set: AtomicBool::new(false),
         tagged: TagMap::default(),
         overflow: AtomicU64::new(0),
     });
@@ -64,12 +72,13 @@ impl Counter {
     /// Adds `amount` to the untagged series.
     pub fn increment(&self, amount: u64) {
         self.state.untagged.fetch_add(amount, Ordering::Relaxed);
+        self.state.untagged_set.store(true, Ordering::Relaxed);
     }
 
     /// Adds `amount` to the series identified by `tags`.
     ///
     /// Tag order does not matter: `&[("a", "1"), ("b", "2")]` and `&[("b", "2"), ("a", "1")]` are the same series.
-    /// Once an instrument has accumulated [`MAX_SERIES`](super::tags::MAX_SERIES) distinct tag sets, further new
+    /// Once an instrument has accumulated `MAX_SERIES` distinct tag sets, further new
     /// ones fold into a single `o11y.series_overflow` series, so the total stays correct while memory stays bounded.
     pub fn add_with_tags(&self, amount: u64, tags: &[(&str, &str)]) {
         let recorded = self.state.tagged.with(
@@ -86,10 +95,14 @@ impl Counter {
 
 impl Instrument for CounterState {
     fn snapshot(&self) -> MetricSnapshot {
-        let mut points = vec![SumPoint {
-            tags: no_tags(),
-            value: self.untagged.load(Ordering::Relaxed),
-        }];
+        let mut points = Vec::new();
+
+        if self.untagged_set.load(Ordering::Relaxed) {
+            points.push(SumPoint {
+                tags: no_tags(),
+                value: self.untagged.load(Ordering::Relaxed),
+            });
+        }
 
         self.tagged.each(|tags, series| {
             points.push(SumPoint {

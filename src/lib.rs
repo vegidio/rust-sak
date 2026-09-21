@@ -4,8 +4,11 @@
 //! [`o11y`], [`sysinfo`]), each gated behind its own Cargo feature so consumers compile only what they need:
 //!
 //! ```toml
-//! rust-sak = { version = "2", features = ["fetch"] }
+//! rust-sak = { git = "https://github.com/vegidio/rust-sak", features = ["fetch"] }
 //! ```
+//!
+//! The crate is not published to crates.io — it depends on its `o11y-macros` sibling by path, which
+//! `cargo publish` rejects — so a git dependency is the supported way to take it.
 
 // `o11y`'s `#[instrument]` macro expands to paths rooted at `::rust_sak`, which is how it must name this crate
 // from a consumer's. Aliasing the crate to itself makes those same paths resolve from inside it too, so the macro

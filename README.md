@@ -4,17 +4,17 @@ A "Swiss Army Knife" of reusable Rust building blocks: hashing, HTTP fetching, h
 
 ## ⬇️ Installation
 
-This library can be installed using Cargo. To do that, run the following command in your project's root directory:
+This crate is **not published to crates.io** — it depends on its `o11y-macros` sibling by path, which `cargo publish` rejects. Take it as a git dependency instead; cargo clones the whole repository, so the path resolves:
 
 ```bash
-cargo add rust-sak --features crypto,fs
+cargo add rust-sak --git https://github.com/vegidio/rust-sak --features crypto,fs
 ```
 
 Or add it directly to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rust-sak = { version = "2", features = ["crypto", "fs"] }
+rust-sak = { git = "https://github.com/vegidio/rust-sak", features = ["crypto", "fs"] }
 ```
 
 The crate is a collection of independent modules, each gated behind its own Cargo feature so consumers compile only what they need.

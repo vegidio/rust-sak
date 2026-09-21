@@ -15,7 +15,7 @@ use super::dispatch::decode_raw;
 ///
 /// # Errors
 ///
-/// Returns [`ImageError::NotRaw`] if the bytes are not a RAW file, and [`ImageError::Raw`] if they are but cannot
+/// Returns [`ImageError::NotRaw`](super::super::ImageError::NotRaw) if the bytes are not a RAW file, and [`ImageError::Raw`](super::super::ImageError::Raw) if they are but cannot
 /// be decoded — most often a camera the backend does not know, which is reported rather than guessed at.
 ///
 /// ```no_run
