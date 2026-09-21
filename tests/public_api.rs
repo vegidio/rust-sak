@@ -163,30 +163,84 @@ mod memo_async {
 
 #[cfg(feature = "o11y")]
 mod o11y {
-    use rust_sak::o11y::{Environment, Telemetry, Value};
+    use std::sync::LazyLock;
+    use std::time::Duration;
 
+    use rust_sak::o11y::{
+        self, Config, ConfigBuilder, Environment, Level, NO_HEADERS, O11yError, Signal, Value, log, metric, trace,
+    };
+
+    static ORDERS: LazyLock<metric::Counter> = LazyLock::new(|| metric::counter("orders_total"));
+    static ORDER_VALUE: LazyLock<metric::Histogram> =
+        LazyLock::new(|| metric::histogram("order_value_dollars").with_buckets(&[10.0, 50.0, 100.0, 500.0]));
+    static QUEUE_DEPTH: LazyLock<metric::Gauge> = LazyLock::new(|| metric::gauge("queue_depth"));
+
+    #[trace::instrument(skip(secret))]
+    fn submit_to_processor(order_id: &str, secret: &str) -> Result<(), std::fmt::Error> {
+        let _ = (order_id, secret);
+        Ok(())
+    }
+
+    /// One test, because `init` succeeds once per process and this binary has its own copy of the statics.
     #[test]
-    fn a_disabled_handle_is_fully_usable() {
-        let telemetry = Telemetry::builder("http://127.0.0.1:1", "api-test")
-            .version("1.2.3")
+    fn the_whole_surface_is_reachable_from_outside_the_crate() {
+        // Instruments are touched before `init`, which is the shape the `LazyLock` pattern forces and must work.
+        ORDERS.increment(1);
+        ORDERS.add_with_tags(1, &[("region", "eu-west-1")]);
+        ORDER_VALUE.record(129.5);
+        QUEUE_DEPTH.set(12);
+
+        assert!(!o11y::is_enabled());
+        assert!(o11y::session_id().is_none());
+
+        let config: Config = Config::builder("http://127.0.0.1:1", [("Authorization", "Bearer secret")])
+            .service_name("api-test")
+            .service_version("1.2.3")
             .environment(Environment::Production)
+            .min_level(Level::Debug)
+            .flush_interval(Duration::from_millis(50))
+            .max_batch_size(8)
+            .max_buffered(64)
+            .timeout(Duration::from_millis(200))
             .enabled(false)
-            .build()
-            .unwrap();
+            .geolocation(false)
+            .on_export_error(|error| {
+                // Naming the type here is the point: a caller has to be able to match on it.
+                assert!(!matches!(error, O11yError::AlreadyInitialized));
+            })
+            .build();
 
-        assert!(!telemetry.is_enabled());
-        telemetry.event("api.smoke").field("count", 1_u64).info();
-        telemetry.info("api.smoke");
+        o11y::init(config).unwrap();
 
-        let before = telemetry.session_id();
-        telemetry.renew_session();
-        assert_ne!(before, telemetry.session_id());
+        // Disabled, so nothing leaves the process and every one of these is a no-op that must still compile.
+        let _span = trace::span!("checkout", order_id = "ord_8812", attempt = 1u32);
+        trace::current().set_attribute("region", "eu-west-1");
+        trace::current().add_event("submitted to processor");
 
-        telemetry.flush().unwrap();
-        telemetry.shutdown().unwrap();
+        log::debug!("cache lookup", hit = false);
+        log::info!("order received", order_id = "ord_8812", amount = 129.5);
+        log::warn!("large order flagged", threshold = 10_000.0);
+        log::error!("payment failed", error = %std::fmt::Error);
 
-        // `Value` is public because callers can name it when assembling fields dynamically.
+        submit_to_processor("ord_8812", "hunter2").unwrap();
+
+        o11y::renew_session();
+        o11y::flush();
+        o11y::shutdown();
+        o11y::shutdown();
+
+        // A second `init` is refused rather than silently reconfiguring.
+        let refused = o11y::init(Config::builder("http://127.0.0.1:1", NO_HEADERS).build());
+        assert!(matches!(refused, Err(O11yError::AlreadyInitialized)));
+
+        // These are public because callers name them when assembling fields or handling export errors.
         assert!(matches!(Value::from(1_i64), Value::Int(1)));
+        assert_eq!(Signal::Logs.path(), "/v1/logs");
+        assert_eq!(Level::Info.severity_text(), "INFO");
+        assert_eq!(Environment::Custom("staging".into()).to_string(), "staging");
+
+        // `ConfigBuilder` is nameable, so a caller can build configuration behind their own helper.
+        let _builder: ConfigBuilder = Config::builder("http://127.0.0.1:1", NO_HEADERS);
     }
 }
 

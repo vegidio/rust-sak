@@ -7,6 +7,12 @@
 //! rust-sak = { version = "2", features = ["fetch"] }
 //! ```
 
+// `o11y`'s `#[instrument]` macro expands to paths rooted at `::rust_sak`, which is how it must name this crate
+// from a consumer's. Aliasing the crate to itself makes those same paths resolve from inside it too, so the macro
+// works in this crate's own tests and doctests.
+#[cfg(feature = "o11y")]
+extern crate self as rust_sak;
+
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "fetch")]

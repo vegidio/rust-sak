@@ -1,16 +1,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use opentelemetry::Key;
-use opentelemetry::logs::AnyValue;
-
-/// A value attached to a log record field.
+/// A value attached to a log field, a span attribute or a metric tag.
 ///
-/// This exists because [`AnyValue`] — OpenTelemetry's own value type — only converts from `&'static str` and from
-/// integers up to `u32`. Telemetry fields are routinely built from borrowed strings and from `u64`/`usize` byte
-/// counts, so `Value` widens the set of accepted types and converts to [`AnyValue`] at emit time.
+/// It mirrors the OTLP `AnyValue` shape, so every variant has somewhere to go on the wire, while accepting the Rust
+/// types telemetry is actually built from — borrowed strings, `u64`/`usize` byte counts, and nested collections.
 ///
-/// You rarely name this type: [`Event::field`](super::Event::field) takes `impl Into<Value>`.
+/// You rarely name this type: the field macros and the span attribute methods all take `impl Into<Value>`. Naming it
+/// is for the case where a set of fields is assembled at runtime rather than written at the call site.
 ///
 /// ```
 /// use rust_sak::o11y::Value;
@@ -44,26 +41,6 @@ pub enum Value {
     List(Vec<Value>),
     /// A set of named values, arbitrarily nested.
     Map(Vec<(String, Value)>),
-}
-
-impl Value {
-    /// Converts into OpenTelemetry's own value type. The one place this module depends on the `AnyValue` shape.
-    pub(super) fn into_any_value(self) -> AnyValue {
-        match self {
-            Value::Bool(value) => AnyValue::Boolean(value),
-            Value::Int(value) => AnyValue::Int(value),
-            Value::Double(value) => AnyValue::Double(value),
-            Value::String(value) => AnyValue::String(value.into()),
-            Value::Bytes(value) => AnyValue::Bytes(Box::new(value)),
-            Value::List(values) => AnyValue::ListAny(Box::new(values.into_iter().map(Value::into_any_value).collect())),
-            Value::Map(entries) => AnyValue::Map(Box::new(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (Key::from(key), value.into_any_value()))
-                    .collect::<HashMap<_, _>>(),
-            )),
-        }
-    }
 }
 
 impl From<bool> for Value {

@@ -19,3 +19,7 @@ unmaintained = "workspace"
 # is, since it pins nothing at all.
 multiple-versions = "allow"
 wildcards = "deny"
+# `o11y-macros` is depended on by path with no version, which `wildcards` would otherwise reject. That is
+# deliberate - the crate is never published, so a version would be a fiction - and this exemption only applies to
+# members marked `publish = false`, which both are.
+allow-wildcard-paths = true

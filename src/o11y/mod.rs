@@ -1,293 +1,140 @@
-//! Observability: OTLP telemetry for applications.
+//! Observability: logs, metrics and traces for applications.
 //!
-//! This module exposes [`Telemetry`], a handle that ships structured log records to an OpenTelemetry collector over
-//! OTLP/HTTP, enriching every record with a fixed set of attributes describing the machine and the current session
-//! (version, a service-scoped machine id, OS and architecture, a session id, and optionally an IP-based location).
-//!
-//! Records are built fluently — [`Telemetry::event`] returns an [`Event`] that takes fields of any type convertible
-//! into a [`Value`], and is sent by one of its severity methods. Export happens on a background thread, so **this
-//! module needs no async runtime** and emitting a record never blocks.
-//!
-//! Two independent switches control what leaves the machine:
-//! [`enabled`](TelemetryBuilder::enabled) (defaults to `true`) turns the whole module on or off, and
-//! [`geolocation`](TelemetryBuilder::geolocation) (defaults to **`false`**) opts into the one enrichment that
-//! discloses the public IP address to a third party.
+//! One call to [`init`] at startup, and every other function in the program can record telemetry without holding a
+//! handle — the same shape the `log` and `tracing` crates use.
 //!
 //! ```no_run
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use rust_sak::o11y::{Environment, Telemetry};
+//! use rust_sak::o11y::{self, Config, Environment, log, metric, trace};
 //!
-//! let telemetry = Telemetry::builder("https://collector.example.com", "my-app")
-//!     .version(env!("CARGO_PKG_VERSION"))
-//!     .environment(Environment::Production)
-//!     .enabled(true)
-//!     .build()?;
+//! o11y::init(
+//!     Config::builder("https://collector.example.com", [("Authorization", "Bearer secret")])
+//!         .service_name("checkout-service")
+//!         .service_version(env!("CARGO_PKG_VERSION"))
+//!         .environment(Environment::Production)
+//!         .build(),
+//! )?;
 //!
-//! telemetry
-//!     .event("export.finished")
-//!     .field("format", "avif")
-//!     .field("bytes", 1_048_576u64)
-//!     .info();
+//! let _span = trace::span!("checkout", order_id = "ord_8812");
+//! log::info!("order received", order_id = "ord_8812", amount = 129.5);
+//! metric::counter("orders_total").increment(1);
 //!
-//! telemetry.shutdown()?;
+//! o11y::shutdown();
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Recording is designed to cost the caller as little as possible: a gated-out log line is an atomic load and a
+//! branch with its arguments never evaluated, a metric is a single atomic operation, and a record that is kept goes
+//! onto a bounded in-memory buffer and returns. Everything else — batching, serialising, and talking to the
+//! collector — happens on a dedicated thread, so **this module needs no async runtime** and an unreachable
+//! collector can cost records but never latency.
 
 // The module README is the long-form documentation; including it here is what puts it on docs.rs and turns its
 // examples into doctests, so the prose cannot drift from the code without CI noticing.
 #![doc = include_str!("README.md")]
 
-mod builder;
+mod buffer;
+mod config;
 mod enrichment;
 mod environment;
 mod error;
-mod event;
 mod geolocation;
+mod ids;
+mod level;
 mod machine_id;
+mod macros;
+mod otlp;
+mod pipeline;
+mod record;
+mod signal;
 mod value;
+mod worker;
+
+pub mod log;
+pub mod metric;
+pub mod trace;
 
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub use builder::TelemetryBuilder;
+pub use config::{Config, ConfigBuilder, NO_HEADERS};
 pub use environment::Environment;
 pub use error::{O11yError, Result};
-pub use event::Event;
 pub use geolocation::{Geolocation, fetch_geolocation, fetch_geolocation_from, fetch_geolocation_with};
+pub use level::Level;
+pub use signal::Signal;
 pub use value::Value;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
-
-use opentelemetry::Key;
-use opentelemetry::logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity};
-use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
-
-use enrichment::Enrichment;
-
-/// A handle that emits enriched log records to an OpenTelemetry collector.
+/// Starts telemetry for this process.
 ///
-/// Build one with [`Telemetry::builder`], keep it for the lifetime of the application, and share it across threads
-/// behind an [`Arc`] — the emit methods take `&self`. Records are batched and exported on a background thread; call
-/// [`shutdown`](Telemetry::shutdown) before exiting to flush them, which [`Drop`] also does.
+/// Call it once, at startup, before the first record. Everything recorded before it — a log macro, a span, a metric
+/// — is simply discarded, so an early call site is a missing record rather than a failure.
 ///
-/// A handle built with [`enabled(false)`](TelemetryBuilder::enabled), or produced by [`Telemetry::disabled`], is
-/// fully usable and simply discards every record without touching the network.
+/// Metric instruments are the exception: a `static` counter accumulates from the moment it is first touched, whether
+/// or not `init` has run, and its total is exported once telemetry starts.
+///
+/// # Errors
+///
+/// Returns [`O11yError::InvalidEndpoint`] if the endpoint is not a valid URL, [`O11yError::InvalidHeader`] if a
+/// header cannot be sent over HTTP, or [`O11yError::AlreadyInitialized`] if telemetry has already been started. In
+/// the last case the first configuration stays in effect.
+///
+/// Nothing after this point is reported through a `Result`: export failures reach the
+/// [`on_export_error`](ConfigBuilder::on_export_error) callback instead.
 ///
 /// ```no_run
 /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// use rust_sak::o11y::Telemetry;
+/// use rust_sak::o11y::{self, Config, NO_HEADERS};
 ///
-/// let telemetry = Telemetry::builder("https://collector.example.com", "my-app").build()?;
-///
-/// telemetry.info("app.started");
-/// telemetry.event("file.opened").field("bytes", 4_096u64).info();
+/// o11y::init(Config::builder("https://collector.example.com", NO_HEADERS)
+///     .service_name("my-app")
+///     .build())?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
-pub struct Telemetry {
-    /// The export machinery, or `None` when collection is disabled — in which case every record is dropped on the
-    /// floor. Pairing the two in a struct is what makes "enabled" a single fact: a handle cannot report itself
-    /// enabled and then have nothing to flush.
-    active: Option<Active>,
-    /// The attributes shared by every record. Shared with the background geolocation thread, if one was started.
-    enrichment: Arc<Enrichment>,
-    /// Guards against shutting the provider down twice, so `shutdown` stays idempotent under an explicit call
-    /// followed by `Drop`.
-    shut_down: AtomicBool,
+pub fn init(config: Config) -> Result<()> {
+    pipeline::init(config)
 }
 
-/// The logger and the provider that owns it, which exist together or not at all.
-#[derive(Debug)]
-struct Active {
-    /// The logger records are emitted through.
-    logger: SdkLogger,
-    /// Kept so the batch processor can be flushed and shut down.
-    provider: SdkLoggerProvider,
+/// Stops telemetry, exporting whatever is still buffered.
+///
+/// **Call this before the process exits.** There is no handle to drop, so nothing else can flush the buffers — this
+/// is the one piece of ceremony a process-global API cannot avoid. It blocks for at most one export
+/// [`timeout`](ConfigBuilder::timeout).
+///
+/// Idempotent, and safe to call without a matching [`init`]. Records emitted afterwards are discarded.
+pub fn shutdown() {
+    pipeline::shutdown();
 }
 
-impl Telemetry {
-    /// Starts configuring a handle that reports to the OTLP collector at `endpoint` as `service_name`.
-    ///
-    /// `endpoint` is the collector's base URL; the `/v1/logs` path is appended to it. Because the endpoint is always
-    /// supplied programmatically, the `OTEL_EXPORTER_OTLP_*` environment variables are ignored.
-    ///
-    /// ```no_run
-    /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_sak::o11y::Telemetry;
-    ///
-    /// let telemetry = Telemetry::builder("https://collector.example.com", "my-app")
-    ///     .version("1.2.3")
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn builder(endpoint: impl Into<String>, service_name: impl Into<String>) -> TelemetryBuilder {
-        TelemetryBuilder::new(endpoint, service_name)
-    }
-
-    /// Creates a handle that discards every record and never touches the network.
-    ///
-    /// Useful as an infallible fallback when the real handle could not be built:
-    ///
-    /// ```no_run
-    /// use rust_sak::o11y::Telemetry;
-    ///
-    /// let telemetry = Telemetry::builder("https://collector.example.com", "my-app")
-    ///     .build()
-    ///     .unwrap_or_else(|_| Telemetry::disabled());
-    /// ```
-    pub fn disabled() -> Self {
-        Self::from_parts(None, Arc::new(Enrichment::new("", "")))
-    }
-
-    /// Assembles a handle from an optional provider and the enrichment gathered by the builder.
-    ///
-    /// Private, but reachable from the sibling modules that make up `o11y`, which is exactly the intended scope.
-    fn from_parts(provider: Option<SdkLoggerProvider>, enrichment: Arc<Enrichment>) -> Self {
-        let active = provider.map(|provider| Active {
-            logger: provider.logger("rust-sak/o11y"),
-            provider,
-        });
-
-        Self {
-            active,
-            enrichment,
-            shut_down: AtomicBool::new(false),
-        }
-    }
-
-    /// Starts a record named `name`, to which fields can be attached before it is emitted.
-    ///
-    /// See [`Event`] for the field and severity methods.
-    pub fn event(&self, name: impl Into<String>) -> Event<'_> {
-        Event::new(self, name)
-    }
-
-    /// Emits a record named `event` at `Debug` severity with no fields of its own.
-    pub fn debug(&self, event: impl Into<String>) {
-        self.event(event).debug();
-    }
-
-    /// Emits a record named `event` at `Info` severity with no fields of its own.
-    pub fn info(&self, event: impl Into<String>) {
-        self.event(event).info();
-    }
-
-    /// Emits a record named `event` at `Warn` severity with no fields of its own.
-    pub fn warn(&self, event: impl Into<String>) {
-        self.event(event).warn();
-    }
-
-    /// Emits a record named `event` at `Error` severity, attaching `err`.
-    ///
-    /// ```no_run
-    /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_sak::o11y::Telemetry;
-    ///
-    /// let telemetry = Telemetry::builder("https://collector.example.com", "my-app").build()?;
-    ///
-    /// if let Err(err) = std::fs::read("/nope") {
-    ///     telemetry.error("config.read_failed", &err);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn error<E: std::error::Error + ?Sized>(&self, event: impl Into<String>, err: &E) {
-        self.event(event).error(err);
-    }
-
-    /// Assigns a fresh session id to every record emitted from now on.
-    ///
-    /// Safe to call concurrently with any number of threads emitting records.
-    pub fn renew_session(&self) {
-        self.enrichment.renew_session();
-    }
-
-    /// The session id currently attached to records, as a UUID string.
-    pub fn session_id(&self) -> String {
-        self.enrichment.session_id()
-    }
-
-    /// Whether this handle actually exports records.
-    pub fn is_enabled(&self) -> bool {
-        self.active.is_some()
-    }
-
-    /// Exports every record buffered so far, blocking until the batch has been sent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`O11yError::Sdk`] if the export fails or times out. Always `Ok` for a disabled handle.
-    pub fn flush(&self) -> Result<()> {
-        match &self.active {
-            Some(active) => Ok(active.provider.force_flush()?),
-            None => Ok(()),
-        }
-    }
-
-    /// Flushes buffered records and shuts the exporter down.
-    ///
-    /// Idempotent, and also run by [`Drop`], so calling it explicitly is only needed to observe the error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`O11yError::Sdk`] if the final export fails or times out. Always `Ok` for a disabled handle, and for
-    /// a second call.
-    pub fn shutdown(&self) -> Result<()> {
-        if self.shut_down.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        match &self.active {
-            Some(active) => Ok(active.provider.shutdown()?),
-            None => Ok(()),
-        }
-    }
-
-    /// Renders the enrichment plus a record's own fields and emits it.
-    ///
-    /// An enrichment attribute whose key the record also sets is skipped, so the record's own value wins without
-    /// either list being mutated.
-    fn emit(&self, name: String, severity: Severity, fields: Vec<(Key, AnyValue)>) {
-        let Some(active) = &self.active else {
-            return;
-        };
-
-        let enrichment = self.enrichment.attributes();
-
-        let mut record = active.logger.create_log_record();
-        record.set_timestamp(SystemTime::now());
-        record.set_severity_number(severity);
-        record.set_severity_text(severity.name());
-        record.set_body(AnyValue::from(name));
-
-        record.add_attributes(
-            enrichment
-                .iter()
-                .filter(|(key, _)| !fields.iter().any(|(own, _)| own == key))
-                .cloned(),
-        );
-        record.add_attributes(fields);
-
-        active.logger.emit(record);
-    }
-
-    /// The enrichment attributes as a plain string map, for assertions.
-    #[cfg(test)]
-    fn enrichment_snapshot(&self) -> std::collections::HashMap<String, String> {
-        self.enrichment.snapshot()
-    }
+/// Exports everything buffered so far, blocking until the export thread has been round once.
+///
+/// Rarely needed — the worker exports on its own schedule — but useful before a checkpoint where losing the last
+/// few seconds of telemetry would matter. Does nothing if telemetry is not running.
+pub fn flush() {
+    pipeline::flush();
 }
 
-impl Drop for Telemetry {
-    /// Flushes and shuts the exporter down, so records buffered at exit are not lost.
-    fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
+/// Whether telemetry is installed and exporting.
+///
+/// `false` before [`init`], after [`shutdown`], and when `init` was given
+/// [`enabled(false)`](ConfigBuilder::enabled).
+pub fn is_enabled() -> bool {
+    pipeline::is_enabled()
+}
+
+/// The session id attached to records right now, or `None` if telemetry is not running.
+pub fn session_id() -> Option<String> {
+    pipeline::session_id()
+}
+
+/// Assigns a fresh session id to everything recorded from now on.
+///
+/// Safe to call while other threads are recording. Records already buffered keep the session they were recorded
+/// under, rather than picking up whichever one happened to be current when the exporter reached them.
+pub fn renew_session() {
+    pipeline::renew_session();
 }

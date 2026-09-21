@@ -20,6 +20,15 @@
 # is required. The `image` feature downloads prebuilt avif/heif/webp static binaries on first build
 # (internet required, or set the `*_BINARIES_DIR` env vars for offline builds). The `memo` feature is listed with
 # `memo-async` so the per-feature run also covers the async method, which `memo` alone compiles out.
+#
+# The workspace's other member, the `o11y-macros` proc-macro crate in `macros/`, is deliberately left out of every
+# run here: a proc macro executes while the *consumer* compiles, so its line coverage measures nothing a test can
+# influence and would only drag the headline number down. Its behaviour is covered through the `o11y` tests that
+# use `#[instrument]`.
+#
+# Note also that the default (no-argument) run goes through `cargo test`, which puts the whole suite in one process
+# rather than one process per test the way `cargo nextest` does. The `o11y` tests that touch its process globals
+# serialise on a shared lock for exactly that reason.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

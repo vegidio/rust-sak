@@ -1,31 +1,26 @@
+use super::Signal;
+
 /// A convenience alias for results returned by this module.
 pub type Result<T> = std::result::Result<T, O11yError>;
 
-/// An error produced while building or shutting down a [`Telemetry`](super::Telemetry).
+/// A configuration or export failure.
 ///
-/// Failures from the OpenTelemetry stack are wrapped per source: the OTLP exporter builder
-/// ([`O11yError::Exporter`]) and the SDK's flush/shutdown path ([`O11yError::Sdk`]). The remaining variants cover this
-/// module's own configuration validation and the optional geolocation lookup.
+/// The variants fall into two groups. [`AlreadyInitialized`](O11yError::AlreadyInitialized),
+/// [`InvalidEndpoint`](O11yError::InvalidEndpoint) and [`InvalidHeader`](O11yError::InvalidHeader) are returned by
+/// [`init`](super::init) and mean the module never started. The rest are handed to the
+/// [`on_export_error`](super::ConfigBuilder::on_export_error) callback from the export thread, long after the call
+/// that produced the data returned.
 ///
-/// Note that **emitting a record never fails**: the log methods on [`Telemetry`](super::Telemetry) return nothing, and
-/// a disabled or misconfigured handle simply discards.
+/// **Recording telemetry never fails.** The log macros, the metric instruments and the span guards all return
+/// nothing: an uninitialised module, a disabled one and an unreachable collector are all indistinguishable at the
+/// call site, by design.
 #[derive(Debug, thiserror::Error)]
 pub enum O11yError {
-    /// The OTLP log exporter could not be built from the supplied configuration.
-    #[error("otlp exporter could not be built: {0}")]
-    Exporter(#[from] opentelemetry_otlp::ExporterBuildError),
-    /// Flushing or shutting the logger provider down failed.
-    #[error("telemetry sdk error: {0}")]
-    Sdk(#[from] opentelemetry_sdk::error::OTelSdkError),
-    /// The geolocation request failed or returned an error status.
-    #[error("geolocation request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    /// Reading the geolocation response body failed.
-    #[error("reading the geolocation response failed: {0}")]
-    Io(#[from] std::io::Error),
-    /// The geolocation response was not the expected JSON.
-    #[error("geolocation response was not valid json: {0}")]
-    Json(#[from] serde_json::Error),
+    /// [`init`](super::init) was called more than once in the same process.
+    ///
+    /// The first call wins and stays in effect; the module is not reconfigured.
+    #[error("o11y has already been initialised")]
+    AlreadyInitialized,
     /// The collector endpoint could not be parsed as a URL.
     #[error("invalid collector endpoint {endpoint:?}: {reason}")]
     InvalidEndpoint {
@@ -40,4 +35,34 @@ pub enum O11yError {
         /// The offending header name.
         name: String,
     },
+    /// The collector answered, but with a status outside the 2xx range.
+    #[error("collector rejected the {signal} payload with status {status}")]
+    ExportRejected {
+        /// Which stream was rejected.
+        signal: Signal,
+        /// The HTTP status code returned.
+        status: u16,
+        /// The response body, truncated to something loggable.
+        body: String,
+    },
+    /// Records were discarded because the buffer was full before the next flush.
+    ///
+    /// The oldest records are the ones dropped, so what survives is the most recent picture. A steady trickle of
+    /// these means `max_buffered` is too small for the emit rate, or the collector is too slow.
+    #[error("dropped {count} buffered {signal} record(s) on overflow")]
+    Dropped {
+        /// Which stream overflowed.
+        signal: Signal,
+        /// How many records were discarded since the last report.
+        count: u64,
+    },
+    /// The export request or the geolocation request failed outright.
+    #[error("telemetry request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    /// Reading a response body failed.
+    #[error("reading a telemetry response failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// A payload could not be serialised, or a geolocation response was not the expected JSON.
+    #[error("telemetry payload was not valid json: {0}")]
+    Json(#[from] serde_json::Error),
 }

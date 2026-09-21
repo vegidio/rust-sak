@@ -48,7 +48,7 @@ jobs:
           key: clippy
 
       - name: Lint
-        run: cargo clippy --all-features --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
   # Every feature is meant to be usable on its own, so each one is compiled on its own. `--all-features` alone would
   # hide a feature that only builds because a sibling happened to pull in what it needs.
@@ -132,7 +132,7 @@ jobs:
 
       # A compile is enough: `rust-version` is a claim about what the crate builds on, and nothing else verifies it.
       - name: Check on the minimum supported Rust version
-        run: cargo check --all-features --all-targets --locked
+        run: cargo check --workspace --all-features --all-targets --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -169,7 +169,7 @@ jobs:
       # The crate has no default features, so a bare `cargo test` would compile nothing.
       - name: Run unit tests
         id: nextest
-        run: cargo nextest run --all-features --locked --no-fail-fast 2>&1 | tee nextest.log
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast 2>&1 | tee nextest.log
 
       # nextest cannot run doctests, and this crate has plenty; without this they stop being compiled at all.
       - name: Run doctests
@@ -212,7 +212,7 @@ jobs:
       # `--no-report` keeps the profdata so the four report formats the next step renders cost no rebuild and no
       # second test run.
       - name: Run instrumented tests
-        run: cargo llvm-cov nextest --all-features --locked --no-fail-fast --no-report
+        run: cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast --no-report
 
       - name: Generate reports
         id: reports

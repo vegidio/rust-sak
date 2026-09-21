@@ -5,46 +5,16 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// A captured HTTP request: the header block as text, and the body as raw bytes.
 pub(super) struct CapturedRequest {
     /// The request line plus headers, as received.
     pub(super) head: String,
-    /// The request body. OTLP payloads are protobuf, so this stays as bytes.
+    /// The request body, kept as bytes so a malformed payload is still inspectable.
     pub(super) body: Vec<u8>,
-}
-
-impl CapturedRequest {
-    /// Whether the body contains `needle` as a UTF-8 substring.
-    ///
-    /// Protobuf keeps string fields — attribute keys and their values — as plain UTF-8, so a substring check is
-    /// enough to assert a record carried a given key or value without decoding the payload.
-    pub(super) fn body_contains(&self, needle: &str) -> bool {
-        self.body
-            .windows(needle.len())
-            .any(|window| window == needle.as_bytes())
-    }
-}
-
-/// Spawns a server that accepts one connection, answers `200 OK`, and returns the request it captured.
-///
-/// Returns the base URL to point a [`Telemetry`](super::Telemetry) at, plus the handle carrying the request.
-pub(super) fn spawn_collector() -> (String, JoinHandle<CapturedRequest>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let request = read_request(&mut stream);
-        write_response(&mut stream, "200 OK", "");
-        request
-    });
-
-    (format!("http://{addr}"), handle)
 }
 
 /// Spawns a server that answers every request with `body` as JSON, for the geolocation lookup.
@@ -166,4 +136,67 @@ fn write_json_response(stream: &mut std::net::TcpStream, body: &str) {
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+impl CapturedRequest {
+    /// The body parsed as JSON.
+    ///
+    /// OTLP/JSON is text, so assertions read the payload's actual structure rather than searching it for a
+    /// substring — which would happily pass on a field that landed in the wrong place.
+    pub(super) fn body_json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).expect("the captured body should be json")
+    }
+
+    /// The request path, taken from the request line.
+    pub(super) fn path(&self) -> &str {
+        self.head.split_whitespace().nth(1).unwrap_or_default()
+    }
+}
+
+/// Spawns a server that accepts `count` connections, answering each with `status`, and records every request.
+///
+/// One flush posts up to three payloads — logs, metrics and traces — so a test that wants to see all of them needs
+/// a collector that outlives the first connection.
+pub(super) fn spawn_recording_collector(
+    count: usize,
+    status: &'static str,
+) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+
+    {
+        let captured = Arc::clone(&captured);
+
+        std::thread::spawn(move || {
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let request = read_request(&mut stream);
+                write_response(&mut stream, status, "");
+                captured.lock().unwrap_or_else(PoisonError::into_inner).push(request);
+            }
+        });
+    }
+
+    (format!("http://{addr}"), captured)
+}
+
+/// Blocks until `captured` holds `count` requests, returning whether it got there.
+pub(super) fn captured_at_least(captured: &Mutex<Vec<CapturedRequest>>, count: usize) -> bool {
+    wait_until(Duration::from_secs(5), || {
+        captured.lock().unwrap_or_else(PoisonError::into_inner).len() >= count
+    })
+}
+
+/// Serialises the tests that touch the process globals.
+///
+/// `cargo nextest` gives every test its own process, but `cargo llvm-cov --html` — which `scripts/coverage.sh`
+/// runs by default — goes through `cargo test`, where the whole suite shares one process and therefore one set of
+/// `static`s. Without this the two runners would disagree about whether the suite passes.
+///
+/// Poisoning is recovered from rather than propagated, so one failing test does not cascade into every other.
+pub(super) fn global_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }

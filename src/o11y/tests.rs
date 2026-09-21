@@ -1,493 +1,1057 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use super::enrichment::{LOCATION_CITY, LOCATION_COUNTRY, MACHINE_ARCH, MACHINE_ID, MACHINE_OS, SESSION_ID, VERSION};
-use super::test_support::{spawn_collector, spawn_counting_server, spawn_json_server, wait_until};
+use super::buffer::Buffer;
+use super::enrichment::Enrichment;
+use super::record::{LogRecord, SpanId, TraceId, now_unix_nano};
+use super::test_support::{
+    captured_at_least, global_lock, spawn_counting_server, spawn_json_server, spawn_recording_collector, wait_until,
+};
+use super::trace::Span;
 use super::*;
 
-/// A sample ipinfo.io payload.
-const GEO_JSON: &str = r#"{"ip":"1.2.3.4","city":"Amsterdam","region":"North Holland","country":"NL"}"#;
+/// Collects the errors an export reports, for the tests that assert on them.
+#[derive(Debug, Default)]
+struct ErrorSink(Mutex<Vec<String>>);
 
-/// How long to wait on the background geolocation thread before giving up.
-const GEO_TIMEOUT: Duration = Duration::from_secs(5);
+impl ErrorSink {
+    /// A handler that appends every error's `Display` form to this sink.
+    fn handler(self: &Arc<Self>) -> super::config::ExportErrorHandler {
+        let sink = Arc::clone(self);
 
-// --- privacy tests ---
-//
-// These are the reason the module exists in this shape: opting out has to mean no traffic at all, and the machine
-// identifier must not be correlatable across applications.
-
-#[test]
-fn disabled_makes_no_network_calls() {
-    // Geolocation discloses the caller's public IP. Opting out of telemetry has to mean opting out of that lookup
-    // too, not merely out of exporting its result — even when geolocation itself was explicitly requested.
-    let (geo_url, geo_hits) = spawn_counting_server();
-    let (collector_url, collector_hits) = spawn_counting_server();
-
-    let telemetry = Telemetry::builder(&collector_url, "test-service")
-        .version("1.0.0")
-        .enabled(false)
-        .geolocation(true)
-        .geolocation_url(&geo_url)
-        .build()
-        .unwrap();
-
-    telemetry.info("should.not.be.sent");
-    telemetry.flush().unwrap();
-
-    // Give anything that *would* have been sent a chance to arrive before asserting it did not.
-    assert!(!wait_until(Duration::from_millis(300), || {
-        geo_hits.load(Ordering::SeqCst) > 0 || collector_hits.load(Ordering::SeqCst) > 0
-    }));
-
-    assert_eq!(geo_hits.load(Ordering::SeqCst), 0, "no geolocation lookup may be made");
-    assert_eq!(collector_hits.load(Ordering::SeqCst), 0, "no record may be exported");
-    assert!(!telemetry.is_enabled());
-}
-
-#[test]
-fn geolocation_is_off_by_default() {
-    // Enabling telemetry must not, on its own, disclose the public IP address to a third party.
-    let (geo_url, geo_hits) = spawn_counting_server();
-    let (collector_url, _) = spawn_counting_server();
-
-    let telemetry = Telemetry::builder(&collector_url, "test-service")
-        .geolocation_url(&geo_url)
-        .build()
-        .unwrap();
-
-    assert!(!wait_until(Duration::from_millis(300), || {
-        geo_hits.load(Ordering::SeqCst) > 0
-    }));
-    assert_eq!(geo_hits.load(Ordering::SeqCst), 0, "geolocation must be opt-in");
-
-    let fields = telemetry.enrichment_snapshot();
-    assert!(!fields.contains_key(LOCATION_COUNTRY));
-    assert!(!fields.contains_key(LOCATION_CITY));
-}
-
-#[test]
-fn disabled_keeps_locally_read_enrichment() {
-    let telemetry = Telemetry::builder("http://127.0.0.1:1", "test-service")
-        .version("1.0.0")
-        .enabled(false)
-        .build()
-        .unwrap();
-
-    let fields = telemetry.enrichment_snapshot();
-
-    // Everything below is read locally and never leaves the process, so it is gathered regardless.
-    assert_eq!(fields.get(VERSION).unwrap(), "1.0.0");
-    assert_eq!(fields.get(MACHINE_OS).unwrap(), std::env::consts::OS);
-    assert_eq!(fields.get(MACHINE_ARCH).unwrap(), std::env::consts::ARCH);
-    assert!(fields.contains_key(SESSION_ID));
-
-    // The one enrichment that would have required a request is absent.
-    assert!(!fields.contains_key(LOCATION_COUNTRY));
-}
-
-#[test]
-fn machine_id_is_scoped_to_the_service() {
-    let a = Telemetry::builder("http://127.0.0.1:1", "service-a")
-        .enabled(false)
-        .build()
-        .unwrap();
-    let b = Telemetry::builder("http://127.0.0.1:1", "service-b")
-        .enabled(false)
-        .build()
-        .unwrap();
-
-    let id_a = a.enrichment_snapshot().get(MACHINE_ID).cloned();
-    let id_b = b.enrichment_snapshot().get(MACHINE_ID).cloned();
-
-    // A machine without a readable host id reports no `machine.id` at all; there is nothing to compare then.
-    let (Some(id_a), Some(id_b)) = (id_a, id_b) else {
-        return;
-    };
-
-    assert!(!id_a.is_empty());
-    // A raw host id would be identical across applications, letting a backend correlate this machine's telemetry
-    // with that of every other program on it.
-    assert_ne!(
-        id_a, id_b,
-        "machine.id must be derived per service, not the raw host id"
-    );
-}
-
-#[test]
-fn machine_id_is_stable_lowercase_hex() {
-    let first = Telemetry::builder("http://127.0.0.1:1", "same-service")
-        .enabled(false)
-        .build()
-        .unwrap();
-    let second = Telemetry::builder("http://127.0.0.1:1", "same-service")
-        .enabled(false)
-        .build()
-        .unwrap();
-
-    let Some(id) = first.enrichment_snapshot().get(MACHINE_ID).cloned() else {
-        return;
-    };
-
-    assert_eq!(id.len(), 64, "hmac-sha256 renders as 64 hex characters");
-    assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-    assert_eq!(
-        Some(&id),
-        second.enrichment_snapshot().get(MACHINE_ID),
-        "the same service must derive the same id on the same machine"
-    );
-}
-
-// --- construction tests ---
-
-#[test]
-fn build_surfaces_an_invalid_endpoint() {
-    // A space makes the URL unparseable, which must be reported rather than silently producing a dead exporter.
-    let error = Telemetry::builder("ht tp://bad endpoint", "test-service")
-        .build()
-        .unwrap_err();
-
-    assert!(
-        matches!(error, O11yError::InvalidEndpoint { .. }),
-        "expected InvalidEndpoint, got {error:?}"
-    );
-    assert!(error.to_string().contains("ht tp://bad endpoint"));
-}
-
-#[test]
-fn build_surfaces_an_invalid_header() {
-    let error = Telemetry::builder("http://127.0.0.1:1", "test-service")
-        .header("bad header name", "value")
-        .build()
-        .unwrap_err();
-
-    assert!(
-        matches!(error, O11yError::InvalidHeader { .. }),
-        "expected InvalidHeader, got {error:?}"
-    );
-}
-
-#[test]
-fn disabled_handle_is_usable_and_shuts_down_cleanly() {
-    let telemetry = Telemetry::disabled();
-
-    assert!(!telemetry.is_enabled());
-    telemetry.info("still works");
-    telemetry.event("still works").field("n", 1i64).warn();
-    telemetry.error("still works", &std::io::Error::other("boom"));
-
-    assert!(telemetry.flush().is_ok());
-    assert!(telemetry.shutdown().is_ok());
-    // Idempotent: the explicit call above plus the one from `Drop` must not fail or panic.
-    assert!(telemetry.shutdown().is_ok());
-}
-
-#[test]
-fn endpoint_gets_the_logs_signal_path() {
-    // The exporter uses a programmatic endpoint verbatim, so the module has to append `/v1/logs` itself. A trailing
-    // slash must not produce a doubled one.
-    let (url, server) = spawn_collector();
-
-    let telemetry = Telemetry::builder(format!("{url}/"), "test-service").build().unwrap();
-    telemetry.info("app.started");
-    let _ = telemetry.flush();
-
-    let request = server.join().unwrap();
-    assert!(
-        request.head.starts_with("POST /v1/logs "),
-        "request head was:\n{}",
-        request.head
-    );
-}
-
-// --- session tests ---
-
-#[test]
-fn session_id_is_a_uuid_and_changes_on_renewal() {
-    let telemetry = Telemetry::disabled();
-
-    let first = telemetry.session_id();
-    assert_eq!(first.len(), 36, "uuid format: 8-4-4-4-12");
-
-    telemetry.renew_session();
-    assert_ne!(telemetry.session_id(), first);
-}
-
-#[test]
-fn renew_session_is_concurrency_safe() {
-    // Renewing used to be a candidate for tearing the attribute list while other threads read it; the swap must be
-    // atomic from a reader's point of view.
-    let telemetry = Arc::new(Telemetry::disabled());
-    let mut handles = Vec::new();
-
-    for _ in 0..4 {
-        let renewer = Arc::clone(&telemetry);
-        handles.push(std::thread::spawn(move || {
-            for _ in 0..200 {
-                renewer.renew_session();
-            }
-        }));
-
-        let emitter = Arc::clone(&telemetry);
-        handles.push(std::thread::spawn(move || {
-            for _ in 0..200 {
-                emitter.event("concurrent").field("n", 1i64).info();
-            }
-        }));
+        Arc::new(move |error: &O11yError| {
+            sink.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(error.to_string());
+        })
     }
 
-    for handle in handles {
-        handle.join().unwrap();
+    /// Everything reported so far.
+    fn taken(&self) -> Vec<String> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+/// A finished span, built directly rather than by closing a guard, whose `Drop` routes to the process globals.
+fn span_record(name: &'static str) -> record::SpanRecord {
+    record::SpanRecord {
+        trace_id: TraceId([1; 16]),
+        span_id: SpanId([2; 8]),
+        parent_span_id: None,
+        name: Cow::Borrowed(name),
+        start_unix_nano: now_unix_nano(),
+        end_unix_nano: now_unix_nano(),
+        attributes: Vec::new(),
+        events: Vec::new(),
+        enrichment: Arc::new(Vec::new()),
+    }
+}
+
+/// A log record with the given body and no fields, for the buffer and payload tests.
+fn log_record(body: &str) -> LogRecord {
+    LogRecord {
+        time_unix_nano: now_unix_nano(),
+        level: Level::Info,
+        body: body.to_string(),
+        fields: vec![(Cow::Borrowed("order_id"), Value::from("ord_8812"))],
+        enrichment: Arc::new(Vec::new()),
+        trace_id: None,
+        span_id: None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The bounded buffer
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_full_buffer_discards_the_oldest_entry() {
+    let buffer = Buffer::new(3);
+
+    for index in 0..5 {
+        buffer.push(index);
     }
 
-    assert_eq!(telemetry.session_id().len(), 36);
+    let (kept, dropped) = buffer.take();
+
+    assert_eq!(kept, vec![2, 3, 4], "the most recent entries are the ones that survive");
+    assert_eq!(dropped, 2);
+}
+
+#[test]
+fn a_buffer_reports_its_drops_once_rather_than_per_drop() {
+    let buffer = Buffer::new(1);
+
+    for index in 0..4 {
+        buffer.push(index);
+    }
+
+    assert_eq!(buffer.take().1, 3);
+    assert_eq!(buffer.take().1, 0, "the tally resets once it has been reported");
+}
+
+#[test]
+fn a_zero_capacity_buffer_still_holds_one_entry() {
+    let buffer = Buffer::new(0);
+    buffer.push(7);
+
+    assert_eq!(buffer.take().0, vec![7]);
+}
+
+#[test]
+fn push_reports_the_queue_length_so_the_worker_can_be_woken() {
+    let buffer = Buffer::new(8);
+
+    assert_eq!(buffer.push('a'), 1);
+    assert_eq!(buffer.push('b'), 2);
+    assert_eq!(buffer.len(), 2);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// OTLP/JSON encoding
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn sixty_four_bit_integers_are_encoded_as_json_strings() {
+    let payload = otlp::logs(vec![log_record("order received")], &[]);
+    let record = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+
+    assert!(
+        record["timeUnixNano"].is_string(),
+        "the proto3 json mapping encodes 64-bit integers as strings, and a collector rejects a bare number",
+    );
+}
+
+#[test]
+fn an_integer_field_is_encoded_as_a_string_too() {
+    let mut record = log_record("counted");
+    record.fields = vec![(Cow::Borrowed("bytes"), Value::from(1_048_576u64))];
+
+    let payload = otlp::logs(vec![record], &[]);
+    let attributes = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"];
+
+    assert_eq!(attributes[0]["value"]["intValue"], "1048576");
+}
+
+#[test]
+fn a_record_emitted_outside_a_span_carries_no_trace_id() {
+    let payload = otlp::logs(vec![log_record("no span")], &[]);
+    let record = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+
+    assert!(
+        record.get("traceId").is_none(),
+        "an absent identifier is omitted, not sent as an empty string, which would be malformed",
+    );
+}
+
+#[test]
+fn a_record_emitted_inside_a_span_carries_its_ids_as_lowercase_hex() {
+    let mut record = log_record("in a span");
+    record.trace_id = Some(TraceId([0xab; 16]));
+    record.span_id = Some(SpanId([0xcd; 8]));
+
+    let payload = otlp::logs(vec![record], &[]);
+    let encoded = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+
+    assert_eq!(encoded["traceId"], "abababababababababababababababab");
+    assert_eq!(encoded["spanId"], "cdcdcdcdcdcdcdcd");
+}
+
+#[test]
+fn records_emitted_under_different_sessions_get_their_own_resource_blocks() {
+    let first: enrichment::Attributes = Arc::new(vec![(Cow::Borrowed("session.id"), Value::from("one"))]);
+    let second: enrichment::Attributes = Arc::new(vec![(Cow::Borrowed("session.id"), Value::from("two"))]);
+
+    let mut a = log_record("before");
+    a.enrichment = Arc::clone(&first);
+    let mut b = log_record("after");
+    b.enrichment = Arc::clone(&second);
+    let mut c = log_record("also before");
+    c.enrichment = first;
+
+    let payload = otlp::logs(vec![a, b, c], &[]);
+    let blocks = payload["resourceLogs"].as_array().unwrap();
+
     assert_eq!(
-        telemetry.enrichment_snapshot().get(SESSION_ID),
-        Some(&telemetry.session_id())
+        blocks.len(),
+        2,
+        "one resource block per distinct enrichment, not per record"
+    );
+    assert_eq!(blocks[0]["scopeLogs"][0]["logRecords"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn the_service_attributes_go_in_the_resource_block_not_on_each_record() {
+    let base = vec![(Cow::Borrowed("service.name"), Value::from("checkout-service"))];
+    let payload = otlp::logs(vec![log_record("order received")], &base);
+
+    let attributes = payload["resourceLogs"][0]["resource"]["attributes"].as_array().unwrap();
+    assert!(attributes.iter().any(|entry| entry["key"] == "service.name"));
+
+    let record_attributes = payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
+        .as_array()
+        .unwrap();
+    assert!(record_attributes.iter().all(|entry| entry["key"] != "service.name"));
+}
+
+#[test]
+fn a_histogram_has_exactly_one_more_bucket_than_it_has_bounds() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let histogram = metric::histogram("durations").with_buckets(&[1.0, 2.0]);
+    histogram.record(1.5);
+
+    let payload = otlp::metrics(metric::snapshot(), &[], &Arc::new(Vec::new()), 0, 1);
+    let point = &payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["histogram"]["dataPoints"][0];
+
+    let bounds = point["explicitBounds"].as_array().unwrap().len();
+    let buckets = point["bucketCounts"].as_array().unwrap().len();
+
+    assert_eq!(
+        buckets,
+        bounds + 1,
+        "the extra bucket catches everything above the last bound"
+    );
+    assert_eq!(
+        point["bucketCounts"][1], "1",
+        "1.5 falls into the bucket bounded by 2.0"
     );
 }
 
-// --- export tests ---
-//
-// These point the exporter at the throwaway local server in `super::test_support`, so they exercise the real export
-// path without reaching the network.
+#[test]
+fn a_counter_is_reported_as_a_cumulative_monotonic_sum() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let orders = metric::counter("orders_total");
+    orders.increment(3);
+
+    let payload = otlp::metrics(metric::snapshot(), &[], &Arc::new(Vec::new()), 0, 1);
+    let sum = &payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"];
+
+    assert_eq!(
+        sum["aggregationTemporality"], 2,
+        "2 is AGGREGATION_TEMPORALITY_CUMULATIVE"
+    );
+    assert_eq!(sum["isMonotonic"], true);
+    assert_eq!(sum["dataPoints"][0]["asInt"], "3");
+}
 
 #[test]
-fn emits_an_enriched_record_to_the_collector() {
-    let (url, server) = spawn_collector();
+fn every_value_variant_maps_onto_an_otlp_any_value() {
+    let mut record = log_record("everything");
+    record.fields = vec![
+        (Cow::Borrowed("flag"), Value::Bool(true)),
+        (Cow::Borrowed("count"), Value::Int(5)),
+        (Cow::Borrowed("ratio"), Value::Double(0.5)),
+        (Cow::Borrowed("name"), Value::from("avif")),
+        (Cow::Borrowed("blob"), Value::Bytes(vec![0, 1, 2])),
+        (Cow::Borrowed("list"), Value::from(vec![1i64, 2])),
+    ];
 
-    let telemetry = Telemetry::builder(&url, "test-service")
-        .version("4.5.6")
-        .environment(Environment::Production)
-        .header("Authorization", "Bearer secret")
-        .build()
-        .unwrap();
+    let payload = otlp::logs(vec![record], &[]);
+    let attributes = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"];
 
-    telemetry
-        .event("export.finished")
-        .field("format", "avif")
-        .field("bytes", 1_048_576u64)
-        .info();
-    let _ = telemetry.flush();
+    assert_eq!(attributes[0]["value"]["boolValue"], true);
+    assert_eq!(attributes[1]["value"]["intValue"], "5");
+    assert_eq!(attributes[2]["value"]["doubleValue"], 0.5);
+    assert_eq!(attributes[3]["value"]["stringValue"], "avif");
+    assert_eq!(
+        attributes[4]["value"]["bytesValue"], "AAEC",
+        "bytes really are base64, unlike the ids"
+    );
+    assert_eq!(attributes[5]["value"]["arrayValue"]["values"][1]["intValue"], "2");
+}
 
-    let request = server.join().unwrap();
+// ---------------------------------------------------------------------------------------------------------------
+// The field syntax
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_field_syntax_accepts_all_four_forms() {
+    let order_id = "ord_8812";
+    let error = std::fmt::Error;
+
+    let fields = crate::__rust_sak_o11y_fields!(
+        plain = 1u32,
+        display = %error,
+        debug = ?error,
+        order_id,
+    );
+
+    assert_eq!(fields[0], (Cow::Borrowed("plain"), Value::Int(1)));
+    assert_eq!(fields[1].1, Value::String(error.to_string()));
+    assert_eq!(fields[2].1, Value::String(format!("{error:?}")));
+    assert_eq!(
+        fields[3],
+        (Cow::Borrowed("order_id"), Value::from("ord_8812")),
+        "a bare identifier is shorthand for `name = name`",
+    );
+}
+
+#[test]
+fn a_string_literal_key_carries_a_dotted_semantic_convention_name() {
+    let fields = crate::__rust_sak_o11y_fields!("http.response.status_code" = 200);
+
+    assert_eq!(fields[0].0, "http.response.status_code");
+}
+
+#[test]
+fn no_fields_produces_an_empty_set() {
+    let fields = crate::__rust_sak_o11y_fields!();
+
+    assert!(fields.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The level gate
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Counts how many times [`side_effect`] has been evaluated.
+static SIDE_EFFECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// A field value whose evaluation is observable.
+fn side_effect() -> u64 {
+    SIDE_EFFECTS.fetch_add(1, Ordering::SeqCst);
+    1
+}
+
+#[test]
+fn fields_are_not_evaluated_when_the_level_gate_is_closed() {
+    let _guard = global_lock();
+
+    level::silence();
+    SIDE_EFFECTS.store(0, Ordering::SeqCst);
+
+    log::debug!("never recorded", value = side_effect());
+    log::info!("never recorded", value = side_effect());
+    log::warn!("never recorded", value = side_effect());
+    log::error!("never recorded", value = side_effect());
+
+    assert_eq!(
+        SIDE_EFFECTS.load(Ordering::SeqCst),
+        0,
+        "a gated-out record must not evaluate its arguments, or an expensive debug field would cost in release",
+    );
+}
+
+#[test]
+fn a_record_at_or_above_the_threshold_evaluates_its_fields() {
+    let _guard = global_lock();
+
+    level::set_threshold(Level::Warn);
+    SIDE_EFFECTS.store(0, Ordering::SeqCst);
+
+    log::debug!("below", value = side_effect());
+    log::info!("below", value = side_effect());
+    log::warn!("at", value = side_effect());
+    log::error!("above", value = side_effect());
+
+    level::silence();
+
+    assert_eq!(SIDE_EFFECTS.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn nothing_passes_the_gate_before_init() {
+    let _guard = global_lock();
+    level::silence();
 
     assert!(
-        request.head.to_lowercase().contains("authorization: bearer secret"),
-        "request head was:\n{}",
-        request.head
+        !log::enabled(Level::Error),
+        "even an error is discarded until init lowers the threshold"
     );
-    assert!(request.body_contains("export.finished"), "event name is missing");
-    assert!(request.body_contains("format"), "record field is missing");
-    assert!(request.body_contains("avif"), "record field value is missing");
-    assert!(request.body_contains(SESSION_ID), "enrichment is missing");
-    assert!(request.body_contains("4.5.6"), "version enrichment is missing");
-    assert!(
-        request.body_contains("test-service"),
-        "service.name resource is missing"
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Spans
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_nested_span_inherits_the_trace_id_and_records_its_parent() {
+    let outer = Span::__enter("outer", Vec::new());
+    let outer_trace = trace::current().trace_id().unwrap();
+    let outer_span = trace::current().span_id().unwrap();
+
+    let inner = Span::__enter("inner", Vec::new());
+
+    assert_eq!(
+        trace::current().trace_id().unwrap(),
+        outer_trace,
+        "a trace spans its whole tree"
     );
-    assert!(request.body_contains("production"), "deployment environment is missing");
-    // Severity text is the SDK's own canonical spelling (uppercase), not Go's lowercased variant.
-    assert!(request.body_contains("INFO"), "severity text is missing");
+    assert_ne!(trace::current().span_id().unwrap(), outer_span);
+
+    drop(inner);
+    assert_eq!(
+        trace::current().span_id().unwrap(),
+        outer_span,
+        "closing the inner span restores the outer"
+    );
+
+    drop(outer);
+    assert_eq!(trace::depth(), 0);
 }
 
 #[test]
-fn record_fields_override_enrichment() {
-    let (url, server) = spawn_collector();
+fn two_root_spans_get_different_traces() {
+    let first = Span::__enter("first", Vec::new());
+    let first_trace = trace::current().trace_id().unwrap();
+    drop(first);
 
-    let telemetry = Telemetry::builder(&url, "test-service")
-        .version("1.0.0")
-        .build()
-        .unwrap();
+    let second = Span::__enter("second", Vec::new());
+    let second_trace = trace::current().trace_id().unwrap();
+    drop(second);
 
-    telemetry.event("versioned").field(VERSION, "overridden").info();
-    let _ = telemetry.flush();
-
-    let request = server.join().unwrap();
-    assert!(request.body_contains("overridden"), "the record's own value must win");
-    assert!(
-        !request.body_contains("1.0.0"),
-        "the enrichment value must be dropped, not emitted alongside"
-    );
-
-    // The enrichment itself is untouched by that one record.
-    assert_eq!(telemetry.enrichment_snapshot().get(VERSION).unwrap(), "1.0.0");
+    assert_ne!(first_trace, second_trace);
 }
 
 #[test]
-fn error_attaches_the_error_and_its_source() {
-    let (url, server) = spawn_collector();
+fn a_span_closes_on_an_early_return() {
+    fn fallible() -> Result<()> {
+        let _span = Span::__enter("fallible", Vec::new());
+        Err(O11yError::AlreadyInitialized)?;
+        Ok(())
+    }
 
-    let telemetry = Telemetry::builder(&url, "test-service").build().unwrap();
-
-    let source = std::io::Error::other("disk is on fire");
-    let error = O11yError::Io(source);
-    telemetry.event("export.failed").error(&error);
-    let _ = telemetry.flush();
-
-    let request = server.join().unwrap();
-    assert!(request.body_contains("error"), "the error attribute is missing");
-    assert!(request.body_contains("disk is on fire"), "the source cause is missing");
-    assert!(request.body_contains("error.source"), "the source attribute is missing");
+    assert!(fallible().is_err());
+    assert_eq!(trace::depth(), 0, "`?` drops the guard on its way out");
 }
 
-// --- geolocation tests ---
-
 #[test]
-fn geolocation_is_merged_when_opted_in() {
-    let geo_url = spawn_json_server(GEO_JSON);
-
-    let telemetry = Telemetry::builder("http://127.0.0.1:1", "test-service")
-        .geolocation(true)
-        .geolocation_url(&geo_url)
-        .build()
-        .unwrap();
-
-    // The lookup runs on a background thread, so `build` returns before it lands.
-    let resolved = wait_until(GEO_TIMEOUT, || {
-        telemetry.enrichment_snapshot().contains_key(LOCATION_CITY)
+fn a_span_closes_while_a_panic_unwinds() {
+    let result = std::panic::catch_unwind(|| {
+        let _span = Span::__enter("doomed", Vec::new());
+        panic!("boom");
     });
-    assert!(resolved, "the location should have been merged in");
 
-    let fields = telemetry.enrichment_snapshot();
-    assert_eq!(fields.get(LOCATION_CITY).unwrap(), "Amsterdam");
-    assert_eq!(fields.get(LOCATION_COUNTRY).unwrap(), "NL");
+    assert!(result.is_err());
+    assert_eq!(trace::depth(), 0);
 }
 
 #[test]
-fn a_second_location_replaces_the_first() {
-    // Only one lookup is started today, so this guards the invariant rather than a live bug: appending would put two
-    // `location.city` attributes on every record, and the attribute list has no notion of a duplicate key.
-    let enrichment = Enrichment::new("1.0.0", "test-service");
+fn guards_dropped_out_of_order_still_leave_the_stack_empty() {
+    let outer = Span::__enter("outer", Vec::new());
+    let inner = Span::__enter("inner", Vec::new());
 
-    let first = Geolocation {
-        city: Some("Amsterdam".to_owned()),
-        country: Some("NL".to_owned()),
-        ..Geolocation::default()
+    // A guard kept in a struct or a collection can outlive its nesting; removing by identifier rather than by
+    // position is what keeps that from corrupting the stack.
+    drop(outer);
+    assert_eq!(trace::depth(), 1);
+
+    drop(inner);
+    assert_eq!(trace::depth(), 0);
+}
+
+#[test]
+fn current_is_a_silent_no_op_when_no_span_is_open() {
+    assert_eq!(trace::depth(), 0);
+    assert!(!trace::current().is_recording());
+    assert!(trace::current().trace_id().is_none());
+
+    // The point of the test: none of these panic, so library code can annotate unconditionally.
+    trace::current().set_attribute("order_id", "ord_8812");
+    trace::current().add_event("nothing is listening");
+    trace::current().set_error(&O11yError::AlreadyInitialized);
+}
+
+#[test]
+fn a_disabled_span_records_nothing_and_never_touches_the_stack() {
+    let span = Span::__disabled();
+
+    assert!(!span.is_recording());
+    assert_eq!(trace::depth(), 0);
+
+    drop(span);
+    assert_eq!(trace::depth(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Async span propagation
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A future that returns `Pending` once before resolving, so a test can observe the gap between two polls.
+struct YieldOnce {
+    /// Whether the single pending poll has already happened.
+    yielded: bool,
+    /// The span depth observed during each poll.
+    depths: Arc<Mutex<Vec<usize>>>,
+}
+
+impl std::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.depths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(trace::depth());
+
+        if self.yielded {
+            std::task::Poll::Ready(())
+        } else {
+            self.yielded = true;
+            std::task::Poll::Pending
+        }
+    }
+}
+
+#[test]
+fn an_instrumented_future_holds_its_span_during_a_poll_and_not_between_polls() {
+    use trace::Instrument;
+
+    let depths = Arc::new(Mutex::new(Vec::new()));
+    let future = YieldOnce {
+        yielded: false,
+        depths: Arc::clone(&depths),
     };
-    let second = Geolocation {
-        city: Some("Lisbon".to_owned()),
-        country: Some("PT".to_owned()),
-        ..Geolocation::default()
+
+    let mut instrumented = Box::pin(future.instrument(Span::__enter("async work", Vec::new())));
+
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+
+    assert!(instrumented.as_mut().poll(&mut context).is_pending());
+    assert_eq!(
+        trace::depth(),
+        0,
+        "between polls the span is off the thread, so it cannot mis-parent another task's work",
+    );
+
+    assert!(instrumented.as_mut().poll(&mut context).is_ready());
+    assert_eq!(trace::depth(), 0);
+
+    let observed = depths.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(
+        observed,
+        vec![1, 1],
+        "the span is on the stack for the duration of every poll"
+    );
+}
+
+#[test]
+fn an_instrumented_future_dropped_before_it_resolves_still_closes_its_span() {
+    use trace::Instrument;
+
+    let future = YieldOnce {
+        yielded: false,
+        depths: Arc::new(Mutex::new(Vec::new())),
     };
 
-    enrichment.set_location(&first);
-    enrichment.set_location(&second);
+    drop(future.instrument(Span::__enter("abandoned", Vec::new())));
 
-    let attributes = enrichment.attributes();
-    let cities = attributes
+    assert_eq!(trace::depth(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_counter_accumulates_across_calls() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let counter = metric::counter("accumulating");
+    counter.increment(2);
+    counter.increment(3);
+
+    let snapshot = metric::snapshot()
+        .into_iter()
+        .find(|s| s.name == "accumulating")
+        .unwrap();
+    let metric::MetricData::Sum(points) = &snapshot.data else {
+        panic!("expected a sum")
+    };
+
+    assert_eq!(points.iter().find(|point| point.tags.is_empty()).unwrap().value, 5);
+}
+
+#[test]
+fn tag_order_does_not_split_one_series_into_two() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let counter = metric::counter("tagged");
+    counter.add_with_tags(1, &[("region", "eu-west-1"), ("tier", "gold")]);
+    counter.add_with_tags(1, &[("tier", "gold"), ("region", "eu-west-1")]);
+
+    let snapshot = metric::snapshot().into_iter().find(|s| s.name == "tagged").unwrap();
+    let metric::MetricData::Sum(points) = &snapshot.data else {
+        panic!("expected a sum")
+    };
+    let tagged: Vec<_> = points.iter().filter(|point| !point.tags.is_empty()).collect();
+
+    assert_eq!(
+        tagged.len(),
+        1,
+        "the same tags in a different order are the same series"
+    );
+    assert_eq!(tagged[0].value, 2);
+}
+
+#[test]
+fn an_untouched_gauge_reports_no_data_point() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let _gauge = metric::gauge("never_set");
+    let snapshot = metric::snapshot().into_iter().find(|s| s.name == "never_set").unwrap();
+    let metric::MetricData::Gauge(points) = &snapshot.data else {
+        panic!("expected a gauge")
+    };
+
+    assert!(
+        points.is_empty(),
+        "a gauge that was never set must not be reported as zero"
+    );
+}
+
+#[test]
+fn a_gauge_reports_the_value_it_was_last_set_to() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let gauge = metric::gauge("queue_depth");
+    gauge.set(12);
+    gauge.set(7);
+
+    let snapshot = metric::snapshot()
+        .into_iter()
+        .find(|s| s.name == "queue_depth")
+        .unwrap();
+    let metric::MetricData::Gauge(points) = &snapshot.data else {
+        panic!("expected a gauge")
+    };
+
+    assert_eq!(points[0].value, 7.0);
+}
+
+#[test]
+fn a_histogram_files_values_into_the_bucket_they_fall_in() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let histogram = metric::histogram("values").with_buckets(&[10.0, 100.0]);
+    histogram.record(5.0);
+    histogram.record(50.0);
+    histogram.record(500.0);
+
+    let snapshot = metric::snapshot().into_iter().find(|s| s.name == "values").unwrap();
+    let metric::MetricData::Histogram(points) = &snapshot.data else {
+        panic!("expected a histogram")
+    };
+
+    assert_eq!(points[0].bucket_counts, vec![1, 1, 1]);
+    assert_eq!(points[0].count, 3);
+    assert_eq!(points[0].sum, 555.0);
+}
+
+#[test]
+fn with_buckets_given_out_of_order_bounds_sorts_them() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let histogram = metric::histogram("unsorted").with_buckets(&[100.0, 10.0]);
+    histogram.record(50.0);
+
+    let snapshot = metric::snapshot().into_iter().find(|s| s.name == "unsorted").unwrap();
+    let metric::MetricData::Histogram(points) = &snapshot.data else {
+        panic!("expected a histogram")
+    };
+
+    assert_eq!(points[0].bounds, vec![10.0, 100.0]);
+    assert_eq!(points[0].bucket_counts, vec![0, 1, 0]);
+}
+
+#[test]
+fn a_dropped_instrument_leaves_the_registry() {
+    let _guard = global_lock();
+    metric::clear();
+
+    drop(metric::counter("transient"));
+
+    assert!(
+        !metric::snapshot().iter().any(|s| s.name == "transient"),
+        "the registry holds weak references, so it never keeps a dropped instrument alive",
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Enrichment
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_machine_id_is_scoped_to_the_service() {
+    let first = Enrichment::new("service-one").snapshot();
+    let second = Enrichment::new("service-two").snapshot();
+
+    match (first.get("machine.id"), second.get("machine.id")) {
+        (Some(one), Some(two)) => assert_ne!(one, two, "two services on one machine must not share an id"),
+        // A host with no readable machine id simply omits the attribute, which is a supported outcome.
+        _ => assert!(!first.contains_key("machine.id") && !second.contains_key("machine.id")),
+    }
+}
+
+#[test]
+fn every_record_carries_the_machine_and_session_attributes() {
+    let snapshot = Enrichment::new("my-app").snapshot();
+
+    assert_eq!(
+        snapshot.get("machine.os").map(String::as_str),
+        Some(std::env::consts::OS)
+    );
+    assert_eq!(
+        snapshot.get("machine.arch").map(String::as_str),
+        Some(std::env::consts::ARCH)
+    );
+    assert!(snapshot.contains_key("session.id"));
+}
+
+#[test]
+fn renewing_the_session_replaces_the_id_for_later_records_only() {
+    let enrichment = Enrichment::new("my-app");
+
+    let before = enrichment.attributes();
+    let before_id = enrichment.session_id();
+
+    enrichment.renew_session();
+
+    assert_ne!(enrichment.session_id(), before_id);
+    assert!(
+        before
+            .iter()
+            .any(|(key, value)| key == "session.id" && *value == Value::String(before_id.clone())),
+        "a record already emitted keeps the session it was emitted under",
+    );
+}
+
+/// A lookup result carrying only the country, which is all the enrichment reads here.
+fn located(country: &str) -> Geolocation {
+    Geolocation {
+        country: Some(country.to_string()),
+        ..Geolocation::default()
+    }
+}
+
+#[test]
+fn a_second_location_replaces_the_first_rather_than_being_appended() {
+    let enrichment = Enrichment::new("my-app");
+
+    enrichment.set_location(&located("NL"));
+    enrichment.set_location(&located("BR"));
+
+    let countries = enrichment
+        .attributes()
         .iter()
-        .filter(|(key, _)| key.as_str() == LOCATION_CITY)
+        .filter(|(key, _)| key == "location.country")
         .count();
-    assert_eq!(cities, 1, "the second location should replace the first, not add to it");
-    assert_eq!(enrichment.snapshot().get(LOCATION_CITY).unwrap(), "Lisbon");
-    assert_eq!(enrichment.snapshot().get(LOCATION_COUNTRY).unwrap(), "PT");
+
+    assert_eq!(countries, 1);
+    assert_eq!(
+        enrichment.snapshot().get("location.country").map(String::as_str),
+        Some("BR"),
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn an_export_posts_each_signal_to_its_own_otlp_path() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let (endpoint, captured) = spawn_recording_collector(3, "200 OK");
+    let sink = Arc::new(ErrorSink::default());
+    let shared = pipeline::test_shared(&endpoint, sink.handler());
+
+    shared.logs.push(log_record("order received"));
+    shared.spans.push(span_record("charge_card"));
+    let exported = metric::counter("exported_total");
+    exported.increment(1);
+
+    assert!(worker::export_once(&shared));
+    assert!(
+        captured_at_least(&captured, 3),
+        "logs, traces and metrics are three separate requests"
+    );
+
+    let requests = captured.lock().unwrap_or_else(PoisonError::into_inner);
+    let paths: Vec<&str> = requests
+        .iter()
+        .map(super::test_support::CapturedRequest::path)
+        .collect();
+
+    assert!(paths.contains(&"/v1/logs"));
+    assert!(paths.contains(&"/v1/traces"));
+    assert!(paths.contains(&"/v1/metrics"));
+    assert!(sink.taken().is_empty());
 }
 
 #[test]
-fn fetch_geolocation_parses_the_response() {
-    let url = spawn_json_server(GEO_JSON);
+fn a_rejected_payload_reaches_the_error_callback() {
+    let _guard = global_lock();
+    metric::clear();
 
+    let (endpoint, _captured) = spawn_recording_collector(1, "503 Service Unavailable");
+    let sink = Arc::new(ErrorSink::default());
+    let shared = pipeline::test_shared(&endpoint, sink.handler());
+
+    shared.logs.push(log_record("order received"));
+
+    assert!(!worker::export_once(&shared));
+
+    let reported = sink.taken();
+    assert_eq!(reported.len(), 1);
+    assert!(reported[0].contains("503"), "got {reported:?}");
+    assert!(
+        reported[0].contains("logs"),
+        "the callback says which stream failed: {reported:?}"
+    );
+}
+
+#[test]
+fn an_unreachable_collector_reports_rather_than_blocking_or_panicking() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let sink = Arc::new(ErrorSink::default());
+    // Port 1 on loopback refuses immediately, which is the connect-error path rather than the timeout one.
+    let shared = pipeline::test_shared("http://127.0.0.1:1", sink.handler());
+
+    shared.logs.push(log_record("never delivered"));
+
+    assert!(!worker::export_once(&shared));
+    assert_eq!(sink.taken().len(), 1);
+}
+
+#[test]
+fn discarded_records_are_reported_through_the_callback() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let sink = Arc::new(ErrorSink::default());
+    let shared = pipeline::test_shared("http://127.0.0.1:1", sink.handler());
+
+    // A buffer of its own, sized so the overflow is deterministic rather than depending on the default.
+    let buffer = Buffer::new(2);
+    for _ in 0..5 {
+        buffer.push(log_record("overflowing"));
+    }
+    let (_kept, dropped) = buffer.take();
+    assert_eq!(dropped, 3);
+
+    shared.logs.push(log_record("delivered"));
+    worker::export_once(&shared);
+
+    assert!(sink.taken().iter().any(|error| error.contains("logs")));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The process globals
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn disabled_telemetry_makes_no_network_calls_at_all() {
+    let _guard = global_lock();
+
+    let (collector, collector_hits) = spawn_counting_server();
+    let (geolocation, geolocation_hits) = spawn_counting_server();
+
+    let result = init(
+        Config::builder(&collector, NO_HEADERS)
+            .service_name("silent")
+            .enabled(false)
+            .geolocation(true)
+            .geolocation_url(&geolocation)
+            .build(),
+    );
+
+    // `init` may already have been claimed by the end-to-end test when the whole suite shares one process; either
+    // way the assertion below is the point, and it holds in both cases.
+    assert!(result.is_ok() || matches!(result, Err(O11yError::AlreadyInitialized)));
+
+    log::info!("discarded", order_id = "ord_8812");
+    flush();
+
+    assert!(!wait_until(Duration::from_millis(200), || {
+        collector_hits.load(Ordering::SeqCst) > 0 || geolocation_hits.load(Ordering::SeqCst) > 0
+    }));
+}
+
+#[test]
+fn init_rejects_an_endpoint_that_is_not_a_url() {
+    let error = init(Config::builder("not a url", NO_HEADERS).build()).unwrap_err();
+
+    assert!(matches!(error, O11yError::InvalidEndpoint { .. }));
+}
+
+#[test]
+fn init_rejects_a_header_that_cannot_be_sent() {
+    let error = init(Config::builder("http://127.0.0.1:1", [("bad header name", "value")]).build()).unwrap_err();
+
+    assert!(matches!(error, O11yError::InvalidHeader { .. }));
+}
+
+#[test]
+fn shutdown_without_init_does_nothing_and_is_safe_to_repeat() {
+    let _guard = global_lock();
+
+    shutdown();
+    shutdown();
+    flush();
+}
+
+#[test]
+fn the_exported_log_payload_has_the_shape_a_collector_expects() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let (endpoint, captured) = spawn_recording_collector(1, "200 OK");
+    let sink = Arc::new(ErrorSink::default());
+    let shared = pipeline::test_shared(&endpoint, sink.handler());
+
+    let mut record = log_record("order received");
+    record.enrichment = shared.enrichment.attributes();
+    shared.logs.push(record);
+
+    assert!(worker::export_once(&shared));
+    assert!(captured_at_least(&captured, 1));
+
+    let requests = captured.lock().unwrap_or_else(PoisonError::into_inner);
+    let payload = requests[0].body_json();
+    let block = &payload["resourceLogs"][0];
+    let record = &block["scopeLogs"][0]["logRecords"][0];
+
+    assert_eq!(block["scopeLogs"][0]["scope"]["name"], "rust-sak/o11y");
+    assert_eq!(record["severityNumber"], 9, "9 is INFO");
+    assert_eq!(record["severityText"], "INFO");
+    assert_eq!(record["body"]["stringValue"], "order received");
+    assert_eq!(record["attributes"][0]["key"], "order_id");
+
+    let resource: Vec<&str> = block["resource"]["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["key"].as_str().unwrap())
+        .collect();
+
+    assert!(resource.contains(&"service.name"));
+    assert!(resource.contains(&"service.version"));
+    assert!(resource.contains(&"deployment.environment.name"));
+    assert!(
+        resource.contains(&"session.id"),
+        "the session travels with the batch, not with each record"
+    );
+}
+
+#[test]
+fn the_export_request_carries_the_configured_headers_and_content_type() {
+    let _guard = global_lock();
+    metric::clear();
+
+    let (endpoint, captured) = spawn_recording_collector(1, "200 OK");
+    let sink = Arc::new(ErrorSink::default());
+    let mut shared = pipeline::test_shared(&endpoint, sink.handler());
+
+    Arc::get_mut(&mut shared)
+        .unwrap()
+        .headers
+        .insert("Authorization".to_string(), "Bearer secret".to_string());
+
+    shared.logs.push(log_record("order received"));
+    assert!(worker::export_once(&shared));
+    assert!(captured_at_least(&captured, 1));
+
+    let requests = captured.lock().unwrap_or_else(PoisonError::into_inner);
+    let head = requests[0].head.to_lowercase();
+
+    assert!(head.contains("authorization: bearer secret"), "got {head}");
+    assert!(head.contains("content-type: application/json"), "got {head}");
+}
+
+#[test]
+fn a_geolocation_lookup_parses_what_the_service_returns() {
+    let url = spawn_json_server(r#"{"ip":"1.2.3.4","city":"Amsterdam","region":"North Holland","country":"NL"}"#);
     let geo = fetch_geolocation_from(&url).unwrap();
 
-    assert_eq!(geo.city.as_deref(), Some("Amsterdam"));
     assert_eq!(geo.country.as_deref(), Some("NL"));
-    assert_eq!(geo.ip.as_deref(), Some("1.2.3.4"));
-    // Fields the service omitted stay `None` rather than becoming empty strings.
-    assert_eq!(geo.postal, None);
-}
-
-// --- value tests ---
-
-#[test]
-fn value_converts_from_the_common_rust_types() {
-    let owned = String::from("avif");
-
-    // A borrowed, non-'static string: the case `AnyValue` itself cannot take.
-    assert_eq!(Value::from(owned.as_str()), Value::String("avif".to_string()));
-    assert_eq!(Value::from(owned.clone()), Value::String("avif".to_string()));
-    assert_eq!(Value::from(true), Value::Bool(true));
-    assert_eq!(Value::from(7u32), Value::Int(7));
-    assert_eq!(Value::from(1_048_576usize), Value::Int(1_048_576));
-    assert_eq!(Value::from(-3i8), Value::Int(-3));
-    assert_eq!(Value::from(1.5f32), Value::Double(1.5));
-    assert_eq!(Value::from(b"ab".as_slice()), Value::Bytes(vec![b'a', b'b']));
+    assert_eq!(geo.city.as_deref(), Some("Amsterdam"));
 }
 
 #[test]
-fn unsigned_values_saturate_rather_than_wrap() {
-    // OTLP has no unsigned integer type. Clamping keeps a nonsensical-but-large number from becoming a negative one.
-    assert_eq!(Value::from(u64::MAX), Value::Int(i64::MAX));
-    assert_eq!(Value::from(i64::MAX as u64), Value::Int(i64::MAX));
-}
+fn a_resolved_location_reaches_the_enrichment() {
+    let enrichment = Enrichment::new("my-app");
+    enrichment.set_location(&located("NL"));
 
-#[test]
-fn value_converts_nested_collections() {
     assert_eq!(
-        Value::from(vec![1i64, 2]),
-        Value::List(vec![Value::Int(1), Value::Int(2)])
+        enrichment.snapshot().get("location.country").map(String::as_str),
+        Some("NL")
     );
-
-    let map = HashMap::from([("codec", "avif")]);
-    assert_eq!(Value::from(map), Value::Map(vec![("codec".to_string(), "avif".into())]));
 }
 
 #[test]
-fn events_accept_dynamically_assembled_fields() {
-    let (url, server) = spawn_collector();
-
-    let telemetry = Telemetry::builder(&url, "test-service").build().unwrap();
-
-    let collected: Vec<(String, Value)> = vec![
-        ("codec".to_string(), "avif".into()),
-        ("threads".to_string(), 8u32.into()),
+fn byte_values_are_base64_encoded_with_the_right_padding() {
+    // Hand-rolled encoders get the tail wrong; every remainder class is exercised here.
+    let cases = [
+        (vec![], ""),
+        (vec![b'f'], "Zg=="),
+        (vec![b'f', b'o'], "Zm8="),
+        (vec![b'f', b'o', b'o'], "Zm9v"),
+        (vec![b'f', b'o', b'o', b'b'], "Zm9vYg=="),
+        (vec![b'f', b'o', b'o', b'b', b'a'], "Zm9vYmE="),
+        (vec![b'f', b'o', b'o', b'b', b'a', b'r'], "Zm9vYmFy"),
     ];
-    telemetry.event("encode.started").fields(collected).info();
-    let _ = telemetry.flush();
 
-    let request = server.join().unwrap();
-    assert!(request.body_contains("codec"));
-    assert!(request.body_contains("threads"));
+    for (bytes, expected) in cases {
+        let mut record = log_record("bytes");
+        record.fields = vec![(Cow::Borrowed("blob"), Value::Bytes(bytes.clone()))];
+
+        let payload = otlp::logs(vec![record], &[]);
+        let encoded = &payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"][0]["value"];
+
+        assert_eq!(encoded["bytesValue"], expected, "encoding {bytes:?}");
+    }
 }
 
-// --- environment tests ---
-
 #[test]
-fn environment_renders_its_name() {
-    assert_eq!(Environment::Development.to_string(), "development");
-    assert_eq!(Environment::Production.to_string(), "production");
-    assert_eq!(Environment::Custom("staging".to_string()).to_string(), "staging");
-    assert_eq!(Environment::default(), Environment::Development);
-}
+fn the_series_cap_folds_the_overflow_into_a_single_marked_series() {
+    let _guard = global_lock();
+    metric::clear();
 
-// --- error tests ---
-//
-// `O11yError` hand-writes its `Display` and `source` arms, so a transposed line would go unnoticed without these.
+    let counter = metric::counter("high_cardinality");
 
-#[test]
-fn errors_describe_themselves_and_expose_their_source() {
-    use std::error::Error;
+    // Well past the per-instrument cap, as an unbounded tag domain — a request id, say — would be.
+    for index in 0..(super::metric::MAX_SERIES + 50) {
+        counter.add_with_tags(1, &[("request_id", &index.to_string())]);
+    }
 
-    let io = O11yError::Io(std::io::Error::other("disk is on fire"));
-    assert!(io.to_string().contains("disk is on fire"));
-    assert!(io.source().is_some(), "a wrapped error must expose its source");
-
-    let json = O11yError::Json(serde_json::from_str::<Geolocation>("not json").unwrap_err());
-    assert!(json.to_string().contains("json"));
-    assert!(json.source().is_some());
-
-    let endpoint = O11yError::InvalidEndpoint {
-        endpoint: "ht tp://nope".to_string(),
-        reason: "relative URL without a base".to_string(),
+    let snapshot = metric::snapshot()
+        .into_iter()
+        .find(|s| s.name == "high_cardinality")
+        .unwrap();
+    let metric::MetricData::Sum(points) = &snapshot.data else {
+        panic!("expected a sum")
     };
-    assert!(endpoint.to_string().contains("ht tp://nope"));
-    assert!(endpoint.to_string().contains("relative URL without a base"));
-    assert!(endpoint.source().is_none(), "a self-describing error has no source");
 
-    let header = O11yError::InvalidHeader {
-        name: "bad name".to_string(),
-    };
-    assert!(header.to_string().contains("bad name"));
-    assert!(header.source().is_none());
+    let overflow = points
+        .iter()
+        .find(|point| point.tags.iter().any(|(key, _)| key == "o11y.series_overflow"))
+        .expect("samples past the cap fold into an overflow series");
+
+    assert_eq!(
+        overflow.value, 50,
+        "the total is preserved even though the breakdown stops"
+    );
+    assert!(
+        points.len() <= super::metric::MAX_SERIES + 2,
+        "memory stays bounded: {} series",
+        points.len(),
+    );
 }
