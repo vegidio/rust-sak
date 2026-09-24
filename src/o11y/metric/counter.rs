@@ -91,6 +91,23 @@ impl Counter {
             self.state.overflow.fetch_add(amount, Ordering::Relaxed);
         }
     }
+
+    /// The running total of the series identified by `tags`, or `0` for a series never written.
+    ///
+    /// `&[]` reads the untagged series, the one [`increment`](Counter::increment) adds to. Tag order does not matter,
+    /// as it does not when writing. A tag set that arrived after the series cap was folded into
+    /// `o11y.series_overflow`, so it reads as never written. Meant for tests and diagnostics; the exporter does not
+    /// use it.
+    pub fn value(&self, tags: &[(&str, &str)]) -> u64 {
+        if tags.is_empty() {
+            return self.state.untagged.load(Ordering::Relaxed);
+        }
+
+        self.state
+            .tagged
+            .get(tags, |series| series.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
 }
 
 impl Instrument for CounterState {
@@ -123,5 +140,61 @@ impl Instrument for CounterState {
             name: self.name.clone(),
             data: MetricData::Sum(points),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tags::MAX_SERIES;
+    use super::*;
+    use crate::o11y::test_support::global_lock;
+
+    #[test]
+    fn value_reads_the_untagged_series_through_empty_tags() {
+        // Held because creating an instrument registers it, and other tests read the whole registry.
+        let _guard = global_lock();
+        let counter = counter("read_untagged");
+
+        counter.increment(2);
+        counter.increment(3);
+        counter.add_with_tags(7, &[("region", "eu")]);
+
+        assert_eq!(counter.value(&[]), 5);
+    }
+
+    #[test]
+    fn value_matches_a_tag_set_in_any_order() {
+        let _guard = global_lock();
+        let counter = counter("read_order");
+
+        counter.add_with_tags(4, &[("a", "1"), ("b", "2")]);
+
+        assert_eq!(counter.value(&[("a", "1"), ("b", "2")]), 4);
+        assert_eq!(counter.value(&[("b", "2"), ("a", "1")]), 4);
+    }
+
+    #[test]
+    fn a_series_never_written_reads_zero() {
+        let _guard = global_lock();
+        let counter = counter("read_unwritten");
+
+        counter.add_with_tags(1, &[("a", "1")]);
+
+        assert_eq!(counter.value(&[]), 0);
+        assert_eq!(counter.value(&[("a", "2")]), 0);
+    }
+
+    #[test]
+    fn a_tag_set_folded_into_overflow_reads_as_never_written() {
+        let _guard = global_lock();
+        let counter = counter("read_overflow");
+
+        for index in 0..MAX_SERIES {
+            counter.add_with_tags(1, &[("index", &index.to_string())]);
+        }
+        counter.add_with_tags(9, &[("index", "past_the_cap")]);
+
+        assert_eq!(counter.value(&[("index", "0")]), 1);
+        assert_eq!(counter.value(&[("index", "past_the_cap")]), 0);
     }
 }

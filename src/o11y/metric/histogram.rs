@@ -182,6 +182,32 @@ impl Histogram {
         }
     }
 
+    /// How many values the series identified by `tags` has recorded, or `0` for a series never written.
+    ///
+    /// `&[]` reads the untagged series, the one [`record`](Histogram::record) files into. Tag matching and the
+    /// overflow caveat are as for [`Counter::value`](super::Counter::value).
+    pub fn count(&self, tags: &[(&str, &str)]) -> u64 {
+        self.read(tags, |series| series.count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// The total of the values the series identified by `tags` has recorded, or `0.0` for a series never written.
+    ///
+    /// Read as [`count`](Histogram::count) is.
+    pub fn sum(&self, tags: &[(&str, &str)]) -> f64 {
+        self.read(tags, |series| f64::from_bits(series.sum.load(Ordering::Relaxed)))
+            .unwrap_or(0.0)
+    }
+
+    /// Runs `read` against the series for `tags`, without creating it or the layout.
+    fn read<R>(&self, tags: &[(&str, &str)], read: impl FnOnce(&Buckets) -> R) -> Option<R> {
+        if tags.is_empty() {
+            return self.state.layout.get().map(|layout| read(&layout.untagged));
+        }
+
+        self.state.tagged.get(tags, read)
+    }
+
     /// The layout, defaulting the bounds if `with_buckets` was never called.
     fn layout(&self) -> &Layout {
         self.state.layout.get_or_init(|| Layout::new(DEFAULT_BOUNDS.into()))
@@ -222,5 +248,85 @@ impl Instrument for HistogramState {
                 points,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tags::MAX_SERIES;
+    use super::*;
+    use crate::o11y::test_support::global_lock;
+
+    #[test]
+    fn count_and_sum_read_the_untagged_series_through_empty_tags() {
+        // Held because creating an instrument registers it, and other tests read the whole registry.
+        let _guard = global_lock();
+        let histogram = histogram("read_untagged").with_buckets(&[1.0]);
+
+        histogram.record(0.5);
+        histogram.record(2.0);
+        histogram.record_with_tags(100.0, &[("route", "a")]);
+
+        assert_eq!(histogram.count(&[]), 2);
+        assert_eq!(histogram.sum(&[]), 2.5);
+    }
+
+    #[test]
+    fn count_and_sum_match_a_tag_set_in_any_order() {
+        let _guard = global_lock();
+        let histogram = histogram("read_order");
+
+        histogram.record_with_tags(1.5, &[("a", "1"), ("b", "2")]);
+        histogram.record_with_tags(2.5, &[("b", "2"), ("a", "1")]);
+
+        assert_eq!(histogram.count(&[("b", "2"), ("a", "1")]), 2);
+        assert_eq!(histogram.sum(&[("a", "1"), ("b", "2")]), 4.0);
+    }
+
+    #[test]
+    fn a_series_never_written_reads_zero() {
+        let _guard = global_lock();
+        let histogram = histogram("read_unwritten");
+
+        assert_eq!(histogram.count(&[]), 0);
+        assert_eq!(histogram.sum(&[]), 0.0);
+
+        histogram.record_with_tags(1.0, &[("a", "1")]);
+
+        assert_eq!(histogram.count(&[]), 0);
+        assert_eq!(histogram.count(&[("a", "2")]), 0);
+        assert_eq!(histogram.sum(&[("a", "2")]), 0.0);
+    }
+
+    #[test]
+    fn reading_before_any_record_leaves_the_bounds_settable() {
+        let _guard = global_lock();
+        let histogram = histogram("read_first");
+
+        assert_eq!(histogram.count(&[]), 0);
+
+        // A read that defaulted the layout would make these bounds a no-op, and the snapshot would show 15 of them.
+        let histogram = histogram.with_buckets(&[1.0, 2.0]);
+        histogram.record(1.5);
+
+        let MetricData::Histogram { bounds, .. } = histogram.state.snapshot().data else {
+            panic!("a histogram snapshots as a histogram");
+        };
+        assert_eq!(&*bounds, &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_tag_set_folded_into_overflow_reads_as_never_written() {
+        let _guard = global_lock();
+        let histogram = histogram("read_overflow");
+
+        for index in 0..MAX_SERIES {
+            histogram.record_with_tags(1.0, &[("index", &index.to_string())]);
+        }
+        histogram.record_with_tags(9.0, &[("index", "past_the_cap")]);
+
+        assert_eq!(histogram.count(&[("index", "0")]), 1);
+        assert_eq!(histogram.count(&[("index", "past_the_cap")]), 0);
+        assert_eq!(histogram.sum(&[("index", "past_the_cap")]), 0.0);
     }
 }

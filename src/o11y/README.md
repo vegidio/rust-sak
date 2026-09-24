@@ -187,6 +187,44 @@ instrument tracks at most 1024 distinct tag sets; beyond that, samples fold into
 series, so the total stays right while memory stays bounded. Tag values drawn from an unbounded domain — a user id,
 a request path, a raw error string — are what that limit is there for.
 
+### Reading a value back
+
+Each instrument can report what it holds for one tag set, so a program can test that its own code recorded a
+metric:
+
+```rust
+use std::sync::LazyLock;
+use rust_sak::o11y::metric::{self, Counter, Gauge, Histogram};
+
+static CACHE_LOOKUPS: LazyLock<Counter> = LazyLock::new(|| metric::counter("cache_lookups_total"));
+static STEP_SECONDS: LazyLock<Histogram> = LazyLock::new(|| metric::histogram("step_seconds"));
+static RESIDENT: LazyLock<Gauge> = LazyLock::new(|| metric::gauge("resident_sessions"));
+
+let before = CACHE_LOOKUPS.value(&[("result", "hit")]);
+CACHE_LOOKUPS.add_with_tags(1, &[("result", "hit")]);
+assert_eq!(CACHE_LOOKUPS.value(&[("result", "hit")]) - before, 1);
+
+STEP_SECONDS.record(0.25);
+assert_eq!((STEP_SECONDS.count(&[]), STEP_SECONDS.sum(&[])), (1, 0.25));
+
+assert_eq!(RESIDENT.value(&[("provider", "cpu")]), None);
+```
+
+| Method | Returns | For a series never written |
+|---|---|---|
+| `Counter::value(tags)` | the running total | `0` |
+| `Gauge::value(tags)` | the last value set | `None` |
+| `Histogram::count(tags)` | how many values were recorded | `0` |
+| `Histogram::sum(tags)` | their total | `0.0` |
+
+- **Tags match as they do when writing.** `&[]` reads the untagged series, the one `increment`, `set` and `record`
+  write. Tag order does not matter.
+- **A tag set folded into `o11y.series_overflow` reads as never written.** Past the 1024-series cap a new tag set has
+  no series of its own, so there is nothing to read for it.
+- **Instruments are process-wide.** Tests running in parallel may write the same series, so assert on the change
+  across the call under test, or on tag sets only that test writes.
+- **Reading never creates a series**, so it never spends the cap. The exporter does not use these methods.
+
 ## Traces
 
 A span opens when `span!` is called and closes when its guard drops, which covers a normal return, an early return

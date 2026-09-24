@@ -109,6 +109,19 @@ impl<T> TagMap<T> {
         Some(use_series(&bucket[index].1))
     }
 
+    /// Runs `read` against the series for `tags`, or returns `None` when no such series exists.
+    ///
+    /// Never creates a series, so reading cannot spend the cap. A tag set refused at the cap was folded into the
+    /// overflow series and has no entry here, so it reads as `None` too.
+    pub(super) fn get<R>(&self, tags: &[(&str, &str)], read: impl FnOnce(&T) -> R) -> Option<R> {
+        let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
+
+        entries
+            .get(&hash_tags(tags))
+            .and_then(|bucket| bucket.iter().find(|(stored, _)| same_tags(stored, tags)))
+            .map(|(_, series)| read(series))
+    }
+
     /// Runs `visit` against every series, for the exporter to read.
     pub(super) fn each(&self, mut visit: impl FnMut(&Tags, &T)) {
         let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);

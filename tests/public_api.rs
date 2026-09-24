@@ -224,6 +224,12 @@ mod o11y {
         ORDER_VALUE.record(129.5);
         QUEUE_DEPTH.set(12);
 
+        assert_eq!(ORDERS.value(&[]), 1);
+        assert_eq!(ORDERS.value(&[("region", "eu-west-1")]), 1);
+        assert_eq!(ORDER_VALUE.count(&[]), 1);
+        assert_eq!(ORDER_VALUE.sum(&[]), 129.5);
+        assert_eq!(QUEUE_DEPTH.value(&[]), Some(12.0));
+
         assert!(!o11y::is_enabled());
         assert!(o11y::session_id().is_none());
 

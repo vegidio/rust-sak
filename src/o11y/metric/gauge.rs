@@ -84,6 +84,24 @@ impl Gauge {
             self.state.overflow_set.store(true, Ordering::Relaxed);
         }
     }
+
+    /// The current value of the series identified by `tags`, or `None` for a series never set.
+    ///
+    /// `&[]` reads the untagged series, the one [`set`](Gauge::set) replaces. Tag matching and the overflow caveat
+    /// are as for [`Counter::value`](super::Counter::value).
+    pub fn value(&self, tags: &[(&str, &str)]) -> Option<f64> {
+        if tags.is_empty() {
+            return self
+                .state
+                .untagged_set
+                .load(Ordering::Relaxed)
+                .then(|| f64::from_bits(self.state.untagged.load(Ordering::Relaxed)));
+        }
+
+        self.state
+            .tagged
+            .get(tags, |series| f64::from_bits(series.load(Ordering::Relaxed)))
+    }
 }
 
 impl Instrument for GaugeState {
@@ -115,5 +133,62 @@ impl Instrument for GaugeState {
             name: self.name.clone(),
             data: MetricData::Gauge(points),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tags::MAX_SERIES;
+    use super::*;
+    use crate::o11y::test_support::global_lock;
+
+    #[test]
+    fn value_reads_the_untagged_series_through_empty_tags() {
+        // Held because creating an instrument registers it, and other tests read the whole registry.
+        let _guard = global_lock();
+        let gauge = gauge("read_untagged");
+
+        gauge.set(3);
+        gauge.set(12);
+        gauge.set_with_tags(40, &[("queue", "a")]);
+
+        assert_eq!(gauge.value(&[]), Some(12.0));
+    }
+
+    #[test]
+    fn value_matches_a_tag_set_in_any_order() {
+        let _guard = global_lock();
+        let gauge = gauge("read_order");
+
+        gauge.set_with_tags(0.5, &[("a", "1"), ("b", "2")]);
+
+        assert_eq!(gauge.value(&[("a", "1"), ("b", "2")]), Some(0.5));
+        assert_eq!(gauge.value(&[("b", "2"), ("a", "1")]), Some(0.5));
+    }
+
+    #[test]
+    fn a_series_never_set_reads_none_and_a_zero_reads_zero() {
+        let _guard = global_lock();
+        let gauge = gauge("read_unset");
+
+        gauge.set_with_tags(0, &[("a", "1")]);
+
+        assert_eq!(gauge.value(&[]), None);
+        assert_eq!(gauge.value(&[("a", "2")]), None);
+        assert_eq!(gauge.value(&[("a", "1")]), Some(0.0), "set to zero is not never set");
+    }
+
+    #[test]
+    fn a_tag_set_folded_into_overflow_reads_as_never_set() {
+        let _guard = global_lock();
+        let gauge = gauge("read_overflow");
+
+        for index in 0..MAX_SERIES {
+            gauge.set_with_tags(1, &[("index", &index.to_string())]);
+        }
+        gauge.set_with_tags(9, &[("index", "past_the_cap")]);
+
+        assert_eq!(gauge.value(&[("index", "0")]), Some(1.0));
+        assert_eq!(gauge.value(&[("index", "past_the_cap")]), None);
     }
 }
