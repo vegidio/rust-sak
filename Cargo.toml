@@ -71,6 +71,7 @@ redb = { version = "4.2.0", default-features = false, optional = true }
 reqwest = { version = "0.13.4", features = ["query", "json", "stream"], optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.150", optional = true }
+semver = { version = "1", optional = true }
 sevenz-rust2 = { version = "0.23", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"], optional = true }
@@ -151,6 +152,8 @@ o11y = [
     "dep:uuid",
     "reqwest/blocking",
 ]
+# Built on `fetch`: the GitHub API is a plain JSON endpoint, so it reuses `Fetch::json` and its retries.
+github = ["fetch", "dep:semver", "dep:serde", "dep:thiserror"]
 sysinfo = ["dep:objc2-core-foundation", "dep:objc2-io-kit", "dep:sysinfo", "dep:thiserror", "dep:windows"]
 
 # Mirrors the `required-features` the `playground` target carried as a `[[bin]]`: without this, a

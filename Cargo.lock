@@ -2913,6 +2913,7 @@ dependencies = [
  "postcard",
  "redb",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sevenz-rust2",

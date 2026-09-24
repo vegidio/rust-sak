@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Reads an HTTP request from `stream` up to the blank line terminating the headers, returning the raw text.
-pub(super) async fn read_request(stream: &mut TcpStream) -> String {
+pub(crate) async fn read_request(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
 
@@ -25,7 +25,7 @@ pub(super) async fn read_request(stream: &mut TcpStream) -> String {
 }
 
 /// Writes a minimal HTTP/1.1 response with the given status line, body, and a `Content-Length` header.
-pub(super) async fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
+pub(crate) async fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()

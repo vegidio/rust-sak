@@ -78,6 +78,30 @@ mod fs {
     }
 }
 
+#[cfg(feature = "github")]
+mod github {
+    use rust_sak::github::{GithubError, Release, get_latest_release, is_outdated_release};
+
+    #[test]
+    fn the_release_api_is_nameable() {
+        // Type-level only: awaiting these would reach the network.
+        drop(get_latest_release("owner", "repo"));
+        drop(is_outdated_release("owner", "repo", "1.0.0"));
+
+        let release = Release {
+            tag_name: "v1.2.0".into(),
+            name: None,
+            html_url: String::new(),
+            published_at: None,
+            prerelease: false,
+            draft: false,
+        };
+        assert_eq!(release.tag_name, "v1.2.0");
+
+        let _: fn(GithubError) -> String = |error| error.to_string();
+    }
+}
+
 #[cfg(feature = "image")]
 mod image {
     use rust_sak::image::{

@@ -87,6 +87,7 @@ jobs:
           - crypto
           - fetch
           - fs
+          - github
           - image
           - image-raw
           - memo

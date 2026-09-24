@@ -1,6 +1,6 @@
 //! `rust-sak` — a "Swiss Army Knife" of reusable Rust building blocks.
 //!
-//! The crate is organized into independent modules (e.g. [`fetch`], [`crypto`], [`fs`], [`image`], [`memo`],
+//! The crate is organized into independent modules (e.g. [`fetch`], [`crypto`], [`fs`], [`github`], [`image`], [`memo`],
 //! [`o11y`], [`sysinfo`]), each gated behind its own Cargo feature so consumers compile only what they need:
 //!
 //! ```toml
@@ -22,6 +22,8 @@ pub mod crypto;
 pub mod fetch;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(feature = "github")]
+pub mod github;
 #[cfg(feature = "image")]
 pub mod image;
 #[cfg(feature = "memo")]
