@@ -315,6 +315,21 @@ fn fields_recorded_later_become_attributes_and_an_error_field_fails_the_span() {
 }
 
 #[test]
+fn a_field_recorded_twice_on_an_exported_span_keeps_one_attribute_with_the_later_value() {
+    let capture = Capture::start(Level::Debug);
+
+    with_layer(layer(), || {
+        let span = ::tracing::info_span!("recorded twice", stage = "decode");
+        span.record("stage", "encode");
+    });
+
+    let span = only_span(&capture, "recorded twice");
+    let stages: Vec<_> = span.attributes.iter().filter(|(name, _)| name == "stage").collect();
+    assert_eq!(stages.len(), 1);
+    assert_eq!(field(&span.attributes, "stage"), Some(&Value::from("encode")));
+}
+
+#[test]
 fn an_error_field_given_at_creation_fails_the_span_even_when_mapped_out() {
     let capture = Capture::start(Level::Debug);
 

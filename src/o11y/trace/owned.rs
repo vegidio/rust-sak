@@ -109,9 +109,9 @@ impl OwnedSpan {
         self.inner.is_some()
     }
 
-    /// Attaches an attribute to the span.
+    /// Attaches an attribute to the span, replacing any earlier value under the same key.
     pub fn set_attribute(&self, key: impl Into<Cow<'static, str>>, value: impl Into<Value>) {
-        self.with_state(|state| state.attributes.push((key.into(), value.into())));
+        self.with_state(|state| state.set_attribute(key.into(), value.into()));
     }
 
     /// Records a point-in-time event on the span.

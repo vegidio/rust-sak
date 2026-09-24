@@ -32,9 +32,9 @@ pub fn current() -> Current {
 }
 
 impl Current {
-    /// Attaches an attribute to the open span.
+    /// Attaches an attribute to the open span, replacing any earlier value under the same key.
     pub fn set_attribute(&self, key: impl Into<Cow<'static, str>>, value: impl Into<Value>) {
-        context::with_current(|span| span.attributes.push((key.into(), value.into())));
+        context::with_current(|span| span.set_attribute(key.into(), value.into()));
     }
 
     /// Records a point-in-time event on the open span.

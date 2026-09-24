@@ -765,6 +765,32 @@ fn an_owned_span_is_send_and_sync() {
 }
 
 #[test]
+fn setting_an_attribute_twice_replaces_it_on_owned_and_guard_spans() {
+    let capture = Capture::start(Level::Debug);
+
+    let owned = trace::start(
+        "owned twice",
+        trace::Parent::Root,
+        vec![(Cow::Borrowed("stage"), Value::from("decode"))],
+    );
+    owned.set_attribute("stage", "encode");
+    owned.end();
+
+    {
+        let _guard = trace::span!("guard twice");
+        trace::current().set_attribute("stage", "decode");
+        trace::current().set_attribute("stage", "encode");
+    }
+
+    for name in ["owned twice", "guard twice"] {
+        let record = only_span(&capture, name);
+        let stages: Vec<_> = record.attributes.iter().filter(|(key, _)| key == "stage").collect();
+        assert_eq!(stages.len(), 1, "{name}");
+        assert_eq!(stages[0].1, Value::from("encode"), "{name}");
+    }
+}
+
+#[test]
 fn an_owned_root_span_starts_a_new_trace_even_inside_a_guard() {
     let capture = Capture::start(Level::Debug);
 

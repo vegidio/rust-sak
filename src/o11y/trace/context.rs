@@ -91,6 +91,15 @@ impl SpanState {
         }
     }
 
+    /// Sets attribute `key`, replacing the value already under it rather than adding a second: OTLP requires a span's
+    /// attribute keys to be unique.
+    pub(super) fn set_attribute(&mut self, key: Cow<'static, str>, value: Value) {
+        match self.attributes.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, slot)) => *slot = value,
+            None => self.attributes.push((key, value)),
+        }
+    }
+
     /// Records a point-in-time event.
     pub(super) fn add_event(&mut self, name: Cow<'static, str>, attributes: Fields) {
         self.events.push(SpanEvent {
