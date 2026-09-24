@@ -36,18 +36,10 @@ impl Span {
     #[doc(hidden)]
     pub fn __enter(name: impl Into<Cow<'static, str>>, attributes: Fields) -> Self {
         let (trace_id, parent_span_id) = context::inherit();
-        let span_id = super::super::ids::new_span_id();
+        let state = SpanState::open(trace_id, parent_span_id, name.into(), attributes);
+        let span_id = state.span_id;
 
-        context::push(SpanState {
-            trace_id,
-            span_id,
-            parent_span_id,
-            name: name.into(),
-            start_unix_nano: now_unix_nano(),
-            attributes,
-            events: Vec::new(),
-            enrichment: pipeline::attributes(),
-        });
+        context::push(state);
 
         Self { entered: Some(span_id) }
     }

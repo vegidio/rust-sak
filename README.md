@@ -24,18 +24,19 @@ The crate is a collection of independent modules, each gated behind its own Carg
 
 ## 🧩 Modules
 
-| Feature      | Module                             | What it does                                                                                                     | Async?          |
-|--------------|------------------------------------|------------------------------------------------------------------------------------------------------------------|-----------------|
-| `crypto`     | [`crypto`](src/crypto/README.md)   | SHA-256 and XXH3-64 hashing of bytes, strings and files; always lowercase hex                                    | no              |
-| `fetch`      | [`fetch`](src/fetch/README.md)     | Reusable `reqwest` client with Fibonacci-backoff retries and resumable streaming downloads with live progress    | **yes** (Tokio) |
-| `fs`         | [`fs`](src/fs/README.md)           | Filesystem helpers, RAII temp handles, and a hardened ZIP/7z/TAR.XZ extractor that treats every entry as hostile | no              |
-| `github`     | [`github`](src/github/README.md)   | Latest GitHub release of a repository, and whether a given version is older than it (semver comparison)          | **yes** (Tokio) |
-| `image`      | [`image`](src/image/README.md)     | Encode and decode 8 image formats behind one uniform API — bmp, gif, jpeg, png, tiff, avif, heif, webp           | no              |
-| `image-raw`  |                                    | Adds camera RAW/DNG decoding to `image` — dng, nef, cr2/cr3, arw, raf and ~20 more                               | no              |
-| `memo`       | [`memo`](src/memo/README.md)       | Memoization with pluggable storage: memory, disk, or memory-over-disk, with concurrent calls coalesced           | no              |
-| `memo-async` |                                    | Adds `Memo::get_or_compute_async` for computations that are themselves futures                                   | **yes** (Tokio) |
-| `o11y`       | [`o11y`](src/o11y/README.md)       | Logs, metrics and traces to an OpenTelemetry collector over OTLP, exported on a background thread                | no              |
-| `sysinfo`    | [`sysinfo`](src/sysinfo/README.md) | CPU, memory and GPU probes, asked through each platform's own interface — no subprocesses                        | no              |
+| Feature        | Module                             | What it does                                                                                                     | Async?          |
+|----------------|------------------------------------|------------------------------------------------------------------------------------------------------------------|-----------------|
+| `crypto`       | [`crypto`](src/crypto/README.md)   | SHA-256 and XXH3-64 hashing of bytes, strings and files; always lowercase hex                                    | no              |
+| `fetch`        | [`fetch`](src/fetch/README.md)     | Reusable `reqwest` client with Fibonacci-backoff retries and resumable streaming downloads with live progress    | **yes** (Tokio) |
+| `fs`           | [`fs`](src/fs/README.md)           | Filesystem helpers, RAII temp handles, and a hardened ZIP/7z/TAR.XZ extractor that treats every entry as hostile | no              |
+| `github`       | [`github`](src/github/README.md)   | Latest GitHub release of a repository, and whether a given version is older than it (semver comparison)          | **yes** (Tokio) |
+| `image`        | [`image`](src/image/README.md)     | Encode and decode 8 image formats behind one uniform API — bmp, gif, jpeg, png, tiff, avif, heif, webp           | no              |
+| `image-raw`    |                                    | Adds camera RAW/DNG decoding to `image` — dng, nef, cr2/cr3, arw, raf and ~20 more                               | no              |
+| `memo`         | [`memo`](src/memo/README.md)       | Memoization with pluggable storage: memory, disk, or memory-over-disk, with concurrent calls coalesced           | no              |
+| `memo-async`   |                                    | Adds `Memo::get_or_compute_async` for computations that are themselves futures                                   | **yes** (Tokio) |
+| `o11y`         | [`o11y`](src/o11y/README.md)       | Logs, metrics and traces to an OpenTelemetry collector over OTLP, exported on a background thread                | no              |
+| `o11y-tracing` |                                    | Adds a `tracing` layer that forwards events and spans to `o11y`, parented by `tracing`'s own span tree           | no              |
+| `sysinfo`      | [`sysinfo`](src/sysinfo/README.md) | CPU, memory and GPU probes, asked through each platform's own interface — no subprocesses                        | no              |
 
 Each module's README covers its API and guarantees in full; the same content is rendered in the [API documentation](https://docs.rs/rust-sak).
 

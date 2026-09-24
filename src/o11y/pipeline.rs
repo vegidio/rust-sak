@@ -12,6 +12,7 @@ use super::buffer::Buffer;
 use super::enrichment::{Attributes, Enrichment};
 use super::geolocation::fetch_geolocation_with;
 use super::record::{Fields, LogRecord, SpanRecord, now_unix_nano};
+use super::trace::SpanContext;
 use super::{Config, Level, O11yError, Result, Value, gate, worker};
 
 /// The installed pipeline, or nothing if telemetry was never started.
@@ -230,27 +231,41 @@ pub(super) fn flush() {
     }
 }
 
-/// Buffers a log record. Reached only when the level gate has already passed.
-pub(super) fn record_log(level: Level, message: String, fields: Fields) {
-    let Some(pipeline) = PIPELINE.get() else { return };
-
-    let (trace_id, span_id) = super::trace::current_ids().unzip();
-
-    let queued = pipeline.shared.logs.push(LogRecord {
+/// Buffers a log record, attached to `context` when there is one. Reached only when the level gate has already
+/// passed, or when a caller of [`log::emit`](super::log::emit) chose not to ask.
+pub(super) fn record_log(level: Level, message: String, fields: Fields, context: Option<SpanContext>) {
+    let (trace_id, span_id) = context.map(|context| (context.trace_id, context.span_id)).unzip();
+    let record = |enrichment| LogRecord {
         time_unix_nano: now_unix_nano(),
         level,
         body: message,
         fields,
-        enrichment: pipeline.shared.enrichment.attributes(),
+        enrichment,
         trace_id,
         span_id,
-    });
+    };
 
+    #[cfg(test)]
+    if let Some(capture) = super::test_support::capture() {
+        return capture.log(record(attributes()));
+    }
+
+    let Some(pipeline) = PIPELINE.get() else { return };
+
+    let queued = pipeline
+        .shared
+        .logs
+        .push(record(pipeline.shared.enrichment.attributes()));
     wake_if_batched(&pipeline.shared, queued);
 }
 
 /// Buffers a finished span.
 pub(super) fn record_span(record: SpanRecord) {
+    #[cfg(test)]
+    if let Some(capture) = super::test_support::capture() {
+        return capture.span(record);
+    }
+
     let Some(pipeline) = PIPELINE.get() else { return };
 
     let queued = pipeline.shared.spans.push(record);

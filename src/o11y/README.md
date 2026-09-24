@@ -126,6 +126,32 @@ use rust_sak::o11y::log;
 log::info!("request finished", "http.response.status_code" = 200);
 ```
 
+### Fields decided at runtime
+
+The macros fix their fields in source. When the level or the fields are only known at runtime — a record forwarded
+from another logging API, or assembled from configuration — call `log::emit` with a `log::Fields` instead:
+
+```rust
+use std::borrow::Cow;
+use rust_sak::o11y::{Level, Value, log};
+
+# let codec = "avif";
+# let threads = 8u32;
+if log::enabled(Level::Info) {
+    let fields: log::Fields = vec![
+        (Cow::Borrowed("codec"), Value::from(codec)),
+        (Cow::Borrowed("threads"), Value::from(threads)),
+    ];
+    log::emit(Level::Info, "encode.started", fields);
+}
+```
+
+`emit` **does not check the level gate** — ask `log::enabled` first, as the macros do, so a discarded record costs
+nothing to build. Like the macros, it attaches the record to the innermost span open on this thread.
+
+`log::emit_in(context, level, message, fields)` attaches the record to the span a `SpanContext` names instead, for a
+record whose span lives somewhere other than this thread's stack — see [Owned spans](#owned-spans).
+
 ## Metrics
 
 Instruments are created **once** and called many times. The intended shape is a `static` behind a `LazyLock`:
@@ -243,6 +269,148 @@ async { /* ... */ }
 # }
 ```
 
+### Owned spans
+
+A `span!` guard lives on the stack of the thread that opened it, which is what lets `trace::current()` and the log
+macros find it. Some spans cannot live there: one opened on a thread that hands its work to another, or one tracked
+by something that is not a scope. `trace::start` opens a span that belongs to the returned `OwnedSpan` instead, with
+its parent given explicitly:
+
+```rust
+use rust_sak::o11y::{Level, log, trace::{self, Parent}};
+
+let span = trace::start("encode", Parent::Current, Vec::new());
+let context = span.context();
+
+std::thread::spawn(move || {
+    span.set_attribute("codec", "avif");
+
+    if let Some(context) = context {
+        log::emit_in(context, Level::Info, "encoded on a worker", Vec::new());
+    }
+
+    span.end(); // or drop it
+})
+.join()
+.unwrap();
+```
+
+| `Parent`             | The span opens…                                                                 |
+|----------------------|---------------------------------------------------------------------------------|
+| `Parent::Current`    | under the innermost guard or `Instrumented` span on this thread, else as a root |
+| `Parent::Context(c)` | under the span `c` names, in its trace                                          |
+| `Parent::Root`       | as the root of a new trace                                                      |
+
+An `OwnedSpan` is `Send + Sync`: it can be annotated from any thread, and ends when `end` is called or it is dropped,
+wherever that happens. It lasts from `start` to that moment. When tracing is off it is a no-op, like `current()`, and
+a span still open at `shutdown` is discarded when it ends.
+
+> **An owned span is never "current".** It is not pushed onto any thread's stack, so `trace::current()`, the log
+> macros and a `span!` opened while it is live do not see it — a guard opened beside it starts a trace of its own.
+> That is deliberate: making it current on one thread for a while is the thread-bound behaviour it exists to avoid.
+> To put a record or a child span under it, pass its `context()` to `log::emit_in` or `Parent::Context`.
+
+### Span contexts and `traceparent`
+
+`SpanContext` is a span's identity — a 16-byte trace id and an 8-byte span id — and is what crosses a boundary the
+stack cannot. `trace::current().context()` and `OwnedSpan::context()` produce one; `trace_id_hex()` and
+`span_id_hex()` render it, and it travels between processes as a W3C `traceparent` header:
+
+```rust
+use rust_sak::o11y::trace::{self, Parent, SpanContext};
+
+// A frontend, or another service, started the trace and passed its span along.
+let header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+if let Some(parent) = SpanContext::from_traceparent(header) {
+    let _span = trace::start("handle_request", Parent::Context(parent), Vec::new());
+    // ...
+}
+```
+
+`to_traceparent()` always writes version `00` with the sampled flag, since nothing is sampled out.
+`from_traceparent` follows the specification's rules for a receiver: it accepts any version but the reserved `ff`,
+skipping fields a later version appends; it requires lowercase hex of exactly the right lengths; it refuses an
+all-zero id; and it ignores the flags. Anything else is `None`.
+
+### Links and failure
+
+`OwnedSpan::add_link(context)` records a span this one is causally related to without being its child — the build
+several requests waited on, say. Links export as the span's OTLP `links`.
+
+`set_error(&error)`, on an `OwnedSpan` or on `trace::current()`, records an `exception` event carrying the error's
+`Display` form **and** marks the span failed, which exports as `status: { code: 2, message }`. The status is what a
+trace backend reads as "this span failed"; the event is where it keeps the reason. A span that neither failed nor
+was linked exports exactly as it did before either existed.
+
+> **Behaviour change.** `trace::current().set_error` used to record only the `exception` event. It now sets the
+> error status as well, so a span it is called on shows as failed.
+
+## Bridging `tracing`
+
+A program that already logs through `tracing` gets this module's exporter from one layer on its subscriber — no
+second set of calls. The layer is behind its own feature, so an `o11y` user who does not use `tracing` compiles none
+of it:
+
+```toml
+[dependencies]
+rust-sak = { git = "https://github.com/vegidio/rust-sak", features = ["o11y-tracing"] }
+```
+
+```rust,no_run
+# // Compiled only with the feature, since this README is also the `o11y` module's documentation.
+# #[cfg(feature = "o11y-tracing")]
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+use rust_sak::o11y::{self, Config, NO_HEADERS};
+use tracing_subscriber::layer::SubscriberExt;
+
+o11y::init(Config::builder("https://collector.example.com", NO_HEADERS).service_name("my-app").build())?;
+
+let layer = o11y::tracing::layer()
+    // Rewrite or drop a field before it leaves the process.
+    .map_field(|name, value| if name.ends_with("path") { None } else { Some(value) })
+    // Fold context-only spans into their events instead of exporting them.
+    .fold_spans(|metadata| metadata.target() == "ort");
+
+tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))?;
+# Ok(())
+# }
+```
+
+Parentage comes from `tracing`'s own span tree, not from whichever thread emits: a `tracing` span created on one
+thread, entered on a second and closed on a third exports once, under the parent `tracing` gave it. **What reaches the
+layer is the consumer's choice**, made with a per-layer filter the same way as for any other layer, so the Grafana
+side of a subscriber can have a different floor from the file side.
+
+The two hooks:
+
+- **`map_field(|name, value| -> Option<Value>)`** sees every field of every event and span, and returns what to send
+  or `None` to send nothing. A hook that panics drops the field it panicked on. A span whose `error` field is mapped
+  out is still marked failed, with an empty message.
+- **`fold_spans(|metadata| -> bool)`** picks spans that are not exported. A folded span's fields are copied onto the
+  events inside it, the innermost value winning when two share a key, and its children are parented to the nearest
+  exported span above it. It is for a span that only carries context — `ort` wraps every ONNX Runtime diagnostic in
+  one, which would otherwise become a zero-length span per record. A hook that panics exports the span.
+
+| `tracing`                               | `o11y`                                                                               |
+|-----------------------------------------|--------------------------------------------------------------------------------------|
+| `ERROR` / `WARN` / `INFO`               | `Error` / `Warn` / `Info`                                                            |
+| `DEBUG`, `TRACE`                        | `Debug` — `o11y` has nothing finer                                                   |
+| an event's `message`                    | the log body; an event with none uses its callsite name                              |
+| an event's other fields                 | log fields, plus `target`, the event's target                                        |
+| `i64` / `u64` / `f64` / `bool` / `&str` | the matching `Value`; a `u64` above `i64::MAX`, and a `Debug` value, a string        |
+| an event's parent span                  | the nearest exported span up its tree (`emit_in`), else this thread's stack (`emit`) |
+| a new span                              | `trace::start` under the nearest exported ancestor, else `Parent::Current`           |
+| a span's recorded fields                | attributes; a field named `error` also marks the span failed                         |
+| `follows_from`                          | a link                                                                               |
+| an `ERROR` event inside a span          | marks the nearest exported span failed, with the event's message                     |
+| a span closing                          | the span ending — it lasts from creation to close, not only its busy time            |
+
+Two rules hold throughout. **It is gated**: every hook asks `log::enabled` or `trace::enabled` first, so before `init`
+and after `shutdown` the layer costs one atomic load and records nothing. **It never panics**: it may run inside a C
+library's logging callback, under frames that cannot unwind, so the consumer's hooks and every hook as a whole run
+behind `catch_unwind`, and its own code contains no `unwrap`, `expect` or indexing.
+
 ## Enrichment and privacy
 
 Every batch carries these, as OTLP **resource** attributes — they are identical on every record, so sending them
@@ -318,18 +486,4 @@ o11y::init(
 )?;
 # Ok(())
 # }
-```
-
-### Fields assembled at runtime
-
-```rust
-use std::borrow::Cow;
-use rust_sak::o11y::{Value, log};
-
-let mut fields: Vec<(Cow<'static, str>, Value)> = Vec::new();
-fields.push((Cow::Borrowed("codec"), "avif".into()));
-fields.push((Cow::Borrowed("threads"), 8u32.into()));
-
-// The macros cover the call-site case; a set built at runtime is what naming `Value` is for.
-log::info!("encode.started", count = fields.len());
 ```

@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
 use super::super::Value;
-use super::super::record::{Fields, SpanEvent, now_unix_nano};
-use super::context;
+use super::super::record::Fields;
+use super::{SpanContext, context};
 
 /// A handle to whichever span is open on this thread right now.
 ///
@@ -44,35 +44,34 @@ impl Current {
 
     /// Records a point-in-time event carrying its own fields.
     pub fn add_event_with(&self, name: impl Into<Cow<'static, str>>, attributes: Fields) {
-        context::with_current(|span| {
-            span.events.push(SpanEvent {
-                time_unix_nano: now_unix_nano(),
-                name: name.into(),
-                attributes,
-            });
-        });
+        context::with_current(|span| span.add_event(name.into(), attributes));
     }
 
-    /// Records `error` on the open span, as an `exception` event carrying its `Display` form.
+    /// Marks the open span as failed and records `error` on it, as an `exception` event carrying its `Display` form.
+    ///
+    /// The span exports with an error status (OTLP `status.code = 2`), which is how a trace backend tells a failed
+    /// unit of work from one that merely logged something.
     pub fn set_error<E: std::error::Error + ?Sized>(&self, error: &E) {
-        self.add_event_with(
-            "exception",
-            vec![(Cow::Borrowed("exception.message"), Value::String(error.to_string()))],
-        );
+        context::with_current(|span| span.set_error(error.to_string()));
     }
 
     /// Whether a span is open on this thread.
     pub fn is_recording(&self) -> bool {
-        context::current_ids().is_some()
+        context::current_context().is_some()
+    }
+
+    /// The open span's context, which is what carries it across a thread or process boundary.
+    pub fn context(&self) -> Option<SpanContext> {
+        context::current_context()
     }
 
     /// The open span's trace id, as lowercase hex.
     pub fn trace_id(&self) -> Option<String> {
-        context::current_ids().map(|(trace_id, _)| trace_id.to_hex())
+        context::current_context().map(|context| context.trace_id_hex())
     }
 
     /// The open span's own id, as lowercase hex.
     pub fn span_id(&self) -> Option<String> {
-        context::current_ids().map(|(_, span_id)| span_id.to_hex())
+        context::current_context().map(|context| context.span_id_hex())
     }
 }

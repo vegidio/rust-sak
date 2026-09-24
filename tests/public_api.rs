@@ -258,6 +258,41 @@ mod o11y {
 
         submit_to_processor("ord_8812", "hunter2").unwrap();
 
+        // The runtime emit, span contexts and owned spans: the paths a bridge from another logging API takes.
+        let fields: log::Fields = vec![(std::borrow::Cow::Borrowed("codec"), Value::from("avif"))];
+        let context = trace::SpanContext::from_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .expect("a well-formed traceparent");
+        assert_eq!(context.span_id_hex(), "00f067aa0ba902b7");
+        assert!(
+            trace::current().context().is_none(),
+            "disabled, so the `checkout` guard never opened"
+        );
+        assert!(!trace::enabled(), "telemetry was disabled");
+
+        log::emit(Level::Info, "encode.started", fields.clone());
+        log::emit_in(context, Level::Warn, "encode.slow", Vec::new());
+
+        let owned: trace::OwnedSpan = trace::start("encode", trace::Parent::Context(context), fields);
+        assert_eq!(
+            owned.context(),
+            None,
+            "a span started while tracing is off records nothing"
+        );
+        owned.set_attribute("threads", 8u32);
+        owned.add_event_with("tile.done", Vec::new());
+        owned.add_link(context);
+        owned.set_error(&std::fmt::Error);
+        owned.end();
+        drop(trace::start("root", trace::Parent::Root, Vec::new()));
+        drop(trace::start("current", trace::Parent::Current, Vec::new()));
+
+        #[cfg(feature = "o11y-tracing")]
+        {
+            let _layer: o11y::tracing::TracingLayer = o11y::tracing::layer()
+                .map_field(|_name, value| Some(value))
+                .fold_spans(|metadata| metadata.target() == "ort");
+        }
+
         o11y::renew_session();
         o11y::flush();
         o11y::shutdown();

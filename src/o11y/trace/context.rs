@@ -3,8 +3,9 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-use super::super::enrichment::Attributes;
-use super::super::record::{Fields, SpanEvent, SpanId, SpanRecord, TraceId};
+use super::super::Value;
+use super::super::record::{Fields, SpanEvent, SpanId, SpanRecord, Status, TraceId, now_unix_nano};
+use super::SpanContext;
 
 thread_local! {
     /// The spans open on this thread, innermost last.
@@ -35,11 +36,44 @@ pub(super) struct SpanState {
     pub(super) attributes: Fields,
     /// Point-in-time events recorded inside the span.
     pub(super) events: Vec<SpanEvent>,
+    /// Spans this one is causally related to without being their child.
+    pub(super) links: Vec<SpanContext>,
+    /// Whether the span's work failed.
+    pub(super) status: Status,
     /// The enrichment current when the span opened.
-    pub(super) enrichment: Attributes,
+    pub(super) enrichment: super::super::enrichment::Attributes,
 }
 
 impl SpanState {
+    /// Opens a span under `parent_span_id` in `trace_id`, with a fresh id, starting now.
+    pub(super) fn open(
+        trace_id: TraceId,
+        parent_span_id: Option<SpanId>,
+        name: Cow<'static, str>,
+        attributes: Fields,
+    ) -> Self {
+        Self {
+            trace_id,
+            span_id: super::super::ids::new_span_id(),
+            parent_span_id,
+            name,
+            start_unix_nano: now_unix_nano(),
+            attributes,
+            events: Vec::new(),
+            links: Vec::new(),
+            status: Status::Unset,
+            enrichment: super::super::pipeline::attributes(),
+        }
+    }
+
+    /// This span's context.
+    pub(super) fn context(&self) -> SpanContext {
+        SpanContext {
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+        }
+    }
+
     /// Closes the span, turning it into the record the exporter sends.
     pub(super) fn finish(self, end_unix_nano: u64) -> SpanRecord {
         SpanRecord {
@@ -51,16 +85,42 @@ impl SpanState {
             end_unix_nano,
             attributes: self.attributes,
             events: self.events,
+            links: self.links,
+            status: self.status,
             enrichment: self.enrichment,
         }
     }
+
+    /// Records a point-in-time event.
+    pub(super) fn add_event(&mut self, name: Cow<'static, str>, attributes: Fields) {
+        self.events.push(SpanEvent {
+            time_unix_nano: now_unix_nano(),
+            name,
+            attributes,
+        });
+    }
+
+    /// Marks the span failed with `message`, without recording an event.
+    pub(super) fn fail(&mut self, message: String) {
+        self.status = Status::Error(message);
+    }
+
+    /// Marks the span failed and records the `exception` event the OpenTelemetry conventions describe, carrying
+    /// `message`. The status is what a trace backend reads as "this span failed"; the event is where it keeps why.
+    pub(super) fn set_error(&mut self, message: String) {
+        self.add_event(
+            Cow::Borrowed("exception"),
+            vec![(Cow::Borrowed("exception.message"), Value::String(message.clone()))],
+        );
+        self.fail(message);
+    }
 }
 
-/// The trace and span ids of the innermost open span, if there is one.
+/// The context of the innermost open span, if there is one.
 ///
 /// This is what stamps a log record with the span it was emitted inside, giving a backend the link between the two.
-pub(in crate::o11y) fn current_ids() -> Option<(TraceId, SpanId)> {
-    STACK.with_borrow(|stack| stack.last().map(|span| (span.trace_id, span.span_id)))
+pub(in crate::o11y) fn current_context() -> Option<SpanContext> {
+    STACK.with_borrow(|stack| stack.last().map(SpanState::context))
 }
 
 /// The trace id and parent a span opened right now would inherit.

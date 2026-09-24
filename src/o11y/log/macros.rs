@@ -1,7 +1,7 @@
 //! The four log macros.
 //!
 //! All four share one body, [`__rust_sak_o11y_log`], and differ only in the [`Level`](crate::o11y::Level) they pass
-//! it; each public name is a one-line forwarder carrying its own documentation. Writing the gate and the `__emit`
+//! it; each public name is a one-line forwarder carrying its own documentation. Writing the gate and the [`emit`](super::emit)
 //! call once is what keeps a change to the emit shape from being a four-place edit.
 //!
 //! # Why the names are mangled
@@ -24,7 +24,7 @@
 macro_rules! __rust_sak_o11y_log {
     ($level:expr, $message:expr $(, $($fields:tt)*)?) => {
         if $crate::o11y::log::enabled($level) {
-            $crate::o11y::log::__emit(
+            $crate::o11y::log::emit(
                 $level,
                 $message,
                 $crate::__rust_sak_o11y_fields!($($($fields)*)?),

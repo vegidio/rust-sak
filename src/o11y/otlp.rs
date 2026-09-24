@@ -18,13 +18,16 @@ use serde_json::{Value as Json, json};
 use super::Value;
 use super::enrichment::Attributes;
 use super::metric::{MetricData, MetricSnapshot};
-use super::record::{LogRecord, SpanRecord};
+use super::record::{LogRecord, SpanRecord, Status};
 
 /// The instrumentation scope reported on every payload.
 const SCOPE_NAME: &str = "rust-sak/o11y";
 
 /// `SPAN_KIND_INTERNAL` — the only kind this module produces.
 const SPAN_KIND_INTERNAL: u8 = 1;
+
+/// `STATUS_CODE_ERROR` — the only status this module sets.
+const STATUS_CODE_ERROR: u8 = 2;
 
 /// `AGGREGATION_TEMPORALITY_CUMULATIVE`.
 ///
@@ -221,6 +224,20 @@ pub(super) fn traces(records: Vec<SpanRecord>, base: &[(Cow<'static, str>, Value
 
                     if let Some(parent) = record.parent_span_id {
                         encoded["parentSpanId"] = Json::String(parent.to_hex());
+                    }
+
+                    // Both omitted when there is nothing to say, so a span with neither encodes exactly as it did
+                    // before either existed.
+                    if !record.links.is_empty() {
+                        encoded["links"] = record
+                            .links
+                            .iter()
+                            .map(|link| json!({ "traceId": link.trace_id_hex(), "spanId": link.span_id_hex() }))
+                            .collect();
+                    }
+
+                    if let Status::Error(message) = &record.status {
+                        encoded["status"] = json!({ "code": STATUS_CODE_ERROR, "message": message });
                     }
 
                     encoded

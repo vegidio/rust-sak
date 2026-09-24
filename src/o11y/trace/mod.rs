@@ -38,11 +38,15 @@ mod context;
 mod current;
 mod instrumented;
 mod macros;
+mod owned;
 mod span;
+mod span_context;
 
 pub use current::{Current, current};
 pub use instrumented::{Instrument, Instrumented};
+pub use owned::{OwnedSpan, Parent, start};
 pub use span::Span;
+pub use span_context::SpanContext;
 
 /// Wraps a function body in a span named after the function, capturing its arguments as fields.
 ///
@@ -52,15 +56,18 @@ pub use o11y_macros::instrument;
 #[doc(inline)]
 pub use crate::__rust_sak_o11y_span as span;
 
-pub(in crate::o11y) use context::current_ids;
+pub(in crate::o11y) use context::current_context;
 
 #[cfg(test)]
 pub(in crate::o11y) use context::{current_span, depth};
 
-/// Whether spans are being recorded. Macro plumbing; not API.
-#[doc(hidden)]
+/// Whether spans are being recorded: `false` before [`init`](super::init), after [`shutdown`](super::shutdown), and
+/// when telemetry was disabled.
+///
+/// One relaxed atomic load. [`span!`] and [`start`] check it themselves; it is public for the caller that would
+/// otherwise do expensive work to build a span's fields only for the span to be discarded.
 #[inline]
-pub fn __enabled() -> bool {
+pub fn enabled() -> bool {
     super::gate::tracing_enabled()
 }
 

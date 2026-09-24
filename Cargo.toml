@@ -79,6 +79,9 @@ tar = { version = "0.4", optional = true }
 tempfile = { version = "3.27", optional = true }
 thiserror = { version = "2.0.20", optional = true }
 tokio = { version = "1.52.3", features = ["time", "rt-multi-thread", "macros", "fs", "io-util", "sync"], optional = true }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
+# `registry` is what names `LookupSpan` and span extensions, which is where the bridge keeps each span's state.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"], optional = true }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64", "alloc"], optional = true }
 uuid = { version = "1.26.0", default-features = false, features = ["v4"], optional = true }
 walkdir = { version = "2.5", optional = true }
@@ -152,6 +155,9 @@ o11y = [
     "dep:uuid",
     "reqwest/blocking",
 ]
+# The bridge from `tracing` into `o11y`, apart from `o11y` itself so a program that does not log through `tracing`
+# compiles none of it.
+o11y-tracing = ["o11y", "dep:tracing", "dep:tracing-subscriber"]
 # Built on `fetch`: the GitHub API is a plain JSON endpoint, so it reuses `Fetch::json` and its retries.
 github = ["fetch", "dep:semver", "dep:serde", "dep:thiserror"]
 sysinfo = ["dep:objc2-core-foundation", "dep:objc2-io-kit", "dep:sysinfo", "dep:thiserror", "dep:windows"]

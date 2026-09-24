@@ -56,6 +56,8 @@ mod worker;
 pub mod log;
 pub mod metric;
 pub mod trace;
+#[cfg(feature = "o11y-tracing")]
+pub mod tracing;
 
 #[cfg(test)]
 mod test_support;

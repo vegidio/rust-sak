@@ -7,9 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::Level;
 use super::Value;
 use super::enrichment::Attributes;
+use super::trace::SpanContext;
 
-/// A set of key/value pairs attached to a record, a span or a span event.
-pub(super) type Fields = Vec<(Cow<'static, str>, Value)>;
+/// A set of key/value pairs attached to a log record, a span or a span event, in the order they were written.
+///
+/// Public, at [`log::Fields`](super::log::Fields), for the caller that assembles fields at runtime rather than writing
+/// them at a macro call site.
+pub type Fields = Vec<(Cow<'static, str>, Value)>;
 
 /// Wall-clock nanoseconds since the Unix epoch, which is the only timestamp OTLP accepts.
 ///
@@ -82,8 +86,25 @@ pub(super) struct SpanRecord {
     pub(super) attributes: Fields,
     /// Point-in-time events recorded inside the span.
     pub(super) events: Vec<SpanEvent>,
+    /// Other spans this one is causally related to without being their child.
+    pub(super) links: Vec<SpanContext>,
+    /// Whether the span's work failed.
+    pub(super) status: Status,
     /// The enrichment current when the span opened.
     pub(super) enrichment: Attributes,
+}
+
+/// A span's outcome, as far as a trace backend is concerned.
+///
+/// Only failure is ever set. OTLP's third state, `Ok`, means "a person has checked this and it is fine", which no
+/// instrumentation can say on its own; an unset status is what a successful span normally carries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) enum Status {
+    /// Nothing was said about the outcome. Encoded as no `status` at all.
+    #[default]
+    Unset,
+    /// The work failed, for the reason given.
+    Error(String),
 }
 
 /// A point-in-time event recorded on a span.

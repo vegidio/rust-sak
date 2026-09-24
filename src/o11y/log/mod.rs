@@ -33,12 +33,13 @@
 
 mod macros;
 
-// Only `enabled` is re-exported: the log macros name it, and expansion happens in the caller's crate, so it has
-// to be reachable at this path. `Level` is deliberately not re-exported here — it already lives at `o11y::Level`,
-// and a second public path for one type is a second thing for the docs and `tests/public_api.rs` to track.
+// `Level` is deliberately not re-exported here — it already lives at `o11y::Level`, and a second public path for one
+// type is a second thing for the docs and `tests/public_api.rs` to track.
 pub use super::gate::enabled;
+pub use super::record::Fields;
 
 use super::level::Level;
+use super::trace::SpanContext;
 
 #[doc(inline)]
 pub use crate::__rust_sak_o11y_debug as debug;
@@ -49,10 +50,48 @@ pub use crate::__rust_sak_o11y_info as info;
 #[doc(inline)]
 pub use crate::__rust_sak_o11y_warn as warn;
 
-/// Hands a record to the buffer. Macro plumbing; not API.
+/// Records a message whose level and fields are decided at runtime.
 ///
-/// The level has already been checked by the macro, so this is only reached for a record that will be kept.
-#[doc(hidden)]
-pub fn __emit(level: Level, message: impl Into<String>, fields: super::record::Fields) {
-    super::pipeline::record_log(level, message.into(), fields);
+/// The macros are the call-site form of this function; `emit` is for the caller that cannot name its fields in
+/// source — a bridge from another logging API, or a record assembled from configuration. Like the macros, it
+/// attaches the record to the innermost span open on this thread, if there is one.
+///
+/// **It does not check the level gate**, so a caller that builds its fields at any cost should ask [`enabled`] first,
+/// the way the macros do. A record emitted while the gate is shut, or before [`init`](super::init), is discarded.
+///
+/// ```
+/// use std::borrow::Cow;
+/// use rust_sak::o11y::{Level, Value, log};
+///
+/// # let codec = "avif";
+/// if log::enabled(Level::Info) {
+///     let fields: log::Fields = vec![(Cow::Borrowed("codec"), Value::from(codec))];
+///     log::emit(Level::Info, "encode.started", fields);
+/// }
+/// ```
+pub fn emit(level: Level, message: impl Into<String>, fields: Fields) {
+    super::pipeline::record_log(level, message.into(), fields, super::trace::current_context());
+}
+
+/// Records a message attached to the span `context` names, rather than to whatever is open on this thread.
+///
+/// For a record whose span is known some other way than the thread's own stack: a worker thread doing work for a
+/// span opened elsewhere, or a bridge that tracks spans itself. As with [`emit`], checking [`enabled`] first is the
+/// caller's job.
+///
+/// ```
+/// use rust_sak::o11y::{Level, log, trace};
+///
+/// let _span = trace::span!("encode");
+///
+/// if let Some(context) = trace::current().context() {
+///     std::thread::spawn(move || {
+///         log::emit_in(context, Level::Info, "encoded on a worker", Vec::new());
+///     })
+///     .join()
+///     .unwrap();
+/// }
+/// ```
+pub fn emit_in(context: SpanContext, level: Level, message: impl Into<String>, fields: Fields) {
+    super::pipeline::record_log(level, message.into(), fields, Some(context));
 }

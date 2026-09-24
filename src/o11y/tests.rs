@@ -7,7 +7,8 @@ use super::buffer::Buffer;
 use super::enrichment::Enrichment;
 use super::record::{LogRecord, SpanId, TraceId, now_unix_nano};
 use super::test_support::{
-    captured_at_least, global_lock, spawn_counting_server, spawn_json_server, spawn_recording_collector, wait_until,
+    Capture, captured_at_least, global_lock, spawn_counting_server, spawn_json_server, spawn_recording_collector,
+    wait_until,
 };
 use super::trace::Span;
 use super::*;
@@ -57,6 +58,8 @@ fn span_record(name: &'static str) -> record::SpanRecord {
         end_unix_nano: now_unix_nano(),
         attributes: Vec::new(),
         events: Vec::new(),
+        links: Vec::new(),
+        status: record::Status::Unset,
         enrichment: Arc::new(Vec::new()),
     }
 }
@@ -252,6 +255,93 @@ fn a_counter_is_reported_as_a_cumulative_monotonic_sum() {
     assert_eq!(sum["dataPoints"][0]["asInt"], "3");
 }
 
+/// A span with every property that existed before links and status did, at fixed times, for the encoding tests.
+fn span_with_every_older_property() -> record::SpanRecord {
+    let mut record = span_record("golden");
+    record.parent_span_id = Some(SpanId([3; 8]));
+    record.start_unix_nano = 1_758_412_800_000_000_000;
+    record.end_unix_nano = 1_758_412_800_500_000_000;
+    record.attributes = vec![(Cow::Borrowed("order_id"), Value::from("ord_8812"))];
+    record.events = vec![record::SpanEvent {
+        time_unix_nano: 1_758_412_800_250_000_000,
+        name: Cow::Borrowed("submitted"),
+        attributes: vec![(Cow::Borrowed("attempt"), Value::from(2))],
+    }];
+
+    record
+}
+
+#[test]
+fn a_span_with_no_links_and_no_status_encodes_as_it_did_before_either_existed() {
+    // Captured from the encoder at `26.9.8`, before links and status were added. Only the scope version moves with
+    // each release.
+    let expected = format!(
+        concat!(
+            r#"{{"resourceSpans":[{{"resource":{{"attributes":[]}},"scopeSpans":[{{"scope":{{"name":"rust-sak/o11y","#,
+            r#""version":"{version}"}},"spans":[{{"attributes":[{{"key":"order_id","value":{{"stringValue":"#,
+            r#""ord_8812"}}}}],"endTimeUnixNano":"1758412800500000000","events":[{{"attributes":[{{"key":"attempt","#,
+            r#""value":{{"intValue":"2"}}}}],"name":"submitted","timeUnixNano":"1758412800250000000"}}],"kind":1,"#,
+            r#""name":"golden","parentSpanId":"0303030303030303","spanId":"0202020202020202","#,
+            r#""startTimeUnixNano":"1758412800000000000","traceId":"01010101010101010101010101010101"}}]}}]}}]}}"#,
+        ),
+        version = env!("CARGO_PKG_VERSION"),
+    );
+
+    let encoded = serde_json::to_string(&otlp::traces(vec![span_with_every_older_property()], &[])).unwrap();
+
+    assert_eq!(encoded, expected);
+}
+
+#[test]
+fn a_linked_failed_span_encodes_its_links_and_an_error_status() {
+    let first = trace::SpanContext::from_traceparent(TRACEPARENT).unwrap();
+    let second =
+        trace::SpanContext::from_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01").unwrap();
+
+    let mut record = span_with_every_older_property();
+    record.links = vec![first, second];
+    record.status = record::Status::Error("model build failed".to_string());
+
+    let payload = otlp::traces(vec![record], &[]);
+    let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+
+    assert_eq!(
+        span["links"],
+        serde_json::json!([
+            { "traceId": "4bf92f3577b34da6a3ce929d0e0e4736", "spanId": "00f067aa0ba902b7" },
+            { "traceId": "0af7651916cd43dd8448eb211c80319c", "spanId": "b7ad6b7169203331" },
+        ])
+    );
+    assert_eq!(
+        span["status"],
+        serde_json::json!({ "code": 2, "message": "model build failed" }),
+        "2 is ERROR"
+    );
+}
+
+#[test]
+fn set_error_on_the_current_span_sets_its_status_as_well_as_the_event() {
+    let capture = Capture::start(Level::Debug);
+
+    {
+        let _span = trace::span!("failing guard");
+        trace::current().set_error(&O11yError::AlreadyInitialized);
+    }
+
+    let spans = capture.spans_named("failing guard");
+    let [span] = spans.as_slice() else {
+        panic!("expected one span, got {}", spans.len())
+    };
+    let message = O11yError::AlreadyInitialized.to_string();
+
+    assert_eq!(span.status, record::Status::Error(message.clone()));
+    assert_eq!(span.events[0].name, "exception", "the event is still recorded");
+    assert_eq!(
+        span.events[0].attributes,
+        vec![(Cow::Borrowed("exception.message"), Value::String(message))]
+    );
+}
+
 #[test]
 fn every_value_variant_maps_onto_an_otlp_any_value() {
     let mut record = log_record("everything");
@@ -379,6 +469,78 @@ fn nothing_passes_the_gate_before_init() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// The runtime emit
+// ---------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn emit_attaches_its_record_to_the_open_guard_span() {
+    let capture = Capture::start(Level::Debug);
+
+    let span = trace::span!("emit guard");
+    let context = trace::current().context().unwrap();
+    log::emit(
+        Level::Warn,
+        "emitted inside",
+        vec![(Cow::Borrowed("attempt"), Value::from(2))],
+    );
+    drop(span);
+
+    log::emit(Level::Info, "emitted outside", Vec::new());
+
+    let inside = capture.log_named("emitted inside");
+    assert_eq!(inside.level, Level::Warn);
+    assert_eq!(inside.fields, vec![(Cow::Borrowed("attempt"), Value::Int(2))]);
+    assert_eq!(inside.trace_id, Some(context.trace_id));
+    assert_eq!(inside.span_id, Some(context.span_id));
+
+    let outside = capture.log_named("emitted outside");
+    assert_eq!(outside.trace_id, None);
+    assert_eq!(outside.span_id, None);
+}
+
+#[test]
+fn emit_in_stamps_the_given_context_rather_than_the_thread_stack() {
+    let capture = Capture::start(Level::Debug);
+    let given = trace::SpanContext::from_traceparent(TRACEPARENT).unwrap();
+
+    let _span = trace::span!("emit_in guard");
+    let stack = trace::current().context().unwrap();
+    log::emit_in(given, Level::Error, "emitted elsewhere", Vec::new());
+
+    let record = capture.log_named("emitted elsewhere");
+    assert_eq!(record.trace_id, Some(given.trace_id));
+    assert_eq!(record.span_id, Some(given.span_id));
+    assert_ne!(
+        record.span_id,
+        Some(stack.span_id),
+        "the open guard span is not the one it was given"
+    );
+}
+
+#[test]
+fn the_log_macros_emit_through_the_same_path() {
+    let capture = Capture::start(Level::Debug);
+
+    log::info!("via the macro", order_id = "ord_8812");
+
+    let record = capture.log_named("via the macro");
+    assert_eq!(record.level, Level::Info);
+    assert_eq!(
+        record.fields,
+        vec![(Cow::Borrowed("order_id"), Value::from("ord_8812"))]
+    );
+}
+
+#[test]
+fn the_trace_gate_follows_init_and_shutdown() {
+    let capture = Capture::start(Level::Info);
+    assert!(trace::enabled());
+
+    capture.close_gates();
+    assert!(!trace::enabled());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Spans
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -479,6 +641,279 @@ fn a_disabled_span_records_nothing_and_never_touches_the_stack() {
 
     drop(span);
     assert_eq!(trace::depth(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Span contexts and `traceparent`
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A well-formed version-00 header, as the W3C specification's own example writes it.
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+#[test]
+fn a_traceparent_round_trips_through_a_span_context() {
+    let context = trace::SpanContext::from_traceparent(TRACEPARENT).unwrap();
+
+    assert_eq!(context.trace_id_hex(), "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(context.span_id_hex(), "00f067aa0ba902b7");
+    assert_eq!(context.span_id(), [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
+    assert_eq!(context.to_traceparent(), TRACEPARENT);
+
+    // Generated ids survive the trip too, not only a hand-picked one.
+    let span = Span::__enter("round trip", Vec::new());
+    let generated = trace::current().context().unwrap();
+    drop(span);
+
+    assert_eq!(
+        trace::SpanContext::from_traceparent(&generated.to_traceparent()),
+        Some(generated)
+    );
+}
+
+#[test]
+fn a_traceparent_ignores_its_flags() {
+    let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+
+    assert_eq!(
+        trace::SpanContext::from_traceparent(unsampled),
+        trace::SpanContext::from_traceparent(TRACEPARENT),
+    );
+}
+
+#[test]
+fn a_malformed_traceparent_is_refused() {
+    let refused = [
+        // All-zero ids are reserved as invalid.
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        // Wrong lengths, in each field.
+        "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e47360-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b-01",
+        "0-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+        "",
+        // Not hex, and not lowercase hex, which is all the specification allows.
+        "00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+        // Version ff is reserved as invalid.
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        // Version 00 has exactly four fields.
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+    ];
+
+    for header in refused {
+        assert_eq!(
+            trace::SpanContext::from_traceparent(header),
+            None,
+            "accepted {header:?}"
+        );
+    }
+}
+
+#[test]
+fn a_traceparent_from_a_later_version_is_accepted() {
+    // A receiver that only knows version 00 must still read a later one, skipping any fields it appends.
+    let later = "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-the-future-holds";
+    let context = trace::SpanContext::from_traceparent(later).unwrap();
+
+    assert_eq!(context.trace_id_hex(), "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(
+        context.to_traceparent(),
+        TRACEPARENT,
+        "and it is always written back as version 00"
+    );
+}
+
+#[test]
+fn the_current_context_is_the_innermost_open_span() {
+    assert_eq!(trace::current().context(), None, "no span is open");
+
+    let outer = Span::__enter("outer context", Vec::new());
+    let inner = Span::__enter("inner context", Vec::new());
+    let context = trace::current().context().unwrap();
+
+    assert_eq!(Some(context.trace_id_hex()), trace::current().trace_id());
+    assert_eq!(Some(context.span_id_hex()), trace::current().span_id());
+
+    drop(inner);
+    assert_ne!(trace::current().context(), Some(context));
+
+    drop(outer);
+    assert_eq!(trace::current().context(), None);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Owned spans
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The one captured span named `name`.
+fn only_span(capture: &Capture, name: &str) -> record::SpanRecord {
+    let mut spans = capture.spans_named(name);
+    assert_eq!(spans.len(), 1, "expected exactly one span {name:?}");
+
+    spans.remove(0)
+}
+
+#[test]
+fn an_owned_span_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<trace::OwnedSpan>();
+}
+
+#[test]
+fn an_owned_root_span_starts_a_new_trace_even_inside_a_guard() {
+    let capture = Capture::start(Level::Debug);
+
+    let guard = trace::span!("guard around root");
+    let guard_context = trace::current().context().unwrap();
+    let owned = trace::start("owned root", trace::Parent::Root, Vec::new());
+    let owned_context = owned.context().unwrap();
+    owned.end();
+    drop(guard);
+
+    let record = only_span(&capture, "owned root");
+    assert_eq!(record.parent_span_id, None);
+    assert_ne!(record.trace_id, guard_context.trace_id);
+    assert_eq!(record.trace_id, owned_context.trace_id);
+    assert_eq!(record.span_id, owned_context.span_id);
+}
+
+#[test]
+fn an_owned_span_under_a_context_joins_that_trace() {
+    let capture = Capture::start(Level::Debug);
+    let parent = trace::SpanContext::from_traceparent(TRACEPARENT).unwrap();
+
+    trace::start("owned child", trace::Parent::Context(parent), Vec::new()).end();
+
+    let record = only_span(&capture, "owned child");
+    assert_eq!(record.trace_id, parent.trace_id);
+    assert_eq!(record.parent_span_id, Some(parent.span_id));
+}
+
+#[test]
+fn an_owned_span_under_current_nests_inside_the_open_guard() {
+    let capture = Capture::start(Level::Debug);
+
+    let guard = trace::span!("guard around current");
+    let guard_context = trace::current().context().unwrap();
+    trace::start(
+        "owned under current",
+        trace::Parent::Current,
+        vec![(Cow::Borrowed("a"), Value::from(1))],
+    )
+    .end();
+    drop(guard);
+
+    // With nothing open, `Current` is a new root.
+    trace::start("owned under nothing", trace::Parent::Current, Vec::new()).end();
+
+    let nested = only_span(&capture, "owned under current");
+    assert_eq!(nested.trace_id, guard_context.trace_id);
+    assert_eq!(nested.parent_span_id, Some(guard_context.span_id));
+    assert_eq!(nested.attributes, vec![(Cow::Borrowed("a"), Value::Int(1))]);
+
+    let root = only_span(&capture, "owned under nothing");
+    assert_eq!(root.parent_span_id, None);
+    assert_ne!(root.trace_id, guard_context.trace_id);
+}
+
+#[test]
+fn an_owned_span_can_end_on_another_thread() {
+    let capture = Capture::start(Level::Debug);
+    let linked = trace::SpanContext::from_traceparent(TRACEPARENT).unwrap();
+
+    let span = trace::start("crosses threads", trace::Parent::Root, Vec::new());
+    let context = span.context().unwrap();
+    span.set_attribute("started_on", "main");
+
+    std::thread::spawn(move || {
+        span.set_attribute("ended_on", "worker");
+        span.add_event("handed over");
+        span.add_link(linked);
+        span.set_error(&O11yError::AlreadyInitialized);
+        span.end();
+    })
+    .join()
+    .unwrap();
+
+    let record = only_span(&capture, "crosses threads");
+    assert_eq!(record.span_id, context.span_id);
+    assert_eq!(
+        record.attributes,
+        vec![
+            (Cow::Borrowed("started_on"), Value::from("main")),
+            (Cow::Borrowed("ended_on"), Value::from("worker")),
+        ]
+    );
+    assert_eq!(record.events[0].name, "handed over");
+    assert_eq!(record.events[1].name, "exception");
+    assert_eq!(record.links, vec![linked]);
+    assert_eq!(
+        record.status,
+        record::Status::Error(O11yError::AlreadyInitialized.to_string())
+    );
+    assert!(record.end_unix_nano >= record.start_unix_nano);
+}
+
+#[test]
+fn an_owned_span_started_while_tracing_is_off_is_a_silent_no_op() {
+    let capture = Capture::start(Level::Debug);
+    capture.close_gates();
+
+    let span = trace::start("never recorded", trace::Parent::Root, Vec::new());
+
+    assert!(!span.is_recording());
+    assert_eq!(span.context(), None);
+
+    span.set_attribute("ignored", true);
+    span.add_event("ignored");
+    span.add_link(trace::SpanContext::from_traceparent(TRACEPARENT).unwrap());
+    span.set_error(&O11yError::AlreadyInitialized);
+    span.end();
+
+    assert!(capture.spans_named("never recorded").is_empty());
+}
+
+#[test]
+fn an_owned_span_ended_after_shutdown_is_discarded() {
+    let capture = Capture::start(Level::Debug);
+
+    let span = trace::start("outlives shutdown", trace::Parent::Root, Vec::new());
+    assert!(span.is_recording());
+
+    capture.close_gates();
+    span.end();
+
+    assert!(capture.spans_named("outlives shutdown").is_empty());
+}
+
+#[test]
+fn a_guard_opened_while_an_owned_span_is_live_does_not_parent_to_it() {
+    let capture = Capture::start(Level::Debug);
+
+    let owned = trace::start("live owned", trace::Parent::Root, Vec::new());
+    let owned_context = owned.context().unwrap();
+
+    {
+        let _guard = trace::span!("guard beside owned");
+        assert_ne!(
+            trace::current().context(),
+            Some(owned_context),
+            "an owned span is never current"
+        );
+    }
+    owned.end();
+
+    let guard = only_span(&capture, "guard beside owned");
+    assert_eq!(
+        guard.parent_span_id, None,
+        "the owned span is not on the stack for the guard to inherit"
+    );
+    assert_ne!(guard.trace_id, owned_context.trace_id);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

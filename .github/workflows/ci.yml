@@ -93,6 +93,7 @@ jobs:
           - memo
           - memo-async
           - o11y
+          - o11y-tracing
           - sysinfo
     steps:
       - uses: actions/checkout@v7
