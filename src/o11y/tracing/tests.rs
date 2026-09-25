@@ -11,8 +11,9 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::super::record::{LogRecord, SpanRecord, Status};
 use super::super::test_support::Capture;
+use super::super::trace::SpanContext;
 use super::super::{Level, Value, trace};
-use super::{TracingLayer, layer};
+use super::{TracingLayer, layer, remote_parent, with_parent};
 
 /// A dispatcher with `layer` as its only layer.
 fn dispatch(layer: TracingLayer) -> Dispatch {
@@ -415,6 +416,152 @@ fn a_span_created_entered_and_closed_on_three_threads_exports_once_with_its_pare
     assert_eq!(span.links[0].trace_id, cause.trace_id);
     assert_eq!(span.links[0].span_id, cause.span_id);
     assert!(is_inside(&capture.log_named("emitted on the second thread"), &span));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Remote parents
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A context as a frontend would send it.
+fn remote(header: &str) -> SpanContext {
+    SpanContext::from_traceparent(header).unwrap()
+}
+
+const WINDOW: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+const OUTER_WINDOW: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+#[test]
+fn a_span_opened_inside_with_parent_continues_the_remote_trace_under_its_span() {
+    let capture = Capture::start(Level::Debug);
+    let context = remote(WINDOW);
+
+    with_layer(layer(), || {
+        with_parent(context, || ::tracing::info_span!("remote child")).in_scope(|| {});
+    });
+
+    let span = only_span(&capture, "remote child");
+    assert_eq!(span.trace_id, context.trace_id);
+    assert_eq!(span.parent_span_id, Some(context.span_id));
+}
+
+#[test]
+fn an_exported_ancestor_wins_over_the_remote_context() {
+    let capture = Capture::start(Level::Debug);
+
+    with_layer(layer(), || {
+        ::tracing::info_span!("local ancestor").in_scope(|| {
+            with_parent(remote(WINDOW), || ::tracing::info_span!("locally parented")).in_scope(|| {});
+        });
+    });
+
+    let ancestor = only_span(&capture, "local ancestor");
+    let span = only_span(&capture, "locally parented");
+    assert_eq!(span.trace_id, ancestor.trace_id);
+    assert_eq!(span.parent_span_id, Some(ancestor.span_id));
+}
+
+#[test]
+fn the_remote_context_wins_over_an_open_o11y_guard() {
+    let capture = Capture::start(Level::Debug);
+    let context = remote(WINDOW);
+
+    with_layer(layer(), || {
+        let _guard = trace::span!("guard beside a remote parent");
+        with_parent(context, || ::tracing::info_span!("remote over guard")).in_scope(|| {});
+    });
+
+    let span = only_span(&capture, "remote over guard");
+    assert_eq!(span.trace_id, context.trace_id);
+    assert_eq!(span.parent_span_id, Some(context.span_id));
+}
+
+#[test]
+fn a_child_of_a_remotely_parented_span_inherits_the_remote_trace() {
+    let capture = Capture::start(Level::Debug);
+    let context = remote(WINDOW);
+
+    with_layer(layer(), || {
+        // The child opens after `with_parent` has returned, so only the span tree can carry it into the trace.
+        let parent = with_parent(context, || ::tracing::info_span!("remote parent"));
+        parent.in_scope(|| ::tracing::info_span!("remote grandchild").in_scope(|| {}));
+    });
+
+    let parent = only_span(&capture, "remote parent");
+    let child = only_span(&capture, "remote grandchild");
+    assert_eq!(child.trace_id, context.trace_id);
+    assert_eq!(child.parent_span_id, Some(parent.span_id));
+}
+
+#[test]
+fn nesting_restores_the_outer_context_and_leaving_clears_it() {
+    let capture = Capture::start(Level::Debug);
+    let outer = remote(OUTER_WINDOW);
+    let inner = remote(WINDOW);
+
+    with_layer(layer(), || {
+        with_parent(outer, || {
+            with_parent(inner, || assert_eq!(remote_parent(), Some(inner)));
+            ::tracing::info_span!("after the inner scope").in_scope(|| {});
+        });
+        assert_eq!(remote_parent(), None);
+        ::tracing::info_span!("after both scopes").in_scope(|| {});
+    });
+
+    let restored = only_span(&capture, "after the inner scope");
+    assert_eq!(restored.trace_id, outer.trace_id);
+    assert_eq!(restored.parent_span_id, Some(outer.span_id));
+
+    let cleared = only_span(&capture, "after both scopes");
+    assert_ne!(cleared.trace_id, outer.trace_id);
+    assert_eq!(cleared.parent_span_id, None);
+}
+
+#[test]
+fn a_panic_inside_with_parent_restores_the_outer_context() {
+    let _capture = Capture::start(Level::Debug);
+    let outer = remote(OUTER_WINDOW);
+
+    with_layer(layer(), || {
+        with_parent(outer, || {
+            let unwound = std::panic::catch_unwind(|| with_parent(remote(WINDOW), || panic!("inside with_parent")));
+            assert!(unwound.is_err());
+            assert_eq!(remote_parent(), Some(outer));
+        });
+        assert_eq!(remote_parent(), None);
+    });
+}
+
+#[test]
+fn an_event_inside_with_parent_is_routed_as_without_it() {
+    let capture = Capture::start(Level::Debug);
+
+    with_layer(layer(), || {
+        with_parent(remote(WINDOW), || {
+            ::tracing::info!("remote event outside any span");
+            ::tracing::info_span!("span around a remote event").in_scope(|| ::tracing::info!("remote event inside"));
+        });
+    });
+
+    let outside = capture.log_named("remote event outside any span");
+    assert_eq!(
+        outside.trace_id, None,
+        "a remote span is not one this process can emit into"
+    );
+    assert_eq!(outside.span_id, None);
+
+    let span = only_span(&capture, "span around a remote event");
+    assert!(is_inside(&capture.log_named("remote event inside"), &span));
+}
+
+#[test]
+fn with_tracing_off_with_parent_sets_nothing() {
+    let capture = Capture::start(Level::Debug);
+    capture.close_gates();
+
+    let seen = with_layer(layer(), || with_parent(remote(WINDOW), remote_parent));
+
+    assert_eq!(seen, None);
+    assert!(capture.spans().is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------------------------

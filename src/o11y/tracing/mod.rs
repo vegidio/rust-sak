@@ -23,6 +23,10 @@
 //! it belongs. Each `tracing` span that is exported holds an [`OwnedSpan`] in its extensions; each event is emitted
 //! with [`log::emit_in`] against the nearest one.
 //!
+//! A span with no exported ancestor is parented to this thread's `o11y` stack — unless it opens inside
+//! [`with_parent`], which hands it a context from outside the process, typically parsed from a `traceparent` header.
+//! The span then continues that trace, and its own children follow it through the span tree as usual.
+//!
 //! What reaches the layer is the consumer's choice, made with a per-layer filter, as it is for any other layer.
 //!
 //! # Rules the layer keeps
@@ -40,6 +44,7 @@
 mod tests;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -63,6 +68,13 @@ const TARGET_FIELD: &str = "target";
 /// `tracing`'s name for an event's formatted message.
 const MESSAGE_FIELD: &str = "message";
 
+thread_local! {
+    /// The remote context [`with_parent`] set on this thread, for the spans opened while it runs.
+    ///
+    /// `const`-initialised, so a thread that never calls [`with_parent`] pays nothing to read it.
+    static REMOTE_PARENT: Cell<Option<SpanContext>> = const { Cell::new(None) };
+}
+
 /// The hook [`TracingLayer::map_field`] installs.
 type MapField = dyn Fn(&str, Value) -> Option<Value> + Send + Sync;
 
@@ -77,6 +89,58 @@ pub fn layer() -> TracingLayer {
     }
 }
 
+/// Runs `open` so that a span the layer opens inside it, on this thread, with no exported `tracing` ancestor,
+/// continues `context`'s trace as a child of `context`'s span.
+///
+/// It is how a `tracing` span joins a trace started elsewhere — by a frontend, or another service — whose context
+/// arrived as a W3C `traceparent`:
+///
+/// ```
+/// use rust_sak::o11y::{self, trace::SpanContext};
+///
+/// # let header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+/// let span = match SpanContext::from_traceparent(header) {
+///     Some(context) => o11y::tracing::with_parent(context, || tracing::info_span!("request")),
+///     None => tracing::info_span!("request"),
+/// };
+/// ```
+///
+/// - **An exported ancestor still wins.** The context stands in for "nothing local above this span"; it does not
+///   re-parent a span that already has a local parent. It does win over this thread's `o11y` guard stack.
+/// - **Spans only.** An event emitted inside `open` is routed as it would be without it: a remote span is not one
+///   this process can emit into.
+/// - **Restored on exit**, including when `open` panics, so nesting restores the outer context and nothing is left
+///   behind for the thread's next span.
+/// - **Nothing is set while tracing is off.** `open` simply runs.
+pub fn with_parent<T>(context: SpanContext, open: impl FnOnce() -> T) -> T {
+    if !trace::enabled() {
+        return open();
+    }
+
+    // Unreachable only while the thread's locals are being destroyed, where running `open` unparented is the most
+    // the bridge can do.
+    let Ok(previous) = REMOTE_PARENT.try_with(|remote| remote.replace(Some(context))) else {
+        return open();
+    };
+
+    let _restore = Restore(previous);
+    open()
+}
+
+/// Puts back the remote context [`with_parent`] replaced, when it returns or unwinds.
+struct Restore(Option<SpanContext>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let _ = REMOTE_PARENT.try_with(|remote| remote.set(self.0));
+    }
+}
+
+/// The remote context [`with_parent`] set on this thread, if it is running.
+fn remote_parent() -> Option<SpanContext> {
+    REMOTE_PARENT.try_with(Cell::get).ok().flatten()
+}
+
 /// The `tracing_subscriber` layer that feeds `o11y`. Built by [`layer`], and configured by its two hooks.
 ///
 /// | `tracing`                                   | `o11y`                                                                  |
@@ -87,7 +151,8 @@ pub fn layer() -> TracingLayer {
 /// | an event's other fields                     | the record's fields, plus `target`, the event's target                  |
 /// | `i64`, `u64`, `f64`, `bool`, `&str`         | the matching [`Value`]; a `u64` above `i64::MAX`, and `Debug`, a string |
 /// | an event's parent span                      | the nearest exported span up its tree, else this thread's `o11y` stack  |
-/// | a new span                                  | [`trace::start`] under the nearest exported ancestor                    |
+/// | a new span                                  | [`trace::start`] under the nearest exported ancestor, else under the    |
+/// |                                             | context [`with_parent`] set, else under this thread's `o11y` stack      |
 /// | a span's recorded fields                    | its attributes; one named `error` also marks it failed                  |
 /// | `follows_from`                              | a link                                                                  |
 /// | an `ERROR` event inside a span              | marks the nearest exported span failed                                  |
@@ -207,6 +272,7 @@ impl TracingLayer {
         let parent = span
             .parent()
             .and_then(|parent| nearest_exported(&parent))
+            .or_else(remote_parent)
             .map_or(Parent::Current, Parent::Context);
 
         let owned = trace::start(span.name(), parent, fields);

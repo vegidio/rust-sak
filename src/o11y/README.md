@@ -420,6 +420,27 @@ thread, entered on a second and closed on a third exports once, under the parent
 layer is the consumer's choice**, made with a per-layer filter the same way as for any other layer, so the Grafana
 side of a subscriber can have a different floor from the file side.
 
+A span with no exported ancestor falls back to this thread's `o11y` stack. **To continue a trace started outside the
+process** — a frontend's, or another service's, arriving as a `traceparent` — open the span inside
+`o11y::tracing::with_parent`:
+
+```rust
+# #[cfg(feature = "o11y-tracing")]
+# fn handle(header: &str) {
+use rust_sak::o11y::{self, trace::SpanContext};
+
+let span = match SpanContext::from_traceparent(header) {
+    Some(context) => o11y::tracing::with_parent(context, || tracing::info_span!("request")),
+    None => tracing::info_span!("request"),
+};
+# }
+```
+
+A span opened inside it with no exported ancestor continues that trace, as a child of the span the context names, and
+its own children follow it through the span tree. An exported ancestor still wins: the context only stands in for
+"nothing local above". Events inside it are routed as before, since a remote span is not one this process can emit
+into. The context is restored when `with_parent` returns or unwinds, and while tracing is off nothing is set.
+
 The two hooks:
 
 - **`map_field(|name, value| -> Option<Value>)`** sees every field of every event and span, and returns what to send
@@ -438,7 +459,8 @@ The two hooks:
 | an event's other fields                 | log fields, plus `target`, the event's target                                        |
 | `i64` / `u64` / `f64` / `bool` / `&str` | the matching `Value`; a `u64` above `i64::MAX`, and a `Debug` value, a string        |
 | an event's parent span                  | the nearest exported span up its tree (`emit_in`), else this thread's stack (`emit`) |
-| a new span                              | `trace::start` under the nearest exported ancestor, else `Parent::Current`           |
+| a new span                              | `trace::start` under the nearest exported ancestor, else `with_parent`'s context,    |
+|                                         | else `Parent::Current`                                                               |
 | a span's recorded fields                | attributes; a field named `error` also marks the span failed                         |
 | `follows_from`                          | a link                                                                               |
 | an `ERROR` event inside a span          | marks the nearest exported span failed, with the event's message                     |
