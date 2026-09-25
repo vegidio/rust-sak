@@ -7,6 +7,7 @@ use tempfile::TempDir;
 
 use super::gpu_dxgi::{adapter_name, gpu_from_adapter, is_software_adapter};
 use super::gpu_ioreg::{data_string, gpu_from_properties, vendor_id_from_bytes, vram_from_megabytes};
+use super::gpu_nvml::{device_name, gpu_from_device, with_nvml_fallback};
 use super::gpu_sysfs::{
     gpu_from_card_dir, gpus_from_drm_dir, is_card_name, is_display_class, parse_class, parse_hex_id, parse_vram,
 };
@@ -644,6 +645,86 @@ fn gpu_from_properties_treats_zero_vram_as_unknown() {
 fn gpu_from_properties_drops_an_entry_with_no_model() {
     assert_eq!(gpu_from_properties(None, Some(0x106b), None), None);
     assert_eq!(gpu_from_properties(Some("   "), Some(0x106b), None), None);
+}
+
+// --- nvml tests ---
+
+/// Encodes a name the way `nvmlDeviceGetName` writes one: NUL-terminated, padded to the 96-byte buffer.
+fn nvml_name(name: &str) -> Vec<u8> {
+    let mut buffer = name.as_bytes().to_vec();
+    buffer.resize(96, 0);
+    buffer
+}
+
+#[test]
+fn device_name_stops_at_the_first_nul() {
+    let mut buffer = nvml_name("NVIDIA GeForce RTX 5090");
+    // The tail past the terminator is whatever the buffer held before the call.
+    buffer[80] = b'X';
+
+    assert_eq!(device_name(&buffer), "NVIDIA GeForce RTX 5090");
+}
+
+#[test]
+fn device_name_handles_an_unterminated_buffer() {
+    assert_eq!(device_name(b"NVIDIA RTX A6000"), "NVIDIA RTX A6000");
+}
+
+#[test]
+fn gpu_from_device_reports_an_nvidia_card_with_its_memory() {
+    let gpu = gpu_from_device("NVIDIA GeForce RTX 5090", Some(34_190_917_632)).unwrap();
+
+    assert_eq!(gpu.name, "NVIDIA GeForce RTX 5090");
+    assert_eq!(gpu.vendor.as_deref(), Some("NVIDIA"));
+    assert_eq!(gpu.memory, Some(34_190_917_632));
+}
+
+#[test]
+fn gpu_from_device_treats_zero_or_unread_memory_as_unknown() {
+    assert_eq!(gpu_from_device("NVIDIA T4", Some(0)).unwrap().memory, None);
+    assert_eq!(gpu_from_device("NVIDIA T4", None).unwrap().memory, None);
+}
+
+#[test]
+fn gpu_from_device_drops_a_device_with_no_name() {
+    assert_eq!(gpu_from_device("", Some(1)), None);
+    assert_eq!(gpu_from_device("   ", Some(1)), None);
+}
+
+#[test]
+fn the_nvml_fallback_is_used_when_sysfs_found_no_nvidia_card() {
+    // WSL2: sysfs lists nothing at all.
+    let nvml = gpu_from_device("NVIDIA GeForce RTX 5090", None).unwrap();
+    assert_eq!(
+        with_nvml_fallback(Vec::new(), || vec![nvml.clone()]),
+        vec![nvml.clone()]
+    );
+
+    // Headless without `nvidia-drm`: sysfs lists only the board's own display controller.
+    let bmc = GpuInfo {
+        name: "ASPEED Graphics Family".to_string(),
+        vendor: None,
+        memory: None,
+    };
+    assert_eq!(
+        with_nvml_fallback(vec![bmc.clone()], || vec![nvml.clone()]),
+        vec![bmc, nvml]
+    );
+}
+
+#[test]
+fn the_nvml_fallback_is_not_asked_when_sysfs_already_found_an_nvidia_card() {
+    let sysfs = vec![GpuInfo {
+        name: "GB202 [GeForce RTX 5090]".to_string(),
+        vendor: Some("NVIDIA".to_string()),
+        memory: None,
+    }];
+
+    let merged = with_nvml_fallback(sysfs.clone(), || {
+        panic!("NVML was loaded for a card sysfs already reported")
+    });
+
+    assert_eq!(merged, sysfs);
 }
 
 // --- gpu_info tests ---

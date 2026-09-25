@@ -43,6 +43,8 @@ mod gpu_info;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod gpu_ioreg;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod gpu_nvml;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod gpu_sysfs;
 mod memory;
 mod memory_info;

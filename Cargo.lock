@@ -2903,6 +2903,7 @@ dependencies = [
  "hex",
  "hmac",
  "image",
+ "libloading",
  "liblzma",
  "machine-uid",
  "moka",

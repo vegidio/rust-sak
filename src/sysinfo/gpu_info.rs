@@ -6,6 +6,10 @@ use super::gpu::GpuInfo;
 /// Each platform is asked through its own interface: the IORegistry on macOS, DXGI on Windows, and the DRM entries
 /// under `/sys/class/drm` on Linux. Nothing here spawns a process.
 ///
+/// On Linux, when `sysfs` shows no NVIDIA card, NVML is asked as well. That covers the NVIDIA GPUs no DRM driver
+/// claims: every GPU under WSL2, and the proprietary driver running without `nvidia-drm`, as on most headless machines
+/// and containers. NVML is loaded at runtime, so a machine without the NVIDIA driver loses nothing.
+///
 /// **An empty list is a normal answer, not a failure.** A headless server, a virtual machine with no display
 /// adapter and a container without `/sys` mounted all legitimately have no GPU to report.
 ///
@@ -39,10 +43,13 @@ pub fn gpu_info() -> Result<Vec<GpuInfo>> {
     {
         use std::path::Path;
 
+        use super::gpu_nvml::{self, with_nvml_fallback};
         use super::gpu_sysfs::{DRM_CLASS_DIR, gpus_from_drm_dir};
         use super::pci_ids::PCI_IDS;
 
-        gpus_from_drm_dir(Path::new(DRM_CLASS_DIR), PCI_IDS.as_deref())
+        let sysfs = gpus_from_drm_dir(Path::new(DRM_CLASS_DIR), PCI_IDS.as_deref())?;
+
+        Ok(with_nvml_fallback(sysfs, gpu_nvml::gpus))
     }
 
     #[cfg(target_os = "macos")]

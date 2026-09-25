@@ -73,8 +73,11 @@ Both optional fields distinguish *"this does not apply"* from a zero. An Apple S
 | macOS    | **IOKit** | `IOAccelerator` entries in the IORegistry — the same data `system_profiler SPDisplaysDataType` prints.  |
 | Windows  | **DXGI**  | `IDXGIFactory1::EnumAdapters1` → `DXGI_ADAPTER_DESC1`, the source behind WMI's `Win32_VideoController`. |
 | Linux    | **sysfs** | `/sys/class/drm/card*/device/`, plus `pci.ids` for model names.                                         |
+| Linux    | **NVML**  | `libnvidia-ml.so.1`, loaded at runtime — only when sysfs shows no NVIDIA card.                          |
 
 Linux is the odd one out because it has no GPU API at all: the kernel publishes device data as a virtual filesystem, which is what `lspci` itself reads.
+
+That filesystem only lists a card some DRM driver has claimed, and an NVIDIA GPU is often claimed by none: under **WSL2** the GPU is paravirtualised through `/dev/dxg` and no PCI display device exists, and the proprietary driver running **without `nvidia-drm`** — the usual setup on headless machines and in containers — never registers the card with DRM. Both still ship NVML with the driver (WSL in `/usr/lib/wsl/lib`), so when sysfs finds no NVIDIA card, `gpu_info` asks NVML and adds what it reports. A machine without the NVIDIA driver has no NVML, and simply gets the sysfs answer.
 
 On any other operating system `gpu_info` returns `SysinfoError::UnsupportedPlatform` rather than an empty list, so a caller can tell "not implemented here" from "no adapters present".
 
@@ -88,9 +91,10 @@ On any other operating system `gpu_info` returns `SysinfoError::UnsupportedPlatf
 | macOS, Intel Mac with a discrete GPU                        | ✅ yes                                          |
 | macOS, Apple Silicon                                        | ❌ no — unified memory, no separate VRAM exists |
 | Linux, `amdgpu`                                             | ✅ yes                                          |
+| Linux, NVIDIA found through NVML (WSL2, no `nvidia-drm`)    | ✅ yes                                          |
 | Linux, Intel (`i915` / `xe`), `nouveau`, proprietary NVIDIA | ❌ no — nothing is published in sysfs           |
 
-The Linux gaps are kernel limitations, not shortcuts: Intel's sysfs VRAM proposal was never merged, and the proprietary NVIDIA driver exposes no framebuffer size anywhere under `/proc` or `/sys`. Reading those needs a DRM `ioctl` or NVML, neither of which this module does. A zero is never invented to paper over the gap.
+The Linux gaps are kernel limitations, not shortcuts: Intel's sysfs VRAM proposal was never merged, and the proprietary NVIDIA driver exposes no framebuffer size anywhere under `/proc` or `/sys`. Reading those needs a DRM `ioctl` or NVML, and NVML is only asked when sysfs found no NVIDIA card at all — so an NVIDIA card sysfs *does* list keeps `None`. A zero is never invented to paper over the gap.
 
 Also:
 

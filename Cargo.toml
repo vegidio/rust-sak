@@ -108,6 +108,11 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 ], optional = true }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "libc"], optional = true }
 
+# NVML, the NVIDIA GPU probe behind `sysfs`, is loaded at runtime: a machine without the NVIDIA driver has no
+# `libnvidia-ml.so.1`, and linking against it would stop this crate loading there at all.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { version = "0.8", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -160,7 +165,14 @@ o11y = [
 o11y-tracing = ["o11y", "dep:tracing", "dep:tracing-subscriber"]
 # Built on `fetch`: the GitHub API is a plain JSON endpoint, so it reuses `Fetch::json` and its retries.
 github = ["fetch", "dep:semver", "dep:serde", "dep:thiserror"]
-sysinfo = ["dep:objc2-core-foundation", "dep:objc2-io-kit", "dep:sysinfo", "dep:thiserror", "dep:windows"]
+sysinfo = [
+    "dep:libloading",
+    "dep:objc2-core-foundation",
+    "dep:objc2-io-kit",
+    "dep:sysinfo",
+    "dep:thiserror",
+    "dep:windows",
+]
 
 # Mirrors the `required-features` the `playground` target carried as a `[[bin]]`: without this, a
 # build with any other feature set tries to compile it and fails on the missing `fetch` module.
