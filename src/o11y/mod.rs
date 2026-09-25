@@ -135,6 +135,8 @@ pub fn is_enabled() -> bool {
 }
 
 /// The session id attached to records right now, or `None` if telemetry is not running.
+///
+/// `None` before [`init`], after [`shutdown`], and when `init` was given [`enabled(false)`](ConfigBuilder::enabled).
 pub fn session_id() -> Option<String> {
     pipeline::session_id()
 }

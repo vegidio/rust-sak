@@ -292,12 +292,20 @@ pub(super) fn attributes() -> Attributes {
 
 /// Whether telemetry is installed and exporting.
 pub(super) fn is_enabled() -> bool {
-    PIPELINE.get().is_some()
+    running().is_some()
 }
 
 /// The current session id, if telemetry is running.
 pub(super) fn session_id() -> Option<String> {
-    PIPELINE.get().map(|pipeline| pipeline.shared.enrichment.session_id())
+    running().map(|pipeline| pipeline.shared.enrichment.session_id())
+}
+
+/// The installed pipeline while it is exporting.
+///
+/// `PIPELINE` outlives the pipeline it holds: a `OnceLock` cannot be emptied, so after [`shutdown`] — or the worker's
+/// death — it still answers `Some`. The gates are what those close, so they decide.
+fn running() -> Option<&'static Pipeline> {
+    PIPELINE.get().filter(|_| gate::tracing_enabled())
 }
 
 /// Assigns a fresh session id to everything recorded from now on.

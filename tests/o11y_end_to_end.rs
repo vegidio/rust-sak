@@ -69,6 +69,10 @@ fn the_pipeline_records_and_exports_all_three_signals() {
 
     o11y::shutdown();
 
+    // A stopped pipeline answers as one that never started.
+    assert!(!o11y::is_enabled());
+    assert!(o11y::session_id().is_none());
+
     assert!(
         wait_until(Duration::from_secs(10), || {
             captured.lock().unwrap_or_else(PoisonError::into_inner).len() >= 3
