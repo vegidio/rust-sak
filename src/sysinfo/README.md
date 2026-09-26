@@ -99,6 +99,8 @@ A **CPU device does not count**. `mesa-vulkan-drivers` also installs `lavapipe`,
 
 A `true` is what the machine offers, not a guarantee: an adapter can still lack a feature or limit a particular WebGPU implementation requires. Each call on Linux creates a Vulkan instance, which loads every installed driver, so hold onto the answer rather than asking repeatedly.
 
+**The drivers the probe loads stay loaded** for the rest of the process. GPU drivers are not written to be unloaded: they leave thread-local destructors and exit handlers behind that assume their code is still mapped, and unloading one turns the next thread exit into a segfault — which is exactly what happens under WSL2, where Mesa's `dzn` driver brings in `libd3d12core.so`. The probe marks everything it caused to be loaded as never to be unloaded, the same state a WebGPU implementation that goes on to use Vulkan leaves them in anyway.
+
 ## Limitations worth knowing
 
 **`memory` is `None` more often than you might expect.** It is reported only where the platform actually publishes it:
