@@ -317,6 +317,11 @@ pub(super) fn session_id() -> Option<String> {
     running().map(|pipeline| pipeline.shared.enrichment.session_id())
 }
 
+/// The current machine id, if telemetry is running and the host id could be read.
+pub(super) fn machine_id() -> Option<String> {
+    running().and_then(|pipeline| pipeline.shared.enrichment.machine_id())
+}
+
 /// The installed pipeline while it is exporting.
 ///
 /// `PIPELINE` outlives the pipeline it holds: a `OnceLock` cannot be emptied, so after [`shutdown`] — or the worker's

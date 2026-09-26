@@ -501,6 +501,10 @@ once per batch rather than once per record is both correct and a large saving on
 `renew_session()` is safe to call while other threads are recording. Records already buffered keep the session they
 were recorded under, rather than picking up whichever one was current when the exporter reached them.
 
+`session_id()` and `machine_id()` read back the `session.id` and `machine.id` on records right now, for a front end
+that reports through a telemetry client of its own and wants its records to line up with this process's. Both answer
+`None` while telemetry is not running.
+
 ## Errors
 
 **Recording telemetry never fails.** The log macros, the metric instruments and the span guards all return nothing:

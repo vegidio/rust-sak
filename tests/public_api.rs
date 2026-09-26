@@ -232,6 +232,7 @@ mod o11y {
 
         assert!(!o11y::is_enabled());
         assert!(o11y::session_id().is_none());
+        assert!(o11y::machine_id().is_none());
 
         let config: Config = Config::builder("http://127.0.0.1:1", [("Authorization", "Bearer secret")])
             .service_name("api-test")

@@ -1242,6 +1242,16 @@ fn the_machine_id_is_scoped_to_the_service() {
 }
 
 #[test]
+fn the_machine_id_read_back_is_the_one_every_record_carries() {
+    let enrichment = Enrichment::new("my-app");
+
+    assert_eq!(
+        enrichment.machine_id(),
+        enrichment.snapshot().get("machine.id").cloned()
+    );
+}
+
+#[test]
 fn every_record_carries_the_machine_and_session_attributes() {
     let snapshot = Enrichment::new("my-app").snapshot();
 

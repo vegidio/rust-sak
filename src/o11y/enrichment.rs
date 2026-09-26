@@ -71,6 +71,16 @@ impl Enrichment {
         Arc::clone(&self.rendered.read().unwrap_or_else(PoisonError::into_inner))
     }
 
+    /// The service-scoped machine id every record carries, or `None` when the host id could not be read.
+    pub(super) fn machine_id(&self) -> Option<String> {
+        let base = self.base.lock().unwrap_or_else(PoisonError::into_inner);
+
+        base.iter().find_map(|(key, value)| match value {
+            Value::String(id) if key == MACHINE_ID => Some(id.clone()),
+            _ => None,
+        })
+    }
+
     /// The session id attached to records emitted right now.
     pub(super) fn session_id(&self) -> String {
         self.session_id.lock().unwrap_or_else(PoisonError::into_inner).clone()

@@ -141,6 +141,15 @@ pub fn session_id() -> Option<String> {
     pipeline::session_id()
 }
 
+/// The service-scoped machine id attached to records, or `None` if telemetry is not running.
+///
+/// For a front end that reports through a telemetry client of its own, so its records can carry the same `machine.id`
+/// as this process's. `None` before [`init`], after [`shutdown`], when `init` was given
+/// [`enabled(false)`](ConfigBuilder::enabled), and on a host whose id cannot be read.
+pub fn machine_id() -> Option<String> {
+    pipeline::machine_id()
+}
+
 /// Assigns a fresh session id to everything recorded from now on.
 ///
 /// Safe to call while other threads are recording. Records already buffered keep the session they were recorded
