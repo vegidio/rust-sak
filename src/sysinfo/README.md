@@ -1,6 +1,6 @@
 # `sysinfo` module
 
-Hardware probes: **what processor**, **how much memory**, **which graphics adapters**. Everything here is **synchronous** and **nothing spawns a process** — each platform is asked through its own interface.
+Hardware probes: **what processor**, **how much memory**, **which graphics adapters**, **whether WebGPU can run**. Everything here is **synchronous** and **nothing spawns a process** — each platform is asked through its own interface.
 
 ## Enabling
 
@@ -15,11 +15,12 @@ rust-sak = { version = "2", features = ["sysinfo"] }
 
 ## Public API
 
-| Function      | Signature                               | What it does                                   |
-|---------------|-----------------------------------------|------------------------------------------------|
-| `cpu_info`    | `fn cpu_info() -> CpuInfo`              | Processor model, core counts, architecture.    |
-| `memory_info` | `fn memory_info() -> MemoryInfo`        | Total and available RAM, total swap, in bytes. |
-| `gpu_info`    | `fn gpu_info() -> Result<Vec<GpuInfo>>` | Every graphics adapter the OS reports.         |
+| Function              | Signature                               | What it does                                   |
+|-----------------------|-----------------------------------------|------------------------------------------------|
+| `cpu_info`            | `fn cpu_info() -> CpuInfo`              | Processor model, core counts, architecture.    |
+| `memory_info`         | `fn memory_info() -> MemoryInfo`        | Total and available RAM, total swap, in bytes. |
+| `gpu_info`            | `fn gpu_info() -> Result<Vec<GpuInfo>>` | Every graphics adapter the OS reports.         |
+| `is_webgpu_supported` | `fn is_webgpu_supported() -> bool`      | Whether a WebGPU implementation can run here.  |
 
 ### Why only one of them returns a `Result`
 
@@ -80,6 +81,23 @@ Linux is the odd one out because it has no GPU API at all: the kernel publishes 
 That filesystem only lists a card some DRM driver has claimed, and an NVIDIA GPU is often claimed by none: under **WSL2** the GPU is paravirtualised through `/dev/dxg` and no PCI display device exists, and the proprietary driver running **without `nvidia-drm`** — the usual setup on headless machines and in containers — never registers the card with DRM. Both still ship NVML with the driver (WSL in `/usr/lib/wsl/lib`), so when sysfs finds no NVIDIA card, `gpu_info` asks NVML and adds what it reports. A machine without the NVIDIA driver has no NVML, and simply gets the sysfs answer.
 
 On any other operating system `gpu_info` returns `SysinfoError::UnsupportedPlatform` rather than an empty list, so a caller can tell "not implemented here" from "no adapters present".
+
+## WebGPU
+
+`is_webgpu_supported` answers whether the platform's native graphics API that WebGPU implementations (Dawn, wgpu) run on is usable:
+
+| Platform | Backend        | Answer                                                                       |
+|----------|----------------|------------------------------------------------------------------------------|
+| macOS    | Metal          | Always `true`.                                                               |
+| Windows  | Direct3D 12    | Always `true`.                                                               |
+| Linux    | Vulkan         | `true` only if Vulkan lists a GPU supporting Vulkan 1.1 or newer.            |
+| Other    | —              | Always `false`.                                                              |
+
+Linux ships no graphics API, so Vulkan needs both the loader (`libvulkan.so.1`: `libvulkan1` on Debian and Ubuntu, `vulkan-loader` on Fedora, `vulkan-icd-loader` on Arch) and a driver for the GPU — `mesa-vulkan-drivers` for AMD, Intel and NVK, or the one the proprietary NVIDIA driver installs itself. Package names are never inspected: the loader is opened at runtime, an instance is created and its physical devices are listed, which is what a WebGPU implementation does first.
+
+A **CPU device does not count**. `mesa-vulkan-drivers` also installs `lavapipe`, a software rasteriser that reports itself as a Vulkan device, so a machine with no GPU driver still lists one — and WebGPU on it is slower than using the CPU directly. Vulkan **1.0-only** GPUs do not count either, because Dawn requires 1.1.
+
+A `true` is what the machine offers, not a guarantee: an adapter can still lack a feature or limit a particular WebGPU implementation requires. Each call on Linux creates a Vulkan instance, which loads every installed driver, so hold onto the answer rather than asking repeatedly.
 
 ## Limitations worth knowing
 

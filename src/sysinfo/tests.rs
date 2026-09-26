@@ -13,6 +13,7 @@ use super::gpu_sysfs::{
 };
 use super::pci_ids::{lookup_pci_ids, read_pci_ids_from};
 use super::vendor::{gpu_from_driver, vendor_from_description, vendor_name};
+use super::webgpu::{DEVICE_TYPE_CPU, VULKAN_1_1, supports_webgpu};
 use super::*;
 
 // --- cpu_info tests ---
@@ -780,4 +781,64 @@ fn only_the_io_error_carries_a_source() {
         .is_none()
     );
     assert!(SysinfoError::UnsupportedPlatform { os: "netbsd" }.source().is_none());
+}
+
+// --- webgpu tests ---
+
+/// `VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU`, `_DISCRETE_GPU` and `_VIRTUAL_GPU`.
+const INTEGRATED: i32 = 1;
+const DISCRETE: i32 = 2;
+const VIRTUAL: i32 = 3;
+
+/// `VK_API_VERSION_1_0` and `VK_API_VERSION_1_3`.
+const VULKAN_1_0: u32 = 1 << 22;
+const VULKAN_1_3: u32 = (1 << 22) | (3 << 12);
+
+#[test]
+fn supports_webgpu_is_false_without_any_device() {
+    assert!(!supports_webgpu([]));
+}
+
+#[test]
+fn supports_webgpu_does_not_count_a_cpu_rasteriser() {
+    assert!(!supports_webgpu([(VULKAN_1_3, DEVICE_TYPE_CPU)]));
+}
+
+#[test]
+fn supports_webgpu_does_not_count_a_vulkan_1_0_gpu() {
+    assert!(!supports_webgpu([(VULKAN_1_0, DISCRETE), (VULKAN_1_1 - 1, INTEGRATED)]));
+}
+
+#[test]
+fn supports_webgpu_counts_any_vulkan_1_1_gpu() {
+    for device_type in [INTEGRATED, DISCRETE, VIRTUAL] {
+        assert!(
+            supports_webgpu([(VULKAN_1_1, device_type)]),
+            "device type {device_type}"
+        );
+        assert!(
+            supports_webgpu([(VULKAN_1_3, device_type)]),
+            "device type {device_type}"
+        );
+    }
+}
+
+#[test]
+fn supports_webgpu_counts_a_gpu_listed_beside_a_cpu_rasteriser() {
+    assert!(supports_webgpu([
+        (VULKAN_1_3, DEVICE_TYPE_CPU),
+        (VULKAN_1_1, INTEGRATED)
+    ]));
+}
+
+#[test]
+fn supports_webgpu_ignores_the_api_variant_bits() {
+    // A non-Vulkan variant sets the top bits, which must not stand in for a newer version.
+    assert!(!supports_webgpu([((1 << 29) | VULKAN_1_0, DISCRETE)]));
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn is_webgpu_supported_is_true_where_the_native_api_always_ships() {
+    assert!(is_webgpu_supported());
 }

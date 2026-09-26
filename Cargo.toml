@@ -6,7 +6,7 @@ members = ["macros"]
 
 # Shared by both members so a release only has to bump one place.
 [workspace.package]
-version = "26.9.11"
+version = "26.9.10"
 edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/vegidio/rust-sak"
@@ -108,8 +108,9 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 ], optional = true }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "libc"], optional = true }
 
-# NVML, the NVIDIA GPU probe behind `sysfs`, is loaded at runtime: a machine without the NVIDIA driver has no
-# `libnvidia-ml.so.1`, and linking against it would stop this crate loading there at all.
+# NVML, the NVIDIA GPU probe behind `sysfs`, and the Vulkan loader, the WebGPU probe, are loaded at runtime: a machine
+# without the NVIDIA driver has no `libnvidia-ml.so.1`, one without Vulkan no `libvulkan.so.1`, and linking against
+# either would stop this crate loading there at all.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { version = "0.8", optional = true }
 
