@@ -212,6 +212,56 @@ fn the_service_attributes_go_in_the_resource_block_not_on_each_record() {
 }
 
 #[test]
+fn a_caller_resource_attribute_follows_the_built_in_ones() {
+    let config = Config::builder("https://collector.example.com", NO_HEADERS)
+        .service_name("checkout-service")
+        .resource_attribute("cpu.model", "Apple M2 Max")
+        .resource_attribute("cpu.cores", 12u64)
+        .build();
+
+    let attributes = super::pipeline::resource_attributes(&config);
+    let keys: Vec<&str> = attributes.iter().map(|(key, _)| key.as_ref()).collect();
+
+    assert_eq!(keys.first(), Some(&"service.name"));
+    assert_eq!(&keys[keys.len() - 2..], ["cpu.model", "cpu.cores"]);
+    assert!(attributes.contains(&(Cow::Borrowed("cpu.cores"), Value::Int(12))));
+}
+
+#[test]
+fn a_caller_resource_attribute_cannot_shadow_a_built_in_one() {
+    let config = Config::builder("https://collector.example.com", NO_HEADERS)
+        .service_name("checkout-service")
+        .resource_attribute("service.name", "impostor")
+        .resource_attribute("machine.os", "plan9")
+        .resource_attribute("session.id", "fixed")
+        .resource_attribute("location.city", "Atlantis")
+        .build();
+
+    let attributes = super::pipeline::resource_attributes(&config);
+
+    assert_eq!(attributes.iter().filter(|(key, _)| key == "service.name").count(), 1);
+    assert!(attributes.contains(&(Cow::Borrowed("service.name"), Value::from("checkout-service"))));
+    assert!(
+        attributes
+            .iter()
+            .all(|(key, _)| key != "machine.os" && key != "session.id" && key != "location.city")
+    );
+}
+
+#[test]
+fn a_resource_attribute_added_twice_keeps_its_last_value() {
+    let config = Config::builder("https://collector.example.com", NO_HEADERS)
+        .resource_attribute("gpu.1.name", "first")
+        .resource_attribute("gpu.1.name", "second")
+        .build();
+
+    let attributes = super::pipeline::resource_attributes(&config);
+    let matching: Vec<_> = attributes.iter().filter(|(key, _)| key == "gpu.1.name").collect();
+
+    assert_eq!(matching, [&(Cow::Borrowed("gpu.1.name"), Value::from("second"))]);
+}
+
+#[test]
 fn a_histogram_has_exactly_one_more_bucket_than_it_has_bounds() {
     let _guard = global_lock();
     metric::clear();

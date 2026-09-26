@@ -124,7 +124,7 @@ pub(super) fn init(config: Config) -> Result<()> {
 }
 
 /// The resource attributes taken from the configuration, as opposed to from the machine.
-fn resource_attributes(config: &Config) -> Vec<(Cow<'static, str>, Value)> {
+pub(super) fn resource_attributes(config: &Config) -> Vec<(Cow<'static, str>, Value)> {
     let mut attributes = vec![(
         Cow::Borrowed("service.name"),
         Value::String(config.service_name.clone()),
@@ -145,7 +145,24 @@ fn resource_attributes(config: &Config) -> Vec<(Cow<'static, str>, Value)> {
     attributes.push((Cow::Borrowed("telemetry.sdk.name"), Value::from("rust-sak")));
     attributes.push((Cow::Borrowed("telemetry.sdk.language"), Value::from("rust")));
 
+    // After the built-in pairs, and never in place of one: a caller's key cannot shadow what this module reports.
+    let extra = config.resource.iter().filter(|(key, _)| !is_reserved(key)).cloned();
+    attributes.extend(extra);
+
     attributes
+}
+
+/// Whether `key` is one this module sets itself, from the configuration or from the machine enrichment.
+fn is_reserved(key: &str) -> bool {
+    const PREFIXES: [&str; 5] = [
+        "service.",
+        "telemetry.sdk.",
+        "machine.",
+        "location.",
+        "deployment.environment.",
+    ];
+
+    key == "session.id" || PREFIXES.iter().any(|prefix| key.starts_with(prefix))
 }
 
 /// Rejects an endpoint that is not a usable URL.

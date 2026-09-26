@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::geolocation;
-use super::{Environment, Level, O11yError};
+use super::{Environment, Level, O11yError, Value};
 
 /// An empty header set, for a collector that authenticates some other way.
 ///
@@ -47,6 +48,8 @@ pub struct Config {
     pub(super) service_version: String,
     /// Reported as `deployment.environment.name`.
     pub(super) environment: Environment,
+    /// Resource attributes the caller added, reported after the built-in ones.
+    pub(super) resource: Vec<(Cow<'static, str>, Value)>,
     /// The lowest severity that is recorded.
     pub(super) min_level: Level,
     /// How often the worker exports whatever has accumulated.
@@ -100,6 +103,7 @@ impl Config {
                 service_name: String::new(),
                 service_version: String::new(),
                 environment: Environment::Development,
+                resource: Vec::new(),
                 min_level: Level::Info,
                 flush_interval: DEFAULT_FLUSH_INTERVAL,
                 max_batch_size: DEFAULT_MAX_BATCH_SIZE,
@@ -126,6 +130,7 @@ impl fmt::Debug for Config {
             .field("service_name", &self.service_name)
             .field("service_version", &self.service_version)
             .field("environment", &self.environment)
+            .field("resource", &self.resource)
             .field("min_level", &self.min_level)
             .field("flush_interval", &self.flush_interval)
             .field("max_batch_size", &self.max_batch_size)
@@ -182,6 +187,24 @@ impl ConfigBuilder {
     /// Sets the deployment environment. Defaults to [`Environment::Development`].
     pub fn environment(mut self, environment: Environment) -> Self {
         self.config.environment = environment;
+        self
+    }
+
+    /// Adds a resource attribute, reported on every batch next to `service.name` and the machine enrichment.
+    ///
+    /// For facts that hold for the whole process — the hardware it runs on, a build flavour — and so belong once per
+    /// batch rather than on every record. A key the module sets itself (`service.*`, `deployment.environment.name`,
+    /// `telemetry.sdk.*`, `machine.*`, `session.id`, `location.*`) is ignored rather than allowed to shadow it, and a
+    /// key added twice keeps its last value.
+    pub fn resource_attribute(mut self, key: impl Into<Cow<'static, str>>, value: impl Into<Value>) -> Self {
+        let key = key.into();
+        let value = value.into();
+
+        match self.config.resource.iter_mut().find(|(existing, _)| *existing == key) {
+            Some(entry) => entry.1 = value,
+            None => self.config.resource.push((key, value)),
+        }
+
         self
     }
 
