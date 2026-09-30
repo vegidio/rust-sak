@@ -108,14 +108,16 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 ], optional = true }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "libc"], optional = true }
 
-# NVML, the NVIDIA GPU probe behind `sysfs`, and the Vulkan loader, the WebGPU probe, are loaded at runtime: a machine
-# without the NVIDIA driver has no `libnvidia-ml.so.1`, one without Vulkan no `libvulkan.so.1`, and linking against
-# either would stop this crate loading there at all.
 [target.'cfg(target_os = "linux")'.dependencies]
-libloading = { version = "0.8", optional = true }
 # `dl_iterate_phdr` and the `RTLD_NOLOAD`/`RTLD_NODELETE` flags, which pin the drivers the WebGPU probe loads. The flag
 # values differ between architectures, so they are taken from here rather than written down.
 libc = { version = "0.2", optional = true }
+
+# NVML, the NVIDIA GPU probe behind `sysfs`, the Vulkan loader, the WebGPU probe, and the CUDA driver, the CUDA probe,
+# are loaded at runtime: a machine without the NVIDIA driver has no `libnvidia-ml.so.1` or `nvcuda.dll`, one without
+# Vulkan no `libvulkan.so.1`, and linking against any of them would stop this crate loading there at all.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+libloading = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [

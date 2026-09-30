@@ -1,6 +1,6 @@
 # `sysinfo` module
 
-Hardware probes: **what processor**, **how much memory**, **which graphics adapters**, **whether WebGPU can run**. Everything here is **synchronous** and **nothing spawns a process** — each platform is asked through its own interface.
+Hardware probes: **what processor**, **how much memory**, **which graphics adapters**, **what CUDA the NVIDIA driver offers**, **whether WebGPU can run**. Everything here is **synchronous** and **nothing spawns a process** — each platform is asked through its own interface.
 
 ## Enabling
 
@@ -20,6 +20,7 @@ rust-sak = { version = "2", features = ["sysinfo"] }
 | `cpu_info`            | `fn cpu_info() -> CpuInfo`              | Processor model, core counts, architecture.    |
 | `memory_info`         | `fn memory_info() -> MemoryInfo`        | Total and available RAM, total swap, in bytes. |
 | `gpu_info`            | `fn gpu_info() -> Result<Vec<GpuInfo>>` | Every graphics adapter the OS reports.         |
+| `cuda_info`           | `fn cuda_info() -> Option<CudaInfo>`    | CUDA driver version, compute capabilities.     |
 | `is_webgpu_supported` | `fn is_webgpu_supported() -> bool`      | Whether a WebGPU implementation can run here.  |
 
 ### Why only one of them returns a `Result`
@@ -81,6 +82,38 @@ Linux is the odd one out because it has no GPU API at all: the kernel publishes 
 That filesystem only lists a card some DRM driver has claimed, and an NVIDIA GPU is often claimed by none: under **WSL2** the GPU is paravirtualised through `/dev/dxg` and no PCI display device exists, and the proprietary driver running **without `nvidia-drm`** — the usual setup on headless machines and in containers — never registers the card with DRM. Both still ship NVML with the driver (WSL in `/usr/lib/wsl/lib`), so when sysfs finds no NVIDIA card, `gpu_info` asks NVML and adds what it reports. A machine without the NVIDIA driver has no NVML, and simply gets the sysfs answer.
 
 On any other operating system `gpu_info` returns `SysinfoError::UnsupportedPlatform` rather than an empty list, so a caller can tell "not implemented here" from "no adapters present".
+
+## CUDA
+
+`cuda_info` asks the NVIDIA driver what it offers CUDA, through the CUDA driver API itself — `nvcuda.dll` on Windows (loaded from `System32` only), `libcuda.so.1` on Linux (and WSL2's `/usr/lib/wsl/lib`). That is the library every CUDA runtime loads, so the answer is the one a CUDA program will meet.
+
+### `CudaInfo`
+
+| Field            | Type              | Notes                                                                                   |
+|------------------|-------------------|-----------------------------------------------------------------------------------------|
+| `driver_version` | `(u32, u32)`      | The newest CUDA version the driver supports, e.g. `(13, 0)`. Not an installed toolkit.  |
+| `devices`        | `Vec<CudaDevice>` | Every device CUDA can run on. **Empty** when the driver cannot initialise.              |
+
+### `CudaDevice`
+
+| Field                | Type         | Notes                                                  |
+|----------------------|--------------|--------------------------------------------------------|
+| `name`               | `String`     | `"NVIDIA GeForce GTX 1060"`.                           |
+| `compute_capability` | `(u32, u32)` | `(6, 1)` for Pascal, `(8, 9)` for Ada Lovelace.        |
+
+Both versions are `(major, minor)` tuples, so they compare the way versions do. That is the whole of deciding whether a CUDA build can run here — CUDA 13, for instance, needs a driver of `(13, 0)` or newer and a device of `(7, 5)` or newer:
+
+```rust,no_run
+use rust_sak::sysinfo::cuda_info;
+
+let cuda_13_runs = cuda_info().is_some_and(|cuda| {
+    cuda.driver_version >= (13, 0) && cuda.devices.iter().any(|device| device.compute_capability >= (7, 5))
+});
+```
+
+`None` means there is no CUDA driver to ask — none installed, or macOS and every other platform CUDA does not run on. It is a normal answer, not a failure. `Some` with no devices means a driver that sees no GPU it can use, which is worth telling apart when explaining why CUDA is off.
+
+Every call initialises the CUDA driver, so hold onto the answer. **The driver stays loaded** afterwards, for the same reason the WebGPU probe's drivers do.
 
 ## WebGPU
 

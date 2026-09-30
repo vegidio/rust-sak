@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
+use super::cuda::{device_from_parts, version_from_driver};
 use super::gpu_dxgi::{adapter_name, gpu_from_adapter, is_software_adapter};
 use super::gpu_ioreg::{data_string, gpu_from_properties, vendor_id_from_bytes, vram_from_megabytes};
 use super::gpu_nvml::{device_name, gpu_from_device, with_nvml_fallback};
@@ -564,6 +565,57 @@ fn gpu_from_adapter_falls_back_to_the_description_for_an_acpi_vendor_id() {
 #[test]
 fn gpu_from_adapter_drops_an_adapter_with_no_description() {
     assert_eq!(gpu_from_adapter(&[0; 128], 0x10de, 0), None);
+}
+
+// --- cuda tests ---
+
+#[test]
+fn version_from_driver_decodes_major_and_minor() {
+    assert_eq!(version_from_driver(12080), Some((12, 8)));
+    assert_eq!(version_from_driver(13000), Some((13, 0)));
+    assert_eq!(version_from_driver(11040), Some((11, 4)));
+}
+
+#[test]
+fn version_from_driver_rejects_what_no_driver_reports() {
+    assert_eq!(version_from_driver(0), None);
+    assert_eq!(version_from_driver(-1), None);
+}
+
+#[test]
+fn versions_compare_the_way_versions_do() {
+    assert!(version_from_driver(12090).unwrap() < version_from_driver(13000).unwrap());
+    assert!((6, 1) < (7, 5) && (7, 5) <= (7, 5) && (7, 5) < (12, 0));
+}
+
+#[test]
+fn device_from_parts_reads_a_device() {
+    let device = device_from_parts("  NVIDIA GeForce GTX 1060 ", 6, 1).unwrap();
+
+    assert_eq!(device.name, "NVIDIA GeForce GTX 1060");
+    assert_eq!(device.compute_capability, (6, 1));
+}
+
+#[test]
+fn device_from_parts_drops_a_device_the_driver_answered_badly_for() {
+    assert_eq!(device_from_parts("", 8, 9), None);
+    assert_eq!(device_from_parts("NVIDIA GeForce RTX 4090", -1, 9), None);
+    assert_eq!(device_from_parts("NVIDIA GeForce RTX 4090", 8, -1), None);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[test]
+fn cuda_info_is_none_where_cuda_does_not_run() {
+    assert_eq!(cuda_info(), None);
+}
+
+#[test]
+fn cuda_info_reports_only_well_formed_answers() {
+    // Whatever this runner has, an answer that exists is a decoded one.
+    if let Some(cuda) = cuda_info() {
+        assert!(cuda.driver_version.0 > 0);
+        assert!(cuda.devices.iter().all(|device| !device.name.is_empty()));
+    }
 }
 
 // --- ioreg parser tests ---

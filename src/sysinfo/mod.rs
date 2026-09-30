@@ -1,9 +1,10 @@
-//! Hardware probes: what processor, how much memory, which graphics adapters, and whether WebGPU can run.
+//! Hardware probes: what processor, how much memory, which graphics adapters, what CUDA the NVIDIA driver offers, and
+//! whether WebGPU can run.
 //!
-//! Four questions are answered here — [`cpu_info`] for the processor, [`memory_info`] for RAM and swap,
-//! [`gpu_info`] for the graphics adapters and [`is_webgpu_supported`] for WebGPU. All of it is **synchronous** and
-//! none of it spawns a process: each platform is asked through its own interface, which is both faster and more
-//! reliable than parsing the output of a command-line tool.
+//! Five questions are answered here — [`cpu_info`] for the processor, [`memory_info`] for RAM and swap,
+//! [`gpu_info`] for the graphics adapters, [`cuda_info`] for CUDA and [`is_webgpu_supported`] for WebGPU. All of it
+//! is **synchronous** and none of it spawns a process: each platform is asked through its own interface, which is
+//! both faster and more reliable than parsing the output of a command-line tool.
 //!
 //! [`cpu_info`] and [`memory_info`] do not return a [`Result`], while [`gpu_info`] does. That asymmetry is real
 //! rather than an oversight: the processor and memory figures come from platform calls that report "unknown"
@@ -35,6 +36,8 @@
 
 mod cpu;
 mod cpu_info;
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+mod cuda;
 mod error;
 mod gpu;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -56,6 +59,7 @@ mod webgpu;
 
 pub use cpu::CpuInfo;
 pub use cpu_info::cpu_info;
+pub use cuda::{CudaDevice, CudaInfo, cuda_info};
 pub use error::{Result, SysinfoError};
 pub use gpu::GpuInfo;
 pub use gpu_info::gpu_info;

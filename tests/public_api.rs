@@ -322,7 +322,7 @@ mod o11y {
 
 #[cfg(feature = "sysinfo")]
 mod sysinfo {
-    use rust_sak::sysinfo::{cpu_info, gpu_info, memory_info};
+    use rust_sak::sysinfo::{CudaDevice, CudaInfo, cpu_info, cuda_info, gpu_info, memory_info};
 
     #[test]
     fn the_probes_answer() {
@@ -334,6 +334,23 @@ mod sysinfo {
 
         // An empty list is a legitimate answer (a headless VM); only a hard failure is not.
         let _ = gpu_info().expect("enumerating GPUs should not fail on a supported platform");
+
+        // No CUDA driver is the normal answer on most runners.
+        let _ = cuda_info();
+    }
+
+    #[test]
+    fn the_cuda_types_can_be_built_from_outside() {
+        // A consumer deciding whether its CUDA build can run needs to test that decision against constructed values.
+        let cuda = CudaInfo {
+            driver_version: (13, 0),
+            devices: vec![CudaDevice {
+                name: "NVIDIA GeForce GTX 1060".to_string(),
+                compute_capability: (6, 1),
+            }],
+        };
+
+        assert!(cuda.devices.iter().all(|device| device.compute_capability < (7, 5)));
     }
 }
 

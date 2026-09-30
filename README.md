@@ -36,7 +36,7 @@ The crate is a collection of independent modules, each gated behind its own Carg
 | `memo-async`   |                                    | Adds `Memo::get_or_compute_async` for computations that are themselves futures                                   | **yes** (Tokio) |
 | `o11y`         | [`o11y`](src/o11y/README.md)       | Logs, metrics and traces to an OpenTelemetry collector over OTLP, exported on a background thread                | no              |
 | `o11y-tracing` |                                    | Adds a `tracing` layer that forwards events and spans to `o11y`, parented by `tracing`'s own span tree           | no              |
-| `sysinfo`      | [`sysinfo`](src/sysinfo/README.md) | CPU, memory and GPU probes, asked through each platform's own interface — no subprocesses                        | no              |
+| `sysinfo`      | [`sysinfo`](src/sysinfo/README.md) | CPU, memory, GPU and CUDA probes, asked through each platform's own interface — no subprocesses                  | no              |
 
 Each module's README covers its API and guarantees in full; the same content is rendered in the [API documentation](https://docs.rs/rust-sak).
 
