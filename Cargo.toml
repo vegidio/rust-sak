@@ -117,7 +117,7 @@ libc = { version = "0.2", optional = true }
 # are loaded at runtime: a machine without the NVIDIA driver has no `libnvidia-ml.so.1` or `nvcuda.dll`, one without
 # Vulkan no `libvulkan.so.1`, and linking against any of them would stop this crate loading there at all.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
