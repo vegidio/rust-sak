@@ -49,6 +49,8 @@ Both `name` and `sub_path` are validated with the same rules as archive entries,
 | `copy_files` | `fn copy_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
 | `move_files` | `fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
 
+`list_path` fails when `directory` is missing or unreadable, and with `ErrorKind::NotADirectory` when it exists but is not a directory, so a mistyped path never comes back as an empty listing. A symbolic link to a directory counts as that directory.
+
 `sources` is any `IntoIterator` of paths, so an array of `&str`, a `Vec<PathBuf>`, or the output of `list_path` all work directly.
 
 `ListOptions` defaults to **files only, one level, unfiltered**; `CopyOptions` to **non-recursive, flattened, unfiltered**. Both are consuming builders, and extension filters are case-insensitive with an optional leading dot, accumulating across calls:

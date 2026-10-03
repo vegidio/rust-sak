@@ -713,7 +713,28 @@ fn list_path_fails_for_a_missing_directory() {
     let dir = TempDir::new().unwrap();
 
     let error = list_path(dir.path().join("missing"), &ListOptions::new()).unwrap_err();
-    assert!(matches!(error, FsError::Io(_)));
+    assert!(matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::NotFound));
+}
+
+#[test]
+fn list_path_fails_for_a_regular_file() {
+    let dir = list_fixture();
+
+    let error = list_path(dir.path().join("a.txt"), &ListOptions::new()).unwrap_err();
+    assert!(matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::NotADirectory));
+}
+
+#[cfg(unix)]
+#[test]
+fn list_path_lists_a_directory_given_through_a_symlink() {
+    let dir = list_fixture();
+    let link = TempDir::new().unwrap();
+    let root = link.path().join("root");
+    std::os::unix::fs::symlink(dir.path(), &root).unwrap();
+
+    let paths = list_path(&root, &ListOptions::new()).unwrap();
+    assert_eq!(names(&paths), ["README", "a.txt", "b.LOG", "c.jpg"]);
+    assert!(paths.iter().all(|path| path.starts_with(&root)));
 }
 
 #[test]
