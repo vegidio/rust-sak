@@ -1,6 +1,6 @@
 //! Image encoding and decoding across many formats behind a small, uniform API.
 //!
-//! The native formats — **bmp, gif, jpeg/jpg, png, tiff** — are handled by the [`image`](::image) crate. The three
+//! The native formats — **bmp, gif, jpeg/jpg, png, tiff** — are handled by the [`image`] crate. The three
 //! formats with their own dedicated crates — **avif** (`avif`), **heif/heic** (`heif`), and **webp** (`webp`) — are
 //! routed through those crates instead of the `image` crate's built-in codecs.
 //!
