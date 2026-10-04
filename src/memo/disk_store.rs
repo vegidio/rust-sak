@@ -75,8 +75,9 @@ pub(super) struct DiskStore {
 ///
 /// Every write commits, so it is readable at once, but only a durable commit forces it to disk — and redb's durable
 /// commit persists every non-durable one before it. The fields are only read and updated with the database's write
-/// transaction held, which redb grants to one caller at a time, so exactly one write per window is the durable one.
-/// They are atomics only because the store is shared across threads.
+/// transaction held - and before it commits, since committing releases it to the next writer - which redb grants to
+/// one caller at a time, so exactly one write per window is the durable one. They are atomics only because the store
+/// is shared across threads.
 #[derive(Debug)]
 struct Cadence {
     /// Make a write durable once this many have been committed since the last durable one. Never zero.
@@ -107,13 +108,22 @@ impl Cadence {
         }
     }
 
-    /// Whether the write about to commit must be durable. Call it holding the write transaction.
-    fn is_due(&self) -> bool {
-        if self.pending.load(Ordering::Acquire).saturating_add(1) >= self.every {
-            return true;
+    /// Counts the write about to commit and reports whether it must be durable.
+    ///
+    /// Call it holding the write transaction and before committing: once the commit releases the transaction, the
+    /// next writer must already see this write counted. If a durable commit then fails, call [`Cadence::failed`].
+    fn next_is_durable(&self) -> bool {
+        let pending = self.pending.load(Ordering::Acquire).saturating_add(1);
+        let due = pending >= self.every
+            || (!self.interval.is_zero() && self.elapsed().saturating_sub(self.last_durable()) >= self.interval);
+
+        if due {
+            self.durable();
+        } else {
+            self.pending.store(pending, Ordering::Release);
         }
 
-        !self.interval.is_zero() && self.elapsed().saturating_sub(self.last_durable()) >= self.interval
+        due
     }
 
     /// Whether any committed write is still waiting to be made durable.
@@ -121,17 +131,20 @@ impl Cadence {
         self.pending.load(Ordering::Acquire) > 0
     }
 
-    /// Records a non-durable commit.
-    fn deferred(&self) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Records a durable commit, which has persisted every write before it.
+    /// Records the durable commit about to happen, which persists every write before it. Call it as
+    /// [`Cadence::next_is_durable`] is called.
     fn durable(&self) {
         let now = u64::try_from(self.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         self.last_durable.store(now, Ordering::Release);
         self.pending.store(0, Ordering::Release);
+    }
+
+    /// Undoes [`Cadence::durable`] after the durable commit failed, so the writes it was meant to persist are still
+    /// pending and the next write is the durable one.
+    fn failed(&self) {
+        self.pending
+            .fetch_max(self.every.saturating_sub(1).max(1), Ordering::AcqRel);
     }
 
     fn elapsed(&self) -> Duration {
@@ -345,20 +358,24 @@ impl Store for DiskStore {
             table.insert(key, record.as_slice())?;
         }
 
-        // Decided with the write transaction held, so no other write can slip into this window.
-        let durable = self.cadence.is_due();
-        if !durable {
-            txn.set_durability(Durability::None)?;
+        // Counted with the write transaction held, so no other write can slip into this window.
+        let durable = self.cadence.next_is_durable();
+        if !durable && let Err(err) = txn.set_durability(Durability::None) {
+            // Nothing committed, so this write must not stay counted; a durable write next is harmless.
+            self.cadence.failed();
+            return Err(err.into());
         }
-        txn.commit()?;
 
+        if let Err(err) = txn.commit() {
+            if durable {
+                self.cadence.failed();
+            }
+            return Err(err.into());
+        }
+
+        #[cfg(test)]
         if durable {
-            self.cadence.durable();
-
-            #[cfg(test)]
             self.cadence.durable_writes.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.cadence.deferred();
         }
 
         Ok(())
@@ -397,15 +414,18 @@ impl DiskStore {
     fn flush_into(db: &Database, cadence: &Cadence) -> Result<()> {
         let txn = db.begin_write()?;
 
-        // Checked with the write transaction held, so a write committing concurrently is either counted here or
-        // has not started.
+        // Checked and reset with the write transaction held, so a concurrent write is either counted here or not
+        // started, and is never counted after the reset only to be wiped by it.
         if !cadence.has_pending() {
             txn.abort()?;
             return Ok(());
         }
 
-        txn.commit()?;
         cadence.durable();
+        if let Err(err) = txn.commit() {
+            cadence.failed();
+            return Err(err.into());
+        }
 
         Ok(())
     }
