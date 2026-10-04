@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use redb::ReadableTableMetadata;
-use redb::{Database, ReadableDatabase, TableDefinition, TableError};
+use redb::{Database, Durability, ReadableDatabase, TableDefinition, TableError};
 
 use super::store::{Entry, Store};
 use super::{CacheOpts, MemoError, Result};
@@ -17,7 +17,7 @@ use super::{CacheOpts, MemoError, Result};
 /// old one.
 const ENTRIES: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("memo_entries_v1");
 
-/// The file the database lives in, inside the directory the caller names.
+/// The file the database lives in when the caller names only a directory.
 const DATABASE_FILE: &str = "memo.redb";
 
 /// The deadline prefix on every record: milliseconds since the Unix epoch, big-endian, `0` meaning no deadline.
@@ -34,7 +34,8 @@ const OPEN_RETRY_DELAY: Duration = Duration::from_millis(2);
 const MIN_CACHE_SIZE: u64 = 1 << 20;
 const MAX_CACHE_SIZE: u64 = 1 << 30;
 
-/// The disk stores this process currently has open, keyed by the canonicalized directory they live in.
+/// The disk stores this process currently has open, keyed by the database file: its canonicalized directory joined
+/// with its file name.
 ///
 /// redb takes an exclusive file lock, so a second open of the same path fails with
 /// `DatabaseError::DatabaseAlreadyOpen` — and that error reads exactly like a *different* process holding the lock.
@@ -48,7 +49,7 @@ type Registered = (u64, Weak<DiskStore>);
 /// Stamps each store so a late [`Drop`] cannot evict a newer store that has since taken the same path.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// A cache backed by a redb database in a directory of its own.
+/// A cache backed by a redb database file.
 #[derive(Debug)]
 pub(super) struct DiskStore {
     /// The database.
@@ -58,39 +59,133 @@ pub(super) struct DiskStore {
     /// the compaction itself. Behind an [`Option`] so [`Drop`] can close it while still holding [`OPEN`], which is
     /// what stops a re-open from racing the file lock this store has not released yet.
     db: RwLock<Option<Database>>,
-    /// The canonicalized directory, both for [`Store::path`] and as this store's key in [`OPEN`].
+    /// The canonicalized directory holding the database, for [`Store::path`].
     directory: PathBuf,
+    /// The database file inside [`directory`](Self::directory): this store's key in [`OPEN`].
+    file: PathBuf,
     /// This store's [`GENERATION`] stamp.
     generation: u64,
     /// Held for the length of a sweep, so only one runs at a time.
     sweeping: AtomicBool,
+    /// Which writes are made durable, and how many are waiting to be.
+    cadence: Cadence,
+}
+
+/// Decides which writes commit durably, from [`CacheOpts::flush_every`] and [`CacheOpts::flush_interval`].
+///
+/// Every write commits, so it is readable at once, but only a durable commit forces it to disk — and redb's durable
+/// commit persists every non-durable one before it. The fields are only read and updated with the database's write
+/// transaction held, which redb grants to one caller at a time, so exactly one write per window is the durable one.
+/// They are atomics only because the store is shared across threads.
+#[derive(Debug)]
+struct Cadence {
+    /// Make a write durable once this many have been committed since the last durable one. Never zero.
+    every: u32,
+    /// Also make a write durable once this long has passed since the last durable one. Zero means never.
+    interval: Duration,
+    /// The writes committed since the last durable commit.
+    pending: AtomicU32,
+    /// When the last durable commit landed, in nanoseconds since [`epoch`](Self::epoch).
+    last_durable: AtomicU64,
+    /// The reference point for [`last_durable`](Self::last_durable): monotonic, so a clock jump cannot fire a flush.
+    epoch: Instant,
+    /// How many writes have committed durably. Test-only.
+    #[cfg(test)]
+    durable_writes: AtomicU64,
+}
+
+impl Cadence {
+    fn new(opts: CacheOpts) -> Self {
+        Cadence {
+            every: opts.flush_every.max(1),
+            interval: opts.flush_interval,
+            pending: AtomicU32::new(0),
+            last_durable: AtomicU64::new(0),
+            epoch: Instant::now(),
+            #[cfg(test)]
+            durable_writes: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether the write about to commit must be durable. Call it holding the write transaction.
+    fn is_due(&self) -> bool {
+        if self.pending.load(Ordering::Acquire).saturating_add(1) >= self.every {
+            return true;
+        }
+
+        !self.interval.is_zero() && self.elapsed().saturating_sub(self.last_durable()) >= self.interval
+    }
+
+    /// Whether any committed write is still waiting to be made durable.
+    fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+    }
+
+    /// Records a non-durable commit.
+    fn deferred(&self) {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a durable commit, which has persisted every write before it.
+    fn durable(&self) {
+        let now = u64::try_from(self.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        self.last_durable.store(now, Ordering::Release);
+        self.pending.store(0, Ordering::Release);
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.epoch.elapsed()
+    }
+
+    fn last_durable(&self) -> Duration {
+        Duration::from_nanos(self.last_durable.load(Ordering::Acquire))
+    }
 }
 
 impl DiskStore {
-    /// Opens the store in `directory`, creating it if needed, or returns the one this process already has open there.
-    ///
-    /// `opts` is honoured only by whichever call opens the store; a caller handed an existing one gets its sizing.
+    /// Opens the store in `directory`, in the default database file there. See [`DiskStore::open_file`].
     pub(super) fn open(directory: impl AsRef<Path>, opts: CacheOpts) -> Result<Arc<DiskStore>> {
-        // Create before canonicalizing: `canonicalize` requires the path to exist.
-        std::fs::create_dir_all(&directory)?;
-        let directory = directory.as_ref().canonicalize()?;
-        let file = directory.join(DATABASE_FILE);
+        DiskStore::open_file(directory.as_ref().join(DATABASE_FILE), opts)
+    }
+
+    /// Opens the store in the database `file`, creating it and its directory if needed, or returns the one this
+    /// process already has open there.
+    ///
+    /// `opts` is honoured only by whichever call opens the store; a caller handed an existing one gets its sizing and
+    /// its cadence.
+    pub(super) fn open_file(file: impl AsRef<Path>, opts: CacheOpts) -> Result<Arc<DiskStore>> {
+        let file = file.as_ref();
+        let name = file.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the database path does not name a file",
+            )
+        })?;
+
+        // The file itself may not exist yet, so it is the directory that is canonicalized - and it is created first,
+        // because `canonicalize` requires the path to exist. A bare file name lives in the current directory.
+        let parent = file.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let parent = parent.unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let directory = parent.canonicalize()?;
+        let file = directory.join(name);
 
         let cache_size = opts.max_capacity.clamp(MIN_CACHE_SIZE, MAX_CACHE_SIZE);
         let mut builder = Database::builder();
         builder.set_cache_size(usize::try_from(cache_size).unwrap_or(usize::MAX));
 
         for attempt in 0..OPEN_ATTEMPTS {
-            if let Some(store) = DiskStore::registered(&directory) {
+            if let Some(store) = DiskStore::registered(&file) {
                 return Ok(store);
             }
 
             // Deliberately *not* holding OPEN here. A store whose last handle has just gone still holds the file
             // lock until its `Drop` reaches OPEN, and that `Drop` cannot make progress while we hold it.
             match builder.create(&file) {
-                Ok(db) => return Ok(DiskStore::register(directory, db)),
+                Ok(db) => return Ok(DiskStore::register(directory, file, db, opts)),
                 // Either a teardown is still in flight, in which case waiting resolves it, or another process holds
-                // the directory, in which case the attempts run out and the caller gets a truthful error.
+                // the file, in which case the attempts run out and the caller gets a truthful error.
                 Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt + 1 < OPEN_ATTEMPTS => {
                     std::thread::sleep(OPEN_RETRY_DELAY);
                 }
@@ -101,18 +196,18 @@ impl DiskStore {
         Err(MemoError::Storage(redb::DatabaseError::DatabaseAlreadyOpen.into()))
     }
 
-    /// The live store already open on `directory`, if there is one.
+    /// The live store already open on `file`, if there is one.
     ///
     /// An entry whose store is mid-teardown is dropped on the way past: its `Weak` can no longer be upgraded, and
     /// leaving it would make every later caller consult a corpse.
-    fn registered(directory: &Path) -> Option<Arc<DiskStore>> {
+    fn registered(file: &Path) -> Option<Arc<DiskStore>> {
         let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
 
-        match open.get(directory) {
+        match open.get(file) {
             Some((_, weak)) => match weak.upgrade() {
                 Some(store) => Some(store),
                 None => {
-                    open.remove(directory);
+                    open.remove(file);
                     None
                 }
             },
@@ -120,12 +215,12 @@ impl DiskStore {
         }
     }
 
-    /// Registers `db` as the store for `directory`, or discards it if another caller got there first.
-    fn register(directory: PathBuf, db: Database) -> Arc<DiskStore> {
+    /// Registers `db` as the store for `file`, or discards it if another caller got there first.
+    fn register(directory: PathBuf, file: PathBuf, db: Database, opts: CacheOpts) -> Arc<DiskStore> {
         let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Someone may have finished opening this path while we were opening it too.
-        if let Some((_, weak)) = open.get(&directory)
+        if let Some((_, weak)) = open.get(&file)
             && let Some(store) = weak.upgrade()
         {
             return store;
@@ -134,12 +229,14 @@ impl DiskStore {
         let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         let store = Arc::new(DiskStore {
             db: RwLock::new(Some(db)),
-            directory: directory.clone(),
+            directory,
+            file: file.clone(),
             generation,
             sweeping: AtomicBool::new(false),
+            cadence: Cadence::new(opts),
         });
 
-        open.insert(directory, (generation, Arc::downgrade(&store)));
+        open.insert(file, (generation, Arc::downgrade(&store)));
         drop(open);
 
         // Reclaim whatever the previous run left behind, in the background so that opening stays cheap. It holds a
@@ -242,14 +339,34 @@ impl Store for DiskStore {
         record.extend_from_slice(&value);
 
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
-        let txn = DiskStore::database(&db).begin_write()?;
+        let mut txn = DiskStore::database(&db).begin_write()?;
         {
             let mut table = txn.open_table(ENTRIES)?;
             table.insert(key, record.as_slice())?;
         }
+
+        // Decided with the write transaction held, so no other write can slip into this window.
+        let durable = self.cadence.is_due();
+        if !durable {
+            txn.set_durability(Durability::None)?;
+        }
         txn.commit()?;
 
+        if durable {
+            self.cadence.durable();
+
+            #[cfg(test)]
+            self.cadence.durable_writes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cadence.deferred();
+        }
+
         Ok(())
+    }
+
+    fn flush(&self) -> Result<()> {
+        let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
+        DiskStore::flush_into(DiskStore::database(&db), &self.cadence)
     }
 
     fn cleanup(&self) -> Result<()> {
@@ -273,6 +390,26 @@ impl Store for DiskStore {
 }
 
 impl DiskStore {
+    /// Makes every deferred write durable with one empty durable commit. Nothing to do if no write is deferred.
+    ///
+    /// Takes the database and the cadence apart rather than `&self`, so [`Drop`] can call it on the database it has
+    /// exclusive access to.
+    fn flush_into(db: &Database, cadence: &Cadence) -> Result<()> {
+        let txn = db.begin_write()?;
+
+        // Checked with the write transaction held, so a write committing concurrently is either counted here or
+        // has not started.
+        if !cadence.has_pending() {
+            txn.abort()?;
+            return Ok(());
+        }
+
+        txn.commit()?;
+        cadence.durable();
+
+        Ok(())
+    }
+
     /// Deletes expired entries, then compacts so the space they held is actually returned to the filesystem.
     ///
     /// Compaction is skipped when the pass deleted nothing. It rewrites the whole database file and is the only
@@ -323,6 +460,16 @@ impl DiskStore {
 
 #[cfg(test)]
 impl DiskStore {
+    /// How many writes have committed durably. Test-only.
+    pub(super) fn durable_writes(&self) -> u64 {
+        self.cadence.durable_writes.load(Ordering::Relaxed)
+    }
+
+    /// Whether any committed write is still waiting to be made durable. Test-only.
+    pub(super) fn has_deferred(&self) -> bool {
+        self.cadence.has_pending()
+    }
+
     /// How many records the table physically holds, expired ones included. Test-only.
     pub(super) fn record_count(&self) -> Result<u64> {
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
@@ -338,15 +485,21 @@ impl DiskStore {
 
 impl Drop for DiskStore {
     fn drop(&mut self) {
+        // Persist what the cadence deferred, before taking the registry so a slow fsync does not hold up other
+        // opens. `Drop` cannot report a failure, and redb recovers to the last durable commit regardless.
+        if let Some(db) = self.db.get_mut().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            let _ = DiskStore::flush_into(db, &self.cadence);
+        }
+
         let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Only evict our own entry. Without the generation check, a `Drop` running after a new store had already
         // registered at this path would evict the live one and leave it unreachable.
         if open
-            .get(&self.directory)
+            .get(&self.file)
             .is_some_and(|(generation, _)| *generation == self.generation)
         {
-            open.remove(&self.directory);
+            open.remove(&self.file);
         }
 
         // Close the database *before* releasing the registry, so that a caller who takes the lock next and finds

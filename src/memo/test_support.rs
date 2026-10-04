@@ -35,6 +35,10 @@ impl Store for FailingStore {
         Ok(())
     }
 
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn path(&self) -> Option<&Path> {
         None
     }
@@ -75,6 +79,10 @@ impl Store for CountingStore {
 
     fn cleanup(&self) -> Result<()> {
         self.inner.cleanup()
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
     }
 
     fn path(&self) -> Option<&Path> {

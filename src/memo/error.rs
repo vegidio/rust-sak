@@ -39,7 +39,7 @@ pub enum MemoError {
 }
 
 // `#[from]` generates one conversion per variant, keyed on the field's type, so it covers `redb::Error` itself.
-// The six conversions below funnel *different* redb error types into that same `Storage` variant, which the derive
+// The seven conversions below funnel *different* redb error types into that same `Storage` variant, which the derive
 // cannot express — they stay hand-written.
 
 impl From<redb::DatabaseError> for MemoError {
@@ -74,6 +74,12 @@ impl From<redb::CommitError> for MemoError {
 
 impl From<redb::CompactionError> for MemoError {
     fn from(err: redb::CompactionError) -> Self {
+        MemoError::Storage(err.into())
+    }
+}
+
+impl From<redb::SetDurabilityError> for MemoError {
+    fn from(err: redb::SetDurabilityError) -> Self {
         MemoError::Storage(err.into())
     }
 }

@@ -29,17 +29,20 @@ Wrap a computation that is expensive to repeat — an HTTP request, a database q
 
 ## Public API
 
-| Function            | Signature                                                                        | What it does                                          |
-|---------------------|----------------------------------------------------------------------------------|-------------------------------------------------------|
-| `Memo::memory`      | `fn(CacheOpts) -> Result<Memo>`                                                  | A cache held entirely in memory.                      |
-| `Memo::disk`        | `fn(impl AsRef<Path>, CacheOpts) -> Result<Memo>`                                | A cache backed by a database in a directory.          |
-| `Memo::memory_disk` | `fn(impl AsRef<Path>, CacheOpts, Duration) -> Result<Memo>`                      | Memory in front of disk, with promotion.              |
-| `get_or_compute`    | `fn(&str, Duration, F) -> Result<T>`                                             | The cached value, or `compute`'s, cached.             |
-| `get_bytes`         | `fn(&str) -> Result<Option<Vec<u8>>>`                                            | The raw bytes under a key.                            |
-| `set_bytes`         | `fn(&str, &[u8], Duration) -> Result<()>`                                        | Writes raw bytes under a key.                         |
-| `path`              | `fn() -> Option<&Path>`                                                          | The backing directory, or `None` for memory-only.     |
-| `cleanup`           | `fn() -> Result<()>`                                                             | Reclaims the space expired entries hold.              |
-| `key_from`          | `fn(impl IntoIterator<Item = impl Serialize>) -> String`                         | A deterministic key from several values.              |
+| Function                 | Signature                                                   | What it does                                         |
+|--------------------------|-------------------------------------------------------------|------------------------------------------------------|
+| `Memo::memory`           | `fn(CacheOpts) -> Result<Memo>`                             | A cache held entirely in memory.                     |
+| `Memo::disk`             | `fn(impl AsRef<Path>, CacheOpts) -> Result<Memo>`           | A cache backed by `memo.redb` in a directory.        |
+| `Memo::disk_file`        | `fn(impl AsRef<Path>, CacheOpts) -> Result<Memo>`           | A cache backed by a database file you name.          |
+| `Memo::memory_disk`      | `fn(impl AsRef<Path>, CacheOpts, Duration) -> Result<Memo>` | Memory in front of disk, with promotion.             |
+| `Memo::memory_disk_file` | `fn(impl AsRef<Path>, CacheOpts, Duration) -> Result<Memo>` | Memory in front of a database file you name.         |
+| `get_or_compute`         | `fn(&str, Duration, F) -> Result<T>`                        | The cached value, or `compute`'s, cached.            |
+| `get_bytes`              | `fn(&str) -> Result<Option<Vec<u8>>>`                       | The raw bytes under a key.                           |
+| `set_bytes`              | `fn(&str, &[u8], Duration) -> Result<()>`                   | Writes raw bytes under a key.                        |
+| `path`                   | `fn() -> Option<&Path>`                                     | The backing directory, or `None` for memory-only.    |
+| `cleanup`                | `fn() -> Result<()>`                                        | Reclaims the space expired entries hold.             |
+| `flush`                  | `fn() -> Result<()>`                                        | Makes every deferred disk write durable.             |
+| `key_from`               | `fn(impl IntoIterator<Item = impl Serialize>) -> String`    | A deterministic key from several values.             |
 
 ## Choosing a store
 
@@ -64,6 +67,21 @@ let second = Memo::disk("/var/cache/myapp", CacheOpts::new())?;   // the same st
 
 That matters for anything whose setup can run twice: a library re-initialised without being torn down, a desktop app whose UI reloads while the backend keeps running, a test that opens a fixture per case. Directories are matched **after resolving symlinks**, so two links to one directory collide as they should. Sizing comes from whichever call opens the store; a caller handed an existing one gets its sizing.
 
+### Naming the database file
+
+`Memo::disk` and `Memo::memory_disk` keep their database in a file called `memo.redb` inside the directory you give them. To choose the file yourself, use `Memo::disk_file` or `Memo::memory_disk_file`, which create the file and its directory if needed:
+
+```rust
+# use rust_sak::memo::{CacheOpts, Memo};
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let thumbnails = Memo::disk_file("/var/cache/myapp/thumbnails.redb", CacheOpts::new())?;
+let probes = Memo::disk_file("/var/cache/myapp/probes.redb", CacheOpts::new())?;   // a separate store
+# Ok(())
+# }
+```
+
+Two files in one directory are two separate stores, and opening one file twice shares a store exactly as opening one directory twice does. `path` still reports the **directory** that holds the file.
+
 The store closes when the last handle is dropped — there is no `close`. Handles share the store but not the deduplication, so prefer cloning a `Memo` over constructing a second one for the same directory.
 
 ### Memory + disk
@@ -85,14 +103,16 @@ let memo = Memo::memory_disk("/var/cache/myapp", CacheOpts::new(), Duration::fro
 
 ### `CacheOpts`
 
-A consuming builder. Both figures are hints, clamped to whatever the engine accepts, so no value here can stop a store from opening.
+A consuming builder, and `Copy`. The two sizes are hints, clamped to whatever the engine accepts, so no value here can stop a store from opening. The two flush settings set how often a disk write is made durable; see [Durability](#durability-and-deferred-writes).
 
-| Method         | Default | Notes                                                                                  |
-|----------------|---------|----------------------------------------------------------------------------------------|
-| `max_entries`  | 10,000  | Sizes the memory tier. The disk tier has nothing to map it onto and **ignores it**.    |
-| `max_capacity` | 1 GiB   | A real byte ceiling in memory; on disk it sizes the read cache, **not the directory**. |
+| Method           | Default   | Notes                                                                                     |
+|------------------|-----------|-------------------------------------------------------------------------------------------|
+| `max_entries`    | 10,000    | Sizes the memory tier. The disk tier has nothing to map it onto and **ignores it**.       |
+| `max_capacity`   | 1 GiB     | A real byte ceiling in memory; on disk it sizes the read cache, **not the directory**.    |
+| `flush_every`    | 1         | A disk write is made durable at least every this many writes. The memory tier ignores it. |
+| `flush_interval` | 0 (never) | A disk write is also made durable once this long has passed since the last durable one.   |
 
-Passing `0` to either restores its default. **The disk cache is not size-bounded** — use TTLs and `cleanup` to keep it in check, and don't read `max_capacity(512 << 20)` as "this directory stays under 512 MiB".
+Passing `0` to `max_entries`, `max_capacity` or `flush_every` restores its default. **The disk cache is not size-bounded** — use TTLs and `cleanup` to keep it in check, and don't read `max_capacity(512 << 20)` as "this directory stays under 512 MiB".
 
 ### `KeyBuilder` and `key_from`
 
@@ -211,6 +231,39 @@ if let Err(err) = memo.cleanup() {
 ```
 
 It is safe to call at any time, is a no-op on a memory-only cache, and a call made while another sweep is running returns immediately rather than queueing. Prefer a quiet moment: when the sweep actually deletes something it goes on to compact, and compaction briefly excludes readers while it rewrites the file. A sweep that finds nothing to delete skips compaction entirely, so opening a healthy cache costs nothing.
+
+### Durability and deferred writes
+
+By default every disk write is **durable**: it is forced to disk before `set_bytes` or `get_or_compute` returns. That costs an fsync per write, and the database admits one writer at a time, so a burst of writes from many threads queues behind every one of those fsyncs — several milliseconds each on a typical SSD.
+
+When you write in bulk, defer it. `flush_every(n)` makes only every `n`th write durable, and `flush_interval(t)` also makes one durable once `t` has passed since the last; whichever comes first wins:
+
+```rust
+use std::time::Duration;
+use rust_sak::memo::{CacheOpts, Memo};
+
+let dir = tempfile::tempdir()?;
+let opts = CacheOpts::new().flush_every(64).flush_interval(Duration::from_secs(1));
+let memo = Memo::disk(dir.path(), opts)?;
+
+for index in 0..1_000 {
+    memo.set_bytes(&format!("frame:{index}"), b"...", Duration::from_secs(3600))?;
+}
+
+// Every write above is readable already; this forces the deferred ones to disk.
+memo.flush()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The writes in between are still committed, so they are **readable at once** — only forcing them to disk is deferred. A durable write persists every deferred one before it. What that buys and what it costs:
+
+- **Bulk writes get much cheaper.** In this crate's benchmark, 9,000 writes from a thread pool took about 1.2 s with `flush_every(64)`, against about 42 s with every write durable.
+- **A hard kill loses the deferred writes.** A process killed without unwinding (SIGKILL, or a default Ctrl+C) loses at most the writes since the last durable one; the next open recovers to that point. For a cache that is one recomputation per lost entry.
+- **The interval is checked only when a write happens.** There is no timer thread, so a store that goes quiet keeps its deferred writes until the next write, a `flush`, or the drop below.
+- **Dropping the last handle makes them durable,** with one final commit before the store closes. A failure there cannot be reported, so call `flush` yourself when you need to know it worked.
+- **`flush` sets a durability point on demand** — after a batch, say. It is a no-op when nothing is deferred and for a memory-only cache.
+
+A store's cadence comes from whichever call opens it, like its sizing. A two-tier cache passes the cadence to its disk tier; the memory tier has nothing to make durable.
 
 ## Things worth knowing
 

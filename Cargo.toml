@@ -127,6 +127,7 @@ windows = { version = "0.62", features = [
 ], optional = true }
 
 [dev-dependencies]
+rayon = "1.12"
 tempfile = "3.27"
 tokio = { version = "1.52.3", features = ["macros", "rt", "time", "test-util", "net", "io-util"] }
 

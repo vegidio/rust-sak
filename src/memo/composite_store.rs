@@ -21,9 +21,20 @@ pub(super) struct CompositeStore {
 impl CompositeStore {
     /// Builds a two-tier store over the disk store in `directory`.
     pub(super) fn open(directory: impl AsRef<Path>, opts: CacheOpts, promote_ttl: Duration) -> Result<Self> {
+        CompositeStore::with_disk(DiskStore::open(directory, opts)?, opts, promote_ttl)
+    }
+
+    /// Builds a two-tier store over the disk store in the database `file`.
+    pub(super) fn open_file(file: impl AsRef<Path>, opts: CacheOpts, promote_ttl: Duration) -> Result<Self> {
+        CompositeStore::with_disk(DiskStore::open_file(file, opts)?, opts, promote_ttl)
+    }
+
+    /// Puts a memory tier sized by `opts` in front of `disk`. The cadence in `opts` has already reached `disk`, the
+    /// only tier with writes to defer.
+    fn with_disk(disk: Arc<DiskStore>, opts: CacheOpts, promote_ttl: Duration) -> Result<Self> {
         Ok(CompositeStore {
             memory: MemoryStore::new(opts),
-            disk: DiskStore::open(directory, opts)?,
+            disk,
             promote_ttl,
         })
     }
@@ -71,6 +82,10 @@ impl Store for CompositeStore {
     fn cleanup(&self) -> Result<()> {
         self.memory.cleanup()?;
         self.disk.cleanup()
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.disk.flush()
     }
 
     fn path(&self) -> Option<&Path> {

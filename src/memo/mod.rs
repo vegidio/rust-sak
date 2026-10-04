@@ -113,6 +113,28 @@ impl Memo {
         Ok(Memo::with_store(DiskStore::open(directory, opts)?))
     }
 
+    /// Opens a cache backed by the database `file`, creating the file and its directory if they do not exist.
+    ///
+    /// [`Memo::disk`] with a file name of your choosing: two files in one directory are two separate stores, and a
+    /// file this process already has open yields the **same** store, exactly as a directory does there.
+    /// [`path`](Memo::path) still reports the directory holding the file.
+    ///
+    /// ```no_run
+    /// use rust_sak::memo::{CacheOpts, Memo};
+    ///
+    /// let memo = Memo::disk_file("/var/cache/myapp/thumbnails.redb", CacheOpts::new())?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// Blocks exactly as [`Memo::disk`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memo::disk`], plus [`MemoError::Io`] if `file` does not end in a file name.
+    pub fn disk_file(file: impl AsRef<Path>, opts: CacheOpts) -> Result<Self> {
+        Ok(Memo::with_store(DiskStore::open_file(file, opts)?))
+    }
+
     /// Opens a two-tier cache: memory in front of the database in `directory`.
     ///
     /// Reads try memory first and fall back to disk; a disk hit is copied back into memory for `promote_ttl`, or for
@@ -127,6 +149,21 @@ impl Memo {
     pub fn memory_disk(directory: impl AsRef<Path>, opts: CacheOpts, promote_ttl: Duration) -> Result<Self> {
         Ok(Memo::with_store(Arc::new(CompositeStore::open(
             directory,
+            opts,
+            promote_ttl,
+        )?)))
+    }
+
+    /// Opens a two-tier cache: memory in front of the database `file`.
+    ///
+    /// [`Memo::memory_disk`] with a file name of your choosing, in the way [`Memo::disk_file`] is to [`Memo::disk`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Memo::disk_file`].
+    pub fn memory_disk_file(file: impl AsRef<Path>, opts: CacheOpts, promote_ttl: Duration) -> Result<Self> {
+        Ok(Memo::with_store(Arc::new(CompositeStore::open_file(
+            file,
             opts,
             promote_ttl,
         )?)))
@@ -167,6 +204,22 @@ impl Memo {
     /// Returns [`MemoError::Storage`] if the sweep or the compaction fails.
     pub fn cleanup(&self) -> Result<()> {
         self.store.cleanup()
+    }
+
+    /// Makes every write the cache has deferred durable.
+    ///
+    /// Writes are deferred only when [`CacheOpts::flush_every`] or [`CacheOpts::flush_interval`] asks for it; they are
+    /// readable at once, but a process killed without unwinding loses them. Dropping the last handle to a store does
+    /// this on its own, so call it to set a durability point of your choosing — after a batch, say, or before a step
+    /// that might not unwind. It is a no-op for a memory-only cache, and when nothing is deferred.
+    ///
+    /// This blocks on an fsync, so from an async task reach for `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoError::Storage`] if the commit fails.
+    pub fn flush(&self) -> Result<()> {
+        self.store.flush()
     }
 
     /// Reads the raw bytes stored under `key`.

@@ -2913,6 +2913,7 @@ dependencies = [
  "objc2-io-kit",
  "pin-project-lite",
  "postcard",
+ "rayon",
  "redb",
  "reqwest",
  "semver",

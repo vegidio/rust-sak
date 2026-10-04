@@ -588,6 +588,239 @@ fn path_reports_the_canonical_directory_and_none_for_memory() {
     assert!(memory().path().is_none());
 }
 
+// --- Deferred durability ---
+
+/// Options that defer every write a test makes.
+fn deferred() -> CacheOpts {
+    CacheOpts::new().flush_every(1000)
+}
+
+#[test]
+fn a_deferred_write_is_readable_at_once() {
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), deferred()).unwrap();
+
+    store.set("k", bytes(b"v"), LONG).unwrap();
+
+    assert!(store.has_deferred(), "the write should not have been made durable yet");
+    assert_eq!(store.durable_writes(), 0);
+    assert_eq!(
+        store.get("k").unwrap().map(|entry| entry.value.to_vec()),
+        Some(b"v".to_vec())
+    );
+}
+
+#[test]
+fn the_default_cadence_makes_every_write_durable() {
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+
+    for index in 0..5 {
+        store.set(&format!("k{index}"), bytes(b"v"), LONG).unwrap();
+    }
+
+    assert_eq!(store.durable_writes(), 5);
+    assert!(!store.has_deferred());
+}
+
+#[test]
+fn parallel_writers_make_one_durable_write_per_window() {
+    const THREADS: usize = 8;
+    const WRITES: usize = 128;
+    const EVERY: u32 = 16;
+
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), CacheOpts::new().flush_every(EVERY)).unwrap();
+    let barrier = Barrier::new(THREADS);
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let (store, barrier) = (&store, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                for index in 0..WRITES {
+                    store.set(&format!("t{thread}-{index}"), bytes(b"v"), LONG).unwrap();
+                }
+            });
+        }
+    });
+
+    let total = (THREADS * WRITES) as u64;
+    assert_eq!(store.durable_writes(), total / u64::from(EVERY));
+    assert!(!store.has_deferred(), "{total} writes fill a whole number of windows");
+}
+
+#[test]
+fn the_interval_makes_a_write_durable_once_it_has_passed() {
+    let dir = TempDir::new().unwrap();
+    let opts = deferred().flush_interval(Duration::from_millis(200));
+    let store = DiskStore::open(dir.path(), opts).unwrap();
+
+    store.set("first", bytes(b"v"), LONG).unwrap();
+    assert_eq!(store.durable_writes(), 0, "the interval has not passed yet");
+
+    std::thread::sleep(Duration::from_millis(300));
+    store.set("second", bytes(b"v"), LONG).unwrap();
+
+    assert_eq!(store.durable_writes(), 1);
+    assert!(!store.has_deferred());
+}
+
+#[test]
+fn deferred_writes_survive_the_last_handle_dropping() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let memo = Memo::disk(dir.path(), deferred()).unwrap();
+        for index in 0..100 {
+            memo.set_bytes(&format!("k{index}"), b"v", LONG).unwrap();
+        }
+    }
+
+    let reopened = Memo::disk(dir.path(), CacheOpts::new()).unwrap();
+    for index in 0..100 {
+        assert_eq!(reopened.get_bytes(&format!("k{index}")).unwrap(), Some(b"v".to_vec()));
+    }
+}
+
+#[test]
+fn flush_makes_deferred_writes_durable() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let store = DiskStore::open(dir.path(), deferred()).unwrap();
+        for index in 0..100 {
+            store.set(&format!("k{index}"), bytes(b"v"), LONG).unwrap();
+        }
+
+        assert!(store.has_deferred());
+        Memo::with_store(Arc::clone(&store) as Arc<dyn Store>).flush().unwrap();
+        assert!(!store.has_deferred(), "flush should have left nothing deferred");
+    }
+
+    let reopened = Memo::disk(dir.path(), CacheOpts::new()).unwrap();
+    for index in 0..100 {
+        assert_eq!(reopened.get_bytes(&format!("k{index}")).unwrap(), Some(b"v".to_vec()));
+    }
+}
+
+#[test]
+fn flush_with_nothing_deferred_succeeds() {
+    let (memo, _dir) = disk();
+
+    memo.flush().unwrap();
+    memo.set_bytes("k", b"v", LONG).unwrap();
+    memo.flush().unwrap();
+}
+
+#[test]
+fn flush_is_a_no_op_for_a_memory_only_cache_and_the_cadence_is_ignored() {
+    let memo = Memo::memory(deferred().flush_interval(Duration::from_millis(1))).unwrap();
+
+    memo.set_bytes("k", b"v", LONG).unwrap();
+    memo.flush().unwrap();
+
+    assert_eq!(memo.get_bytes("k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn a_two_tier_cache_passes_the_cadence_to_its_disk_tier() {
+    let dir = TempDir::new().unwrap();
+    let store = CompositeStore::open(dir.path(), deferred(), LONG).unwrap();
+
+    store.set("k", bytes(b"v"), LONG).unwrap();
+
+    assert!(
+        store.disk.has_deferred(),
+        "the disk tier should have deferred the write"
+    );
+}
+
+#[test]
+fn deferred_writes_on_a_two_tier_cache_survive_the_last_handle_dropping() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let memo = Memo::memory_disk(dir.path(), deferred(), LONG).unwrap();
+        for index in 0..100 {
+            memo.set_bytes(&format!("k{index}"), b"v", LONG).unwrap();
+        }
+    }
+
+    // A fresh memory tier, so every read has to come from disk.
+    let reopened = Memo::memory_disk(dir.path(), CacheOpts::new(), Duration::ZERO).unwrap();
+    for index in 0..100 {
+        assert_eq!(reopened.get_bytes(&format!("k{index}")).unwrap(), Some(b"v".to_vec()));
+    }
+}
+
+// --- Database files ---
+
+#[test]
+fn disk_file_creates_the_named_file_and_reports_its_directory() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("nested").join("custom.redb");
+
+    let memo = Memo::disk_file(&file, CacheOpts::new()).unwrap();
+    memo.set_bytes("k", b"v", LONG).unwrap();
+
+    assert!(file.is_file(), "the named database file should exist");
+    assert!(!dir.path().join("nested").join("memo.redb").exists());
+    assert_eq!(
+        memo.path(),
+        Some(dir.path().join("nested").canonicalize().unwrap().as_path())
+    );
+}
+
+#[test]
+fn two_files_in_one_directory_are_separate_stores() {
+    let dir = TempDir::new().unwrap();
+
+    let first = Memo::disk_file(dir.path().join("first.redb"), CacheOpts::new()).unwrap();
+    let second = Memo::disk_file(dir.path().join("second.redb"), CacheOpts::new()).unwrap();
+    let default = Memo::disk(dir.path(), CacheOpts::new()).unwrap();
+
+    first.set_bytes("k", b"v", LONG).unwrap();
+
+    assert_eq!(second.get_bytes("k").unwrap(), None);
+    assert_eq!(default.get_bytes("k").unwrap(), None);
+    assert_eq!(first.path(), second.path());
+}
+
+#[test]
+fn two_opens_of_one_file_share_a_store() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("cache.redb");
+
+    let first = Memo::disk_file(&file, CacheOpts::new()).unwrap();
+    let second = Memo::memory_disk_file(dir.path().join(".").join("cache.redb"), CacheOpts::new(), LONG).unwrap();
+
+    first.set_bytes("k", b"v", LONG).unwrap();
+
+    assert_eq!(second.get_bytes("k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn disk_opens_the_same_store_as_disk_file_on_memo_redb() {
+    let dir = TempDir::new().unwrap();
+
+    let by_directory = Memo::disk(dir.path(), CacheOpts::new()).unwrap();
+    let by_file = Memo::disk_file(dir.path().join("memo.redb"), CacheOpts::new()).unwrap();
+
+    by_directory.set_bytes("k", b"v", LONG).unwrap();
+
+    assert_eq!(by_file.get_bytes("k").unwrap(), Some(b"v".to_vec()));
+}
+
+#[test]
+fn a_path_without_a_file_name_is_rejected() {
+    let dir = TempDir::new().unwrap();
+
+    let err = Memo::disk_file(dir.path().join(".."), CacheOpts::new()).unwrap_err();
+
+    assert!(matches!(err, MemoError::Io(_)), "unexpected error: {err:?}");
+}
+
 // --- Cleanup ---
 
 #[test]
@@ -901,4 +1134,40 @@ fn a_payload_with_bytes_left_over_is_treated_as_a_miss() {
         value, 9,
         "a payload that is not consumed exactly must be recomputed, not partially read"
     );
+}
+
+// --- Benchmarks ---
+
+/// Times 9,000 parallel disk writes shaped like a decoded-media cache: run with `--ignored --nocapture`.
+///
+/// Not an assertion, because timings depend on the machine; it prints both cadences side by side. On an APFS SSD the
+/// deferred cadence takes about 1-2 s, against tens of seconds with every write durable.
+#[test]
+#[ignore = "a benchmark: run it explicitly with --ignored --nocapture"]
+fn benchmark_parallel_writes_with_a_deferred_cadence() {
+    use rayon::prelude::*;
+
+    const ENTRIES: usize = 9_000;
+
+    let time = |opts: CacheOpts| {
+        let dir = TempDir::new().unwrap();
+        let memo = Memo::disk(dir.path(), opts).unwrap();
+        let small = vec![0x5A_u8; 11 * 11 * 3];
+        let large = vec![0x5A_u8; 11 * 11 * 3 * 120];
+
+        let started = std::time::Instant::now();
+        (0..ENTRIES).into_par_iter().for_each(|index| {
+            let value = if index % 10 == 0 { &large } else { &small };
+            memo.set_bytes(&format!("k{index}"), value, LONG).unwrap();
+        });
+        drop(memo);
+
+        started.elapsed()
+    };
+
+    let deferred = time(CacheOpts::new().flush_every(64));
+    println!("{ENTRIES} writes with flush_every(64): {deferred:?}");
+
+    let durable = time(CacheOpts::new());
+    println!("{ENTRIES} writes with every write durable: {durable:?}");
 }
