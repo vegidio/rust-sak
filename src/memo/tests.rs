@@ -97,13 +97,16 @@ fn a_zero_ttl_write_is_not_admitted_on_disk() {
 
 #[test]
 fn a_disk_entry_expires_on_wall_clock_time() {
+    // The deadline is taken before the commit, so a slow fsync can eat a `SHORT` TTL before the write returns. A
+    // `LONG` entry beside it shows the store serves what has not expired, without racing the write's latency.
     let (memo, _dir) = disk();
 
-    memo.set_bytes("k", b"v", SHORT).unwrap();
-    assert_eq!(memo.get_bytes("k").unwrap(), Some(b"v".to_vec()));
+    memo.set_bytes("short", b"v", SHORT).unwrap();
+    memo.set_bytes("long", b"v", LONG).unwrap();
 
     std::thread::sleep(EXPIRED);
-    assert_eq!(memo.get_bytes("k").unwrap(), None);
+    assert_eq!(memo.get_bytes("short").unwrap(), None);
+    assert_eq!(memo.get_bytes("long").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
