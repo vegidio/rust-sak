@@ -14,6 +14,7 @@
 //!   depth) from its header without decoding the pixels.
 //! - [`rotate`] — turn an image by any angle onto a canvas expanded to contain it, clockwise for a positive
 //!   angle, with the uncovered area left transparent.
+//! - [`fit`] — scale an image down so its longer edge equals a bound, keeping the aspect ratio and never enlarging.
 //! - [`encode_file`] — encode and save to a path, format chosen from its extension.
 //! - [`encode_writer`] — encode and write to any [`Write`](std::io::Write) sink with an explicit [`ImageFormat`].
 //!
@@ -73,6 +74,7 @@ mod dispatch;
 mod encode_file;
 mod encode_writer;
 mod error;
+mod fit;
 mod format;
 mod format_from_bytes;
 mod info;
@@ -89,6 +91,7 @@ pub use decode_file::decode_file;
 pub use encode_file::encode_file;
 pub use encode_writer::encode_writer;
 pub use error::{ImageError, Result};
+pub use fit::fit;
 pub use format::ImageFormat;
 pub use format_from_bytes::format_from_bytes;
 pub use info::ImageInfo;

@@ -33,8 +33,8 @@ use rust_sak::image::{
 
 ## Public functions
 
-All are synchronous. Every one that touches a file or a codec returns `Result<T, ImageError>`; `rotate` is pure
-pixel arithmetic with nothing to fail, so it returns its picture directly.
+All are synchronous. Every one that touches a file or a codec returns `Result<T, ImageError>`; `rotate` and `fit`
+are pure pixel arithmetic with nothing to fail, so they return their picture directly.
 
 ### Decoding → `DynamicImage`
 
@@ -57,10 +57,11 @@ pixel arithmetic with nothing to fail, so it returns its picture directly.
 | Function | Signature                                                      | What it does                                                                                                                     |
 |----------|------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
 | `rotate` | `fn rotate(image: &DynamicImage, degrees: f64) -> DynamicImage` | Turns an image by **any** angle onto a canvas expanded to contain it. **Positive is clockwise.** The result **carries alpha**. |
+| `fit`    | `fn fit(img: &DynamicImage, bound: NonZeroU32) -> Cow<'_, DynamicImage>` | Scales an image down so its **longer edge equals `bound`**, keeping the aspect ratio. **Never enlarges.** |
 
 The `image` crate already flips (`imageops::flip_horizontal`, `flip_vertical`), turns by quarter turns
-(`rotate90`/`180`/`270`) and crops (`crop_imm`), and this module does not wrap any of them — `rotate` is only the
-piece that was missing.
+(`rotate90`/`180`/`270`) and crops (`crop_imm`), and this module does not wrap any of them — `rotate` and `fit` are
+the pieces that were missing.
 
 - **Positive is clockwise**, matching CSS `transform: rotate()` and the direction an on-screen rotation control
   reports, so no caller has to negate. Angles are taken modulo 360.
@@ -73,6 +74,15 @@ piece that was missing.
 - **Sampling is bilinear**, weighted by each neighbour's own alpha so a transparent one cannot bleed its colour
   into the edge. The exact quarter turns take the `image` crate's own exact rotations instead, so they neither
   interpolate nor gain a row.
+
+`fit` is the downscale a thumbnail or preview wants:
+
+- **A picture that already fits comes back `Cow::Borrowed`** — no copy and no filter pass.
+- **Otherwise it is resampled with Lanczos3.** When the bound is less than a third of the longer edge, a fast
+  integer-averaging prefilter (`DynamicImage::thumbnail`) first brings it to three times the bound. The result stays
+  above 40 dB PSNR against a pure Lanczos3 pass, for about a third of the cost.
+- **The short edge is rounded to the nearest pixel, and is at least 1**, so a 1×10000 strip keeps its column.
+- **The colour type is preserved** — RGBA stays RGBA, 16-bit stays 16-bit.
 
 ### Encoding
 
