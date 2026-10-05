@@ -3,8 +3,8 @@ use super::dispatch::probe_with_format;
 use super::error::{ImageError, Result};
 use super::info::ImageInfo;
 
-/// Reads the metadata of the encoded image in `bytes` (dimensions, color type, bit depth) **without decoding
-/// the pixels**, guessing the format from its magic bytes.
+/// Reads the metadata of the encoded image in `bytes` (dimensions, color type, bit depth, color profile)
+/// **without decoding the pixels**, guessing the format from its magic bytes.
 ///
 /// # Errors
 ///

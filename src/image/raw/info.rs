@@ -6,8 +6,7 @@ use super::RawFormat;
 /// deliberately not [`ImageInfo`](super::super::ImageInfo), for two reasons that pull the same way: `ImageInfo::format` is
 /// an [`ImageFormat`](super::super::ImageFormat), which has no RAW member and cannot honestly be given one, and RAW files
 /// carry two facts — the camera's make and model — that a photographer's file listing wants and that no `ImageInfo`
-/// field holds. Widening `ImageInfo` to fit would also cost it its `Copy`, which the eight native formats have no
-/// reason to give up.
+/// field holds.
 ///
 /// There is no `color_type`: a developed RAW is always 16-bit RGB here (see
 /// [`decode_raw_bytes`](super::decode_raw_bytes)), so the field would report one constant.

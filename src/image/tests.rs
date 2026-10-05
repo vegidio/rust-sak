@@ -56,6 +56,12 @@ fn format_extensions_start_with_the_canonical_extension() {
 }
 
 #[test]
+fn format_names() {
+    let names: Vec<_> = ImageFormat::ALL.into_iter().map(ImageFormat::name).collect();
+    assert_eq!(names, ["BMP", "GIF", "JPEG", "PNG", "TIFF", "AVIF", "HEIF", "WebP"]);
+}
+
+#[test]
 fn format_extensions_are_disjoint() {
     let mut seen = std::collections::HashSet::new();
     for format in ImageFormat::ALL {
@@ -562,6 +568,527 @@ fn bmp_and_jpeg_write_a_sixteen_bit_picture_with_their_own_hook() {
         let decoded = decode_bytes_with_format(&encode(&image, format), format)
             .unwrap_or_else(|e| panic!("{format:?} no longer converts 16-bit input itself: {e}"));
         assert_eq!((decoded.width(), decoded.height()), (8, 8), "format {format:?}");
+    }
+}
+
+// ── Color profile ──────────────────────────────────────────────────────────────────────────────────────────────
+
+mod color_profile {
+    use std::cell::Cell;
+    use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+    use std::rc::Rc;
+
+    use ::image::codecs::jpeg::JpegEncoder;
+    use ::image::codecs::png::PngEncoder;
+    use ::image::{ImageEncoder, Rgb, RgbImage};
+
+    use super::super::dispatch::probe_native;
+    use super::super::icc;
+    use super::*;
+
+    /// A minimal ICC profile with one `desc` tag holding `tag` (the full tag data, signature included).
+    pub(super) fn icc_with_desc(tag: &[u8]) -> Vec<u8> {
+        let mut profile = vec![0_u8; 128];
+        profile[36..40].copy_from_slice(b"acsp");
+        profile.extend(1_u32.to_be_bytes());
+        profile.extend(b"desc");
+        profile.extend(144_u32.to_be_bytes());
+        profile.extend((tag.len() as u32).to_be_bytes());
+        profile.extend(tag);
+        let len = profile.len() as u32;
+        profile[0..4].copy_from_slice(&len.to_be_bytes());
+        profile
+    }
+
+    /// An ICC v2 profile whose `desc` is a `textDescriptionType` holding `text`.
+    pub(super) fn icc_v2(text: &str) -> Vec<u8> {
+        let mut tag = b"desc\0\0\0\0".to_vec();
+        tag.extend((text.len() as u32 + 1).to_be_bytes());
+        tag.extend(text.as_bytes());
+        tag.push(0);
+        // The empty Unicode and ScriptCode parts a v2 description always carries.
+        tag.extend([0_u8; 4 + 4 + 2 + 1 + 67]);
+        icc_with_desc(&tag)
+    }
+
+    /// An ICC v4 profile whose `desc` is a `multiLocalizedUnicodeType` with one record per `(language, text)`.
+    pub(super) fn icc_v4(records: &[(&str, &str)]) -> Vec<u8> {
+        let mut tag = b"mluc\0\0\0\0".to_vec();
+        tag.extend((records.len() as u32).to_be_bytes());
+        tag.extend(12_u32.to_be_bytes());
+
+        let mut strings = Vec::new();
+        let base = 16 + records.len() * 12;
+        for (language, text) in records {
+            let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            tag.extend(language.as_bytes());
+            tag.extend(b"US");
+            tag.extend((utf16.len() as u32).to_be_bytes());
+            tag.extend(((base + strings.len()) as u32).to_be_bytes());
+            strings.extend(utf16);
+        }
+        tag.extend(strings);
+        icc_with_desc(&tag)
+    }
+
+    #[test]
+    fn reads_a_v2_ascii_description() {
+        assert_eq!(
+            icc::description(&icc_v2("sRGB IEC61966-2.1")).as_deref(),
+            Some("sRGB IEC61966-2.1")
+        );
+    }
+
+    #[test]
+    fn prefers_the_english_v4_record() {
+        let profile = icc_v4(&[("de", "Anzeige P3"), ("en", "Display P3"), ("fr", "Écran P3")]);
+        assert_eq!(icc::description(&profile).as_deref(), Some("Display P3"));
+    }
+
+    #[test]
+    fn falls_back_to_the_first_v4_record_without_english() {
+        let profile = icc_v4(&[("de", "Anzeige P3"), ("fr", "Écran P3")]);
+        assert_eq!(icc::description(&profile).as_deref(), Some("Anzeige P3"));
+    }
+
+    #[test]
+    fn trims_and_caps_the_description() {
+        assert_eq!(
+            icc::description(&icc_v2("  Display P3 \n")).as_deref(),
+            Some("Display P3")
+        );
+
+        let long = "x".repeat(200);
+        assert_eq!(icc::description(&icc_v2(&long)).map(|s| s.chars().count()), Some(64));
+        let wide = "é".repeat(200);
+        assert_eq!(
+            icc::description(&icc_v4(&[("en", &wide)])).map(|s| s.chars().count()),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn a_profile_without_a_desc_tag_has_no_description() {
+        let mut profile = icc_v2("Display P3");
+        profile[132..136].copy_from_slice(b"cprt");
+        assert_eq!(icc::description(&profile), None);
+    }
+
+    #[test]
+    fn blank_descriptions_are_none() {
+        assert_eq!(icc::description(&icc_v2("   ")), None);
+        assert_eq!(icc::description(&icc_v4(&[])), None);
+    }
+
+    #[test]
+    fn truncated_or_garbage_input_never_panics() {
+        for profile in [icc_v2("Display P3"), icc_v4(&[("en", "Display P3")])] {
+            for len in 0..profile.len() {
+                let _ = icc::description(&profile[..len]);
+            }
+        }
+
+        assert_eq!(icc::description(&[]), None);
+        assert_eq!(icc::description(&[0xFF; 300]), None);
+
+        // A valid header whose counts, offsets and sizes are all as large as they can be.
+        let mut huge = icc_v4(&[("en", "Display P3")]);
+        huge[128..132].copy_from_slice(&u32::MAX.to_be_bytes());
+        huge[140..144].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(icc::description(&huge), None);
+
+        let mut huge = icc_v4(&[("en", "Display P3")]);
+        huge[144 + 8..144 + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+        huge[144 + 12..144 + 16].copy_from_slice(&u32::MAX.to_be_bytes());
+        let _ = icc::description(&huge);
+
+        let mut huge = icc_v2("Display P3");
+        huge[144 + 8..144 + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(icc::description(&huge), None);
+    }
+
+    /// `image` encoded as `format` (PNG or JPEG) with `profile` embedded.
+    fn encode_with_icc(image: &DynamicImage, format: ImageFormat, profile: Vec<u8>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        match format {
+            ImageFormat::Png => {
+                let mut encoder = PngEncoder::new(&mut bytes);
+                encoder.set_icc_profile(profile).unwrap();
+                image.write_with_encoder(encoder).unwrap();
+            }
+            ImageFormat::Jpeg => {
+                let mut encoder = JpegEncoder::new(&mut bytes);
+                encoder.set_icc_profile(profile).unwrap();
+                image.write_with_encoder(encoder).unwrap();
+            }
+            other => unreachable!("{other:?} has no ICC-capable encoder here"),
+        }
+        bytes
+    }
+
+    #[test]
+    fn native_formats_report_an_embedded_profile() {
+        let profile = icc_v4(&[("en", "Display P3")]);
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let bytes = encode_with_icc(&sample_image(), format, profile.clone());
+            let info = probe_bytes(&bytes).unwrap();
+            assert_eq!(info.color_profile.as_deref(), Some("Display P3"), "format {format:?}");
+
+            let path = std::env::temp_dir().join(format!("rust_sak_icc_{}.{}", std::process::id(), format.extension()));
+            std::fs::write(&path, &bytes).unwrap();
+            let from_file = probe_file(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(from_file.unwrap(), info, "format {format:?}");
+        }
+    }
+
+    #[test]
+    fn an_untagged_image_has_no_profile() {
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg,
+            ImageFormat::Bmp,
+            ImageFormat::Gif,
+            ImageFormat::Tiff,
+        ] {
+            let info = probe_bytes(&encode(&sample_image(), format)).unwrap();
+            assert_eq!(info.color_profile, None, "format {format:?}");
+        }
+    }
+
+    /// A reader that records the furthest byte it was asked for.
+    struct Spy<R> {
+        inner: R,
+        furthest: Rc<Cell<u64>>,
+    }
+
+    impl<R: Read + Seek> Read for Spy<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            let position = self.inner.stream_position()?;
+            self.furthest.set(self.furthest.get().max(position));
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Spy<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn the_native_probe_reads_only_the_header() {
+        // Noise compresses badly, so the pixel data runs to megabytes behind a header of a few hundred bytes.
+        let mut state = 0x2545_F491_u32;
+        let noise = RgbImage::from_fn(1024, 1024, |_, _| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            Rgb(state.to_le_bytes()[..3].try_into().unwrap())
+        });
+        let profile = icc_v4(&[("en", "Display P3")]);
+
+        // PNG only: the `image` crate's JPEG decoder buffers its whole input before parsing the header, so a JPEG
+        // probe reads the file (without decoding it) whether or not the profile is asked for.
+        let bytes = encode_with_icc(&DynamicImage::ImageRgb8(noise), ImageFormat::Png, profile);
+        let furthest = Rc::new(Cell::new(0));
+        let spy = Spy {
+            inner: Cursor::new(&bytes),
+            furthest: Rc::clone(&furthest),
+        };
+
+        // The function `probe_file` hands the opened file to, with the same buffering in front of it.
+        let info = probe_native(BufReader::new(spy), ImageFormat::Png).unwrap();
+
+        assert_eq!(info.color_profile.as_deref(), Some("Display P3"));
+        assert!(bytes.len() > 1 << 20, "the sample is too small to tell");
+        assert!(
+            furthest.get() <= 64 * 1024,
+            "the probe read {} of {} bytes",
+            furthest.get(),
+            bytes.len()
+        );
+    }
+
+    // ── Containers: WebP, AVIF, HEIF ──
+    //
+    // None of the three encoders can embed a profile, so these files are encoded plainly and then rewritten.
+
+    /// A plain (`VP8 `) WebP turned into an extended one carrying `profile` in an `ICCP` chunk.
+    fn webp_with_icc(simple: &[u8], width: u32, height: u32, profile: &[u8]) -> Vec<u8> {
+        assert_eq!(&simple[12..16], b"VP8 ", "expected a simple lossy WebP");
+
+        let mut vp8x = vec![VP8X_ICC, 0, 0, 0];
+        vp8x.extend(&(width - 1).to_le_bytes()[..3]);
+        vp8x.extend(&(height - 1).to_le_bytes()[..3]);
+
+        let mut body = b"WEBP".to_vec();
+        for (kind, data) in [(b"VP8X", vp8x.as_slice()), (b"ICCP", profile)] {
+            body.extend(kind);
+            body.extend((data.len() as u32).to_le_bytes());
+            body.extend(data);
+            if data.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+        body.extend(&simple[12..]);
+
+        let mut file = b"RIFF".to_vec();
+        file.extend((body.len() as u32).to_le_bytes());
+        file.extend(body);
+        file
+    }
+
+    const VP8X_ICC: u8 = 0x20;
+
+    /// One ISO-BMFF box.
+    fn bmff(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend(kind);
+        out.extend(body);
+        out
+    }
+
+    /// The top-level boxes of an ISO-BMFF file, as `(type, whole box)`.
+    fn split_boxes(mut bytes: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        let mut boxes = Vec::new();
+        while !bytes.is_empty() {
+            let size = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            boxes.push((bytes[4..8].try_into().unwrap(), &bytes[..size]));
+            bytes = &bytes[size..];
+        }
+        boxes
+    }
+
+    /// `file` (an encoded AVIF or HEIF) with `properties` added to `ipco` and associated with item 1, the primary.
+    ///
+    /// The grown `meta` cannot stay where it was, because `iloc` points into `mdat` by absolute offset. So the old
+    /// `meta` becomes a `free` box of the same size, which keeps every offset valid, and the new one goes at the end.
+    fn with_properties(file: &[u8], properties: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut moved = Vec::new();
+        for (kind, whole) in split_boxes(file) {
+            if &kind != b"meta" {
+                out.extend(whole);
+                continue;
+            }
+            out.extend(bmff(b"free", &vec![0; whole.len() - 8]));
+
+            let mut meta = whole[8..12].to_vec();
+            for (kind, child) in split_boxes(&whole[12..]) {
+                if &kind != b"iprp" {
+                    meta.extend(child);
+                    continue;
+                }
+                let mut iprp = Vec::new();
+                let mut count = 0;
+                for (kind, grand) in split_boxes(&child[8..]) {
+                    match &kind {
+                        b"ipco" => {
+                            count = split_boxes(&grand[8..]).len();
+                            let mut ipco = grand[8..].to_vec();
+                            properties.iter().for_each(|p| ipco.extend(p));
+                            iprp.extend(bmff(b"ipco", &ipco));
+                        }
+                        b"ipma" => iprp.extend(bmff(b"ipma", &associate(&grand[8..], count, properties.len()))),
+                        _ => iprp.extend(grand),
+                    }
+                }
+                meta.extend(bmff(b"iprp", &iprp));
+            }
+            moved = bmff(b"meta", &meta);
+        }
+        out.extend(moved);
+        out
+    }
+
+    /// An `ipma` body (version 0, one-byte indices, item 1 first) with `added` more properties, numbered from
+    /// `existing + 1`, associated with item 1 and marked essential.
+    fn associate(ipma: &[u8], existing: usize, added: usize) -> Vec<u8> {
+        assert_eq!(
+            (ipma[0], ipma[3] & 1, &ipma[8..10]),
+            (0, 0, &[0, 1][..]),
+            "unexpected ipma layout"
+        );
+        let n = ipma[10] as usize;
+        let mut out = ipma[..10].to_vec();
+        out.push((n + added) as u8);
+        out.extend(&ipma[11..11 + n]);
+        out.extend((1..=added).map(|i| 0x80 | (existing + i) as u8));
+        out.extend(&ipma[11 + n..]);
+        out
+    }
+
+    /// The `colr` property holding `profile` as an ICC profile.
+    fn colr_prof(profile: &[u8]) -> Vec<u8> {
+        let mut body = b"prof".to_vec();
+        body.extend(profile);
+        bmff(b"colr", &body)
+    }
+
+    /// `avif` with its `nclx` primaries and transfer characteristics replaced.
+    fn with_nclx(avif: &[u8], primaries: u16, transfer: u16) -> Vec<u8> {
+        let at = avif
+            .windows(8)
+            .position(|w| w == b"colrnclx")
+            .expect("an nclx colr box")
+            + 8;
+        let mut out = avif.to_vec();
+        out[at..at + 2].copy_from_slice(&primaries.to_be_bytes());
+        out[at + 2..at + 4].copy_from_slice(&transfer.to_be_bytes());
+        out
+    }
+
+    /// A profile whose bulk pushes whatever follows it past the 64 KiB prefix `probe_file` starts with.
+    fn oversized_icc(name: &str) -> Vec<u8> {
+        let mut profile = icc_v4(&[("en", name)]);
+        profile.resize(100 * 1024, 0);
+        profile
+    }
+
+    fn probe_via_file(bytes: &[u8], format: ImageFormat) -> ImageInfo {
+        let path = std::env::temp_dir().join(format!(
+            "rust_sak_container_{}_{:?}.{}",
+            std::process::id(),
+            std::thread::current().id(),
+            format.extension()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let info = probe_file(&path);
+        std::fs::remove_file(&path).unwrap();
+        info.unwrap()
+    }
+
+    #[test]
+    fn webp_reports_its_iccp_profile() {
+        let image = sample_image_sized(16, 8);
+        let simple = encode(&image, ImageFormat::WebP);
+        assert_eq!(probe_bytes(&simple).unwrap().color_profile, None);
+
+        let tagged = webp_with_icc(&simple, 16, 8, &icc_v2("sRGB IEC61966-2.1"));
+        let info = probe_bytes(&tagged).unwrap();
+        assert_eq!(info.color_profile.as_deref(), Some("sRGB IEC61966-2.1"));
+        assert_eq!((info.width, info.height), (16, 8));
+        assert_eq!(probe_via_file(&tagged, ImageFormat::WebP), info);
+    }
+
+    #[test]
+    fn avif_names_its_nclx_description() {
+        let avif = encode(&sample_image_sized(64, 64), ImageFormat::Avif);
+        // The bundled encoder writes "unspecified" (2) for both, which is outside the table.
+        assert_eq!(probe_bytes(&avif).unwrap().color_profile, None);
+
+        for (primaries, transfer, expected) in [
+            (12, 13, Some("Display P3")),
+            (1, 13, Some("sRGB")),
+            (9, 16, Some("Rec. 2100 PQ")),
+            (12, 1, None),
+        ] {
+            let info = probe_bytes(&with_nclx(&avif, primaries, transfer)).unwrap();
+            assert_eq!(info.color_profile.as_deref(), expected, "({primaries}, {transfer})");
+        }
+    }
+
+    #[test]
+    fn the_nclx_table() {
+        use super::super::container::nclx_name;
+
+        assert_eq!(nclx_name(1, 13), Some("sRGB"));
+        assert_eq!(nclx_name(12, 13), Some("Display P3"));
+        for transfer in [1, 6, 13, 14, 15] {
+            assert_eq!(nclx_name(9, transfer), Some("Rec. 2020"), "transfer {transfer}");
+        }
+        assert_eq!(nclx_name(9, 16), Some("Rec. 2100 PQ"));
+        assert_eq!(nclx_name(9, 18), Some("Rec. 2100 HLG"));
+
+        for (primaries, transfer) in [(2, 2), (1, 1), (1, 16), (12, 16), (9, 8), (0, 0), (u16::MAX, u16::MAX)] {
+            assert_eq!(nclx_name(primaries, transfer), None, "({primaries}, {transfer})");
+        }
+    }
+
+    #[test]
+    fn avif_reports_its_prof_profile_over_its_nclx() {
+        let avif = with_nclx(&encode(&sample_image_sized(64, 64), ImageFormat::Avif), 1, 13);
+        let tagged = with_properties(&avif, &[colr_prof(&icc_v4(&[("en", "Display P3")]))]);
+
+        let info = probe_bytes(&tagged).unwrap();
+        assert_eq!(info.color_profile.as_deref(), Some("Display P3"));
+        assert_eq!((info.width, info.height), (64, 64));
+
+        // A profile is what the file declares, so one with no readable description names nothing, even beside an nclx.
+        let mut nameless = icc_v4(&[("en", "Display P3")]);
+        nameless[132..136].copy_from_slice(b"cprt");
+        let tagged = with_properties(&avif, &[colr_prof(&nameless)]);
+        assert_eq!(probe_bytes(&tagged).unwrap().color_profile, None);
+    }
+
+    #[test]
+    fn a_profile_past_the_prefix_is_found_by_rereading() {
+        let profile = oversized_icc("Display P3");
+
+        let image = sample_image_sized(16, 8);
+        let webp = webp_with_icc(&encode(&image, ImageFormat::WebP), 16, 8, &profile);
+        assert_eq!(
+            probe_via_file(&webp, ImageFormat::WebP).color_profile.as_deref(),
+            Some("Display P3")
+        );
+
+        let avif = with_properties(
+            &encode(&sample_image_sized(64, 64), ImageFormat::Avif),
+            &[colr_prof(&profile)],
+        );
+        assert_eq!(
+            probe_via_file(&avif, ImageFormat::Avif).color_profile.as_deref(),
+            Some("Display P3")
+        );
+
+        let heif = with_properties(&encode(&image, ImageFormat::Heif), &[colr_prof(&profile)]);
+        assert_eq!(
+            probe_via_file(&heif, ImageFormat::Heif).color_profile.as_deref(),
+            Some("Display P3")
+        );
+    }
+
+    #[test]
+    fn heif_probe_dimensions_are_the_decoded_ones() {
+        let heif = encode(&sample_image_sized(16, 8), ImageFormat::Heif);
+        // `irot` angle 1 is 90° anticlockwise, which swaps the displayed width and height.
+        let rotated = with_properties(&heif, &[bmff(b"irot", &[1])]);
+
+        for (bytes, expected) in [(heif, (16, 8)), (rotated, (8, 16))] {
+            let info = probe_bytes(&bytes).unwrap();
+            let decoded = decode_bytes(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), expected);
+            assert_eq!((info.width, info.height), expected);
+        }
+    }
+
+    #[test]
+    fn truncated_containers_never_panic() {
+        let profile = icc_v4(&[("en", "Display P3")]);
+        let image = sample_image_sized(16, 8);
+        let webp = webp_with_icc(&encode(&image, ImageFormat::WebP), 16, 8, &profile);
+        let avif = with_properties(
+            &encode(&sample_image_sized(64, 64), ImageFormat::Avif),
+            &[colr_prof(&profile)],
+        );
+        let heif = encode(&image, ImageFormat::Heif);
+
+        for (bytes, format) in [
+            (webp, ImageFormat::WebP),
+            (avif, ImageFormat::Avif),
+            (heif, ImageFormat::Heif),
+        ] {
+            for len in 0..bytes.len() {
+                let _ = super::super::container::color_profile(&bytes[..len], format);
+            }
+            let mut garbage = bytes.clone();
+            for byte in garbage.iter_mut().skip(12).step_by(7) {
+                *byte = 0xFF;
+            }
+            let _ = super::super::container::color_profile(&garbage, format);
+        }
     }
 }
 

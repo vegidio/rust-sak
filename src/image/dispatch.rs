@@ -1,4 +1,4 @@
-use std::io::{Cursor, Write};
+use std::io::{BufRead, Cursor, Seek, Write};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
@@ -6,7 +6,9 @@ use ::image::codecs::jpeg::JpegEncoder;
 use ::image::codecs::png::PngEncoder;
 use ::image::{DynamicImage, ImageDecoder, ImageReader};
 
+use super::container;
 use super::error::{ImageError, Result};
+use super::icc;
 use super::info::ImageInfo;
 use super::{EncodeOptions, ImageFormat};
 
@@ -104,6 +106,7 @@ pub(super) fn probe_with_format(bytes: &[u8], format: ImageFormat) -> Result<Ima
                 height: info.height,
                 color_type: info.color_type,
                 bit_depth: avif_bit_depth(info.bit_depth),
+                color_profile: container_profile(bytes, format),
             })
         }
         ImageFormat::Heif => {
@@ -114,6 +117,7 @@ pub(super) fn probe_with_format(bytes: &[u8], format: ImageFormat) -> Result<Ima
                 height: info.height,
                 color_type: info.color_type,
                 bit_depth: heif_bit_depth(info.bit_depth),
+                color_profile: container_profile(bytes, format),
             })
         }
         ImageFormat::WebP => {
@@ -125,35 +129,56 @@ pub(super) fn probe_with_format(bytes: &[u8], format: ImageFormat) -> Result<Ima
                 height: info.height,
                 color_type: info.color_type,
                 bit_depth: 8,
+                color_profile: container_profile(bytes, format),
             })
         }
-        native => {
-            let image_format = native
-                .to_image_format()
-                .expect("native formats map to image::ImageFormat");
-            // `into_decoder` parses the header only; `read_image` (never called here) is what decodes pixels.
-            let decoder = ImageReader::with_format(Cursor::new(bytes), image_format).into_decoder()?;
-            Ok(info_from_decoder(format, decoder))
-        }
+        native => probe_native(Cursor::new(bytes), native),
     }
 }
 
-/// Reads the metadata a header-parsed decoder exposes, without touching the pixels.
+/// The color profile the `avif`/`heif`/`webp` container in `bytes` declares. `bytes` is taken to be the whole file,
+/// so running out of it means there is no profile to find; [`probe_file`](super::probe_file), which may hold only a
+/// prefix, checks for that itself before trusting this.
+fn container_profile(bytes: &[u8], format: ImageFormat) -> Option<String> {
+    container::color_profile(bytes, format).unwrap_or_default()
+}
+
+/// Reads the metadata of a native-format image from `reader` **without decoding the pixels**, pulling only as much
+/// of it as the header needs.
 ///
-/// Shared by [`probe_with_format`], which decodes from a byte slice, and
-/// [`probe_file`](super::probe_file), which decodes straight from the file so only the header is read off disk.
-pub(super) fn info_from_decoder(format: ImageFormat, decoder: impl ImageDecoder) -> ImageInfo {
+/// Shared by [`probe_with_format`], which reads from a byte slice, and [`probe_file`](super::probe_file), which reads
+/// straight from the file so only the header comes off disk.
+///
+/// # Panics
+///
+/// If `format` is one of the formats with a dedicated codec (`avif`/`heif`/`webp`), which have no `image` crate
+/// decoder to read from.
+pub(super) fn probe_native(reader: impl BufRead + Seek, format: ImageFormat) -> Result<ImageInfo> {
+    let image_format = format
+        .to_image_format()
+        .expect("native formats map to image::ImageFormat");
+    // `into_decoder` parses the header only; `read_image` (never called here) is what decodes pixels.
+    let mut decoder = ImageReader::with_format(reader, image_format).into_decoder()?;
+
     let (width, height) = decoder.dimensions();
     let color_type = decoder.color_type();
     let bit_depth = (color_type.bits_per_pixel() / color_type.channel_count() as u16) as u8;
+    // Every native decoder has the profile in hand once the header is parsed (JPEG `APP2`, PNG `iCCP`, TIFF tag
+    // 34675). A profile that fails to read is reported as no profile: it is a label, not the image.
+    let color_profile = decoder
+        .icc_profile()
+        .ok()
+        .flatten()
+        .and_then(|profile| icc::description(&profile));
 
-    ImageInfo {
+    Ok(ImageInfo {
         format,
         width,
         height,
         color_type,
         bit_depth,
-    }
+        color_profile,
+    })
 }
 
 /// Maps the `avif` crate's bit-depth enum to bits per channel. Both enums are `#[non_exhaustive]`, so the

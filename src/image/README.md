@@ -49,7 +49,7 @@ are pure pixel arithmetic with nothing to fail, so they return their picture dir
 | Function            | Signature                                                    | What it does                                                                                                              |
 |---------------------|--------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
 | `format_from_bytes` | `fn format_from_bytes(bytes: &[u8]) -> Result<ImageFormat>`  | Sniffs the format from magic bytes **without decoding pixels**. `UnrecognizedFormat` if no match.                         |
-| `probe_bytes`       | `fn probe_bytes(bytes: &[u8]) -> Result<ImageInfo>`          | Reads metadata (dimensions, color type, bit depth) from the header; format guessed from **magic bytes**. No pixel decode. |
+| `probe_bytes`       | `fn probe_bytes(bytes: &[u8]) -> Result<ImageInfo>`          | Reads metadata (dimensions, color type, bit depth, color profile) from the header; format guessed from **magic bytes**. No pixel decode. |
 | `probe_file`        | `fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo>` | Same, for a file; format from the **extension**. Reads the file bytes but never decodes pixels.                           |
 
 ### Transforming
@@ -159,22 +159,34 @@ The functions below stay as the **narrow** forms, for a caller that wants anythi
 - `ImageFormat::ALL: [ImageFormat; 8]` — every format, in declaration order.
 - `ImageFormat::extension(self) -> &'static str` — canonical lowercase extension.
 - `ImageFormat::extensions(self) -> &'static [&'static str]` — every lowercase extension that selects the format, canonical first (`jpg`, `jpeg` · `tiff`, `tif` · `heif`, `heic`; the others have one).
+- `ImageFormat::name(self) -> &'static str` — the display name: `BMP`, `GIF`, `JPEG`, `PNG`, `TIFF`, `AVIF`, `HEIF` or `WebP`.
 
 ### `ImageInfo`
 
-Returned by `probe_file` / `probe_bytes`. A plain `Copy` struct of header metadata:
+Returned by `probe_file` / `probe_bytes`. A plain struct of header metadata:
 
 ```rust,ignore
 pub struct ImageInfo {
     pub format: ImageFormat,
     pub width: u32,
     pub height: u32,
-    pub color_type: image::ColorType, // the `image` crate's enum (channel layout + sample size)
-    pub bit_depth: u8,                // bits per channel (8/10/12/16/…)
+    pub color_type: image::ColorType,  // the `image` crate's enum (channel layout + sample size)
+    pub bit_depth: u8,                 // bits per channel (8/10/12/16/…)
+    pub color_profile: Option<String>, // the declared color profile's name, e.g. "Display P3"
 }
 ```
 
 `bit_depth` carries the true per-channel depth — important for high-bit-depth AVIF/HEIF (10/12-bit), which `color_type` alone cannot tell apart from 16-bit.
+
+`color_profile` names the profile the file declares, read from the header like everything else here:
+
+- **An embedded ICC profile** (JPEG `APP2`, PNG `iCCP`, TIFF tag 34675, WebP `ICCP`, AVIF/HEIF `colr` of type `prof`/`rICC`) gives the profile's own description, as its author wrote it — `Display P3`, `sRGB IEC61966-2.1` — trimmed and capped at 64 characters.
+- **A coded color description** (AVIF/HEIF `colr` of type `nclx`, with no ICC profile beside it) is named from a fixed table: `sRGB` (BT.709 primaries, sRGB transfer), `Display P3` (P3-D65, sRGB transfer), `Rec. 2020` (BT.2020, an SDR transfer), `Rec. 2100 PQ` and `Rec. 2100 HLG`.
+- **Otherwise `None`:** no profile, an `nclx` combination outside the table, or an ICC profile with no readable description. Nothing is guessed.
+
+For AVIF, HEIF and WebP the profile is read from the container's boxes and chunks, since the codecs do not report it. A profile that lies past the 64 KiB prefix `probe_file` starts with makes it re-read the file whole, as a header that does not fit already did.
+
+> **Changed in 26.10.2:** `ImageInfo` gained the public `color_profile` field and is no longer `Copy` (it is still `Clone`). Code that builds an `ImageInfo` with a struct literal must add the field, and code that copied one implicitly must `.clone()` it.
 
 ### `EncodeOptions`
 

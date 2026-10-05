@@ -119,6 +119,20 @@ impl ImageFormat {
         }
     }
 
+    /// The format's display name, as people write it: `BMP`, `GIF`, `JPEG`, `PNG`, `TIFF`, `AVIF`, `HEIF` or `WebP`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ImageFormat::Bmp => "BMP",
+            ImageFormat::Gif => "GIF",
+            ImageFormat::Jpeg => "JPEG",
+            ImageFormat::Png => "PNG",
+            ImageFormat::Tiff => "TIFF",
+            ImageFormat::Avif => "AVIF",
+            ImageFormat::Heif => "HEIF",
+            ImageFormat::WebP => "WebP",
+        }
+    }
+
     /// Maps the native formats to the `image` crate's [`ImageFormat`](::image::ImageFormat); returns `None` for the
     /// formats handled by their dedicated codecs (`avif`/`heif`/`webp`).
     pub(super) fn to_image_format(self) -> Option<::image::ImageFormat> {

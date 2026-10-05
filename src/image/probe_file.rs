@@ -2,10 +2,9 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
-use ::image::ImageReader;
-
 use super::ImageFormat;
-use super::dispatch::{info_from_decoder, probe_with_format};
+use super::container;
+use super::dispatch::{probe_native, probe_with_format};
 use super::error::{ImageError, Result};
 use super::info::ImageInfo;
 
@@ -16,7 +15,7 @@ use super::info::ImageInfo;
 /// is handled by re-reading it whole rather than by guessing a larger number here.
 const HEADER_PREFIX: u64 = 64 * 1024;
 
-/// Reads the metadata of the image at `path` (dimensions, color type, bit depth) **without decoding the
+/// Reads the metadata of the image at `path` (dimensions, color type, bit depth, color profile) **without decoding the
 /// pixels**, selecting the codec from the file extension.
 ///
 /// Only as much of the file as the header needs is read from disk. For the native formats the decoder pulls from the
@@ -42,9 +41,8 @@ pub fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo> {
 
     // A native decoder reads from any `Read + Seek`, so pointing it at the file means only the header is ever
     // fetched — a multi-hundred-megabyte TIFF costs a few kilobytes of I/O instead of being loaded whole.
-    if let Some(image_format) = format.to_image_format() {
-        let decoder = ImageReader::with_format(BufReader::new(File::open(path)?), image_format).into_decoder()?;
-        return Ok(info_from_decoder(format, decoder));
+    if format.to_image_format().is_some() {
+        return probe_native(BufReader::new(File::open(path)?), format);
     }
 
     let mut file = File::open(path)?;
@@ -54,11 +52,13 @@ pub fn probe_file(path: impl AsRef<Path>) -> Result<ImageInfo> {
     // A prefix shorter than the cap is the whole file, so there is nothing left to fall back to.
     let is_whole_file = (prefix.len() as u64) < HEADER_PREFIX;
     match probe_with_format(&prefix, format) {
-        Ok(info) => Ok(info),
+        // The codec's header fits more often than the color profile does: a large `meta` box, or a WebP with a big
+        // EXIF chunk ahead of `ICCP`, can push the profile past the prefix even when the dimensions were found.
+        Ok(info) if is_whole_file || container::color_profile(&prefix, format).is_ok() => Ok(info),
         Err(err) if is_whole_file => Err(err),
         // The prefix was not enough. Re-read the file whole and let its error, if any, be the one reported: it comes
         // from complete input and so describes the actual problem.
-        Err(_) => {
+        _ => {
             let mut bytes = prefix;
             file.read_to_end(&mut bytes)?;
             probe_with_format(&bytes, format)

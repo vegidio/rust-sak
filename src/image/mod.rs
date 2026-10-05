@@ -11,7 +11,7 @@
 //! - [`decode_bytes_with_format`] — decode in-memory bytes with an explicitly given [`ImageFormat`].
 //! - [`format_from_bytes`] — detect the [`ImageFormat`] from magic bytes without decoding.
 //! - [`probe_bytes`] / [`probe_file`] — read an image's metadata ([`ImageInfo`]: dimensions, color type, bit
-//!   depth) from its header without decoding the pixels.
+//!   depth, color profile) from its header without decoding the pixels.
 //! - [`rotate`] — turn an image by any angle onto a canvas expanded to contain it, clockwise for a positive
 //!   angle, with the uncovered area left transparent.
 //! - [`fit`] — scale an image down so its longer edge equals a bound, keeping the aspect ratio and never enlarging.
@@ -67,6 +67,7 @@
 // examples into doctests, so the prose cannot drift from the code without CI noticing.
 #![doc = include_str!("README.md")]
 
+mod container;
 mod decode_bytes;
 mod decode_bytes_with_format;
 mod decode_file;
@@ -77,6 +78,7 @@ mod error;
 mod fit;
 mod format;
 mod format_from_bytes;
+mod icc;
 mod info;
 mod options;
 mod probe_bytes;
