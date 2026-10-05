@@ -4,7 +4,7 @@ Encode and decode images across **8 formats** behind one small, uniform, synchro
 
 | Family           | Formats                                   | Backed by                                                                                         |
 |------------------|-------------------------------------------|---------------------------------------------------------------------------------------------------|
-| Native           | `bmp`, `gif`, `jpeg`/`jpg`, `png`, `tiff` | the [`image`](https://crates.io/crates/image) crate                                               |
+| Native           | `bmp`, `gif`, `jpg`/`jpeg`, `png`, `tiff`/`tif` | the [`image`](https://crates.io/crates/image) crate                                               |
 | Dedicated codecs | `avif`, `heif`/`heic`, `webp`             | the author's `avif-rs` / `heif-rs` / `webp-rs` crates (never the `image` crate's built-in codecs) |
 | Camera RAW *(decode only)* | `dng`, `nef`, `cr2`/`cr3`, `arw`, `raf`, `orf`, `rw2` and ~20 more | `zenraw` on its `rawler` backend — behind the separate `image-raw` feature. See [RAW decoding](#raw-decoding-image-raw) |
 
@@ -146,7 +146,9 @@ The functions below stay as the **narrow** forms, for a caller that wants anythi
 - `ImageFormat::from_extension(&str) -> Option<Self>` — case-insensitive, no leading dot (`jpg`↔`jpeg`, `heif`↔`heic`).
 - `ImageFormat::from_path(impl AsRef<Path>) -> Option<Self>`
 - `ImageFormat::from_magic(&[u8]) -> Option<Self>` — signature sniff (incl. ISO-BMFF `ftyp` brand to tell avif from heif).
+- `ImageFormat::ALL: [ImageFormat; 8]` — every format, in declaration order.
 - `ImageFormat::extension(self) -> &'static str` — canonical lowercase extension.
+- `ImageFormat::extensions(self) -> &'static [&'static str]` — every lowercase extension that selects the format, canonical first (`jpg`, `jpeg` · `tiff`, `tif` · `heif`, `heic`; the others have one).
 
 ### `ImageInfo`
 

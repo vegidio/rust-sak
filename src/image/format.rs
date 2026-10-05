@@ -25,22 +25,27 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
+    /// Every supported format, in declaration order.
+    pub const ALL: [ImageFormat; 8] = [
+        ImageFormat::Bmp,
+        ImageFormat::Gif,
+        ImageFormat::Jpeg,
+        ImageFormat::Png,
+        ImageFormat::Tiff,
+        ImageFormat::Avif,
+        ImageFormat::Heif,
+        ImageFormat::WebP,
+    ];
+
     /// Returns the format associated with the given file-name extension (case-insensitive, no leading dot), or `None`
     /// if the extension does not map to a supported format.
     pub fn from_extension(extension: &str) -> Option<Self> {
-        let ext = extension.to_ascii_lowercase();
-        let format = match ext.as_str() {
-            "bmp" => ImageFormat::Bmp,
-            "gif" => ImageFormat::Gif,
-            "jpg" | "jpeg" => ImageFormat::Jpeg,
-            "png" => ImageFormat::Png,
-            "tif" | "tiff" => ImageFormat::Tiff,
-            "avif" => ImageFormat::Avif,
-            "heif" | "heic" => ImageFormat::Heif,
-            "webp" => ImageFormat::WebP,
-            _ => return None,
-        };
-        Some(format)
+        Self::ALL.into_iter().find(|format| {
+            format
+                .extensions()
+                .iter()
+                .any(|ext| ext.eq_ignore_ascii_case(extension))
+        })
     }
 
     /// Returns the format inferred from a path's extension, or `None` if it has no recognized extension.
@@ -96,6 +101,21 @@ impl ImageFormat {
             ImageFormat::Avif => "avif",
             ImageFormat::Heif => "heif",
             ImageFormat::WebP => "webp",
+        }
+    }
+
+    /// Every lowercase file extension (without a leading dot) that selects this format; the first is
+    /// [`extension`](ImageFormat::extension).
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            ImageFormat::Bmp => &["bmp"],
+            ImageFormat::Gif => &["gif"],
+            ImageFormat::Jpeg => &["jpg", "jpeg"],
+            ImageFormat::Png => &["png"],
+            ImageFormat::Tiff => &["tiff", "tif"],
+            ImageFormat::Avif => &["avif"],
+            ImageFormat::Heif => &["heif", "heic"],
+            ImageFormat::WebP => &["webp"],
         }
     }
 

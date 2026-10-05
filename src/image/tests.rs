@@ -35,6 +35,37 @@ fn format_from_extension_maps_aliases() {
 }
 
 #[test]
+fn format_extensions_round_trip_through_from_extension() {
+    for format in ImageFormat::ALL {
+        for ext in format.extensions() {
+            assert_eq!(ImageFormat::from_extension(ext), Some(format), "{ext}");
+            assert_eq!(
+                ImageFormat::from_extension(&ext.to_ascii_uppercase()),
+                Some(format),
+                "{ext}"
+            );
+        }
+    }
+}
+
+#[test]
+fn format_extensions_start_with_the_canonical_extension() {
+    for format in ImageFormat::ALL {
+        assert_eq!(format.extensions()[0], format.extension(), "{format:?}");
+    }
+}
+
+#[test]
+fn format_extensions_are_disjoint() {
+    let mut seen = std::collections::HashSet::new();
+    for format in ImageFormat::ALL {
+        for ext in format.extensions() {
+            assert!(seen.insert(*ext), "{ext} belongs to two formats");
+        }
+    }
+}
+
+#[test]
 fn detects_native_formats_from_magic() {
     let img = sample_image();
     for format in [
