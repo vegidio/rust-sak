@@ -82,6 +82,7 @@ tokio = { version = "1.52.3", features = ["time", "rt-multi-thread", "macros", "
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 # `registry` is what names `LookupSpan` and span extensions, which is where the bridge keeps each span's state.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"], optional = true }
+trash = { version = "5.2.9", optional = true }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64", "alloc"], optional = true }
 uuid = { version = "1.26.0", default-features = false, features = ["v4"], optional = true }
 walkdir = { version = "2.5", optional = true }
@@ -144,6 +145,7 @@ fs = [
     "dep:tar",
     "dep:tempfile",
     "dep:thiserror",
+    "dep:trash",
     "dep:walkdir",
     "dep:zip",
 ]

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 
 /// A convenience alias for results returned by this module.
 pub type Result<T> = std::result::Result<T, FsError>;
@@ -89,5 +90,16 @@ pub enum FsError {
         limit: Limit,
         /// The configured value for that ceiling.
         allowed: u64,
+    },
+    /// The platform refused to move a file to its Trash, and the file was left in place.
+    ///
+    /// The underlying `trash` error is flattened into `message`, so that crate's major version stays out of this one's
+    /// public API.
+    #[error("could not move {path:?} to the Trash: {message}")]
+    Trash {
+        /// The file that was not moved.
+        path: PathBuf,
+        /// Why the platform refused.
+        message: String,
     },
 }

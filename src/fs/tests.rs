@@ -1064,6 +1064,53 @@ fn move_files_reports_the_same_counts_as_a_copy() {
     assert_eq!(copy_summary, move_summary);
 }
 
+// --- move_to_trash tests ---
+
+#[test]
+fn move_to_trash_fails_with_not_found_for_a_missing_path() {
+    let dir = TempDir::new().unwrap();
+
+    let error = move_to_trash(dir.path().join("nope.txt")).unwrap_err();
+    assert!(
+        matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn move_to_trash_refuses_a_directory_and_leaves_it_in_place() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("folder");
+    fs::create_dir(&target).unwrap();
+
+    let error = move_to_trash(&target).unwrap_err();
+    assert!(
+        matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::IsADirectory),
+        "{error:?}"
+    );
+    assert!(target.is_dir());
+}
+
+// Reaches the real platform Trash, which a CI runner may not have; run by hand with
+// `cargo test --features fs -- --ignored`, then empty the Trash of `rust-sak-trash-test.txt`.
+#[test]
+#[ignore = "moves a file to the real platform Trash"]
+fn move_to_trash_removes_the_file_from_its_path() {
+    // Under the home directory rather than the system temp one, which on Linux is often a separate volume with no
+    // Trash of its own.
+    let parent = dirs::home_dir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("rust-sak-trash-")
+        .tempdir_in(parent)
+        .unwrap();
+    let path = dir.path().join("rust-sak-trash-test.txt");
+    fs::write(&path, b"trash me").unwrap();
+
+    move_to_trash(&path).unwrap();
+
+    assert!(!path.exists());
+}
+
 // --- extraction budget tests ---
 
 #[test]
@@ -2426,6 +2473,13 @@ fn errors_display_usefully() {
                 allowed: 99,
             },
             "99",
+        ),
+        (
+            FsError::Trash {
+                path: "photo.jpg".into(),
+                message: "no trash on this volume".into(),
+            },
+            "no trash on this volume",
         ),
     ];
 

@@ -43,11 +43,12 @@ Both `name` and `sub_path` are validated with the same rules as archive entries,
 
 ### Listing, copying, moving
 
-| Function     | Signature                                                                                                   |
-|--------------|-------------------------------------------------------------------------------------------------------------|
-| `list_path`  | `fn list_path(directory: impl AsRef<Path>, options: &ListOptions) -> Result<Vec<PathBuf>>`                  |
-| `copy_files` | `fn copy_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
-| `move_files` | `fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
+| Function        | Signature                                                                                                   |
+|-----------------|-------------------------------------------------------------------------------------------------------------|
+| `list_path`     | `fn list_path(directory: impl AsRef<Path>, options: &ListOptions) -> Result<Vec<PathBuf>>`                  |
+| `copy_files`    | `fn copy_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
+| `move_files`    | `fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
+| `move_to_trash` | `fn move_to_trash(path: impl AsRef<Path>) -> Result<()>`                                                    |
 
 `list_path` fails when `directory` is missing or unreadable, and with `ErrorKind::NotADirectory` when it exists but is not a directory, so a mistyped path never comes back as an empty listing. A symbolic link to a directory counts as that directory.
 
@@ -63,6 +64,15 @@ let copying = CopyOptions::new().recursive(true).preserve_structure(true).extens
 ```
 
 `move_files` copies and then deletes — so it works across filesystems, where a rename fails. It removes **only files it copied**, never a directory, since a directory may still hold entries the filter skipped.
+
+`move_to_trash` sends one file to the platform's Trash — the macOS Trash, the Windows Recycle Bin, or the freedesktop.org trash on Linux — and **never deletes it outright**: a volume with no usable Trash is an `FsError::Trash` naming the file, and the file stays put. A missing path fails with `ErrorKind::NotFound` and a directory with `ErrorKind::IsADirectory`, before the platform is asked.
+
+```rust,no_run
+use rust_sak::fs::move_to_trash;
+
+move_to_trash("/tmp/unwanted.jpg")?;
+# Ok::<(), rust_sak::fs::FsError>(())
+```
 
 ### Extraction
 
@@ -165,6 +175,6 @@ the bytes on disk.
 
 ## Errors
 
-Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch` and `LimitExceeded` (carrying a typed `Limit`).
+Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch`, `LimitExceeded` (carrying a typed `Limit`) and `Trash` (carrying the path and the platform's reason).
 
 Rejections happen **before** anything is written, so an `IllegalPath` or `IllegalSymlink` means nothing landed outside the target directory. Extraction stops at the first bad entry; entries already written stay on disk.
