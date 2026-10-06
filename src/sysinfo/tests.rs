@@ -14,7 +14,10 @@ use super::gpu_sysfs::{
 };
 use super::pci_ids::{lookup_pci_ids, read_pci_ids_from};
 use super::vendor::{gpu_from_driver, vendor_from_description, vendor_name};
-use super::webgpu::{DEVICE_TYPE_CPU, VULKAN_1_1, supports_webgpu};
+use super::webgpu::{
+    DEVICE_TYPE_CPU, HEAP_DEVICE_LOCAL, VULKAN_1_1, VulkanDeviceType, api_version_parts,
+    device_from_parts as vulkan_device_from_parts, supports_webgpu,
+};
 use super::*;
 
 // --- cpu_info tests ---
@@ -904,6 +907,86 @@ fn supports_webgpu_counts_a_gpu_listed_beside_a_cpu_rasteriser() {
 fn supports_webgpu_ignores_the_api_variant_bits() {
     // A non-Vulkan variant sets the top bits, which must not stand in for a newer version.
     assert!(!supports_webgpu([((1 << 29) | VULKAN_1_0, DISCRETE)]));
+}
+
+/// What `deviceName` holds: the name, NUL-terminated, then padding.
+fn device_name_buffer(name: &str) -> [u8; 256] {
+    let mut buffer = [0_u8; 256];
+    buffer[..name.len()].copy_from_slice(name.as_bytes());
+    buffer
+}
+
+#[test]
+fn a_vulkan_device_counts_only_its_device_local_heaps() {
+    // An Arc B580 as Mesa's ANV reports it: 12 GiB of VRAM, plus the system memory it can reach.
+    let device = vulkan_device_from_parts(
+        &device_name_buffer("Intel(R) Graphics (BMG G21)"),
+        VULKAN_1_3 | 290,
+        DISCRETE,
+        &[(12 << 30, HEAP_DEVICE_LOCAL), (16 << 30, 0)],
+    );
+
+    assert_eq!(device.name, "Intel(R) Graphics (BMG G21)");
+    assert_eq!(device.device_type, VulkanDeviceType::DiscreteGpu);
+    assert_eq!(device.api_version, (1, 3, 290));
+    assert_eq!(device.device_local_memory, Some(12 << 30));
+}
+
+#[test]
+fn a_vulkan_device_adds_up_several_device_local_heaps() {
+    let heaps = [
+        (512 << 20, HEAP_DEVICE_LOCAL),
+        (256 << 20, HEAP_DEVICE_LOCAL | 0x2),
+        (15 << 30, 0),
+    ];
+    let device = vulkan_device_from_parts(
+        &device_name_buffer("AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO)"),
+        VULKAN_1_3,
+        INTEGRATED,
+        &heaps,
+    );
+
+    assert_eq!(device.device_type, VulkanDeviceType::IntegratedGpu);
+    assert_eq!(device.device_local_memory, Some(768 << 20));
+}
+
+#[test]
+fn a_vulkan_device_with_no_device_local_heap_reports_no_memory() {
+    let lavapipe = vulkan_device_from_parts(
+        &device_name_buffer("llvmpipe (LLVM 19.1.7, 256 bits)"),
+        VULKAN_1_3,
+        DEVICE_TYPE_CPU,
+        &[(32 << 30, 0)],
+    );
+    assert_eq!(lavapipe.device_type, VulkanDeviceType::Cpu);
+    assert_eq!(lavapipe.device_local_memory, None);
+
+    assert_eq!(
+        vulkan_device_from_parts(&device_name_buffer("x"), VULKAN_1_3, DISCRETE, &[]).device_local_memory,
+        None
+    );
+}
+
+#[test]
+fn vulkan_device_types_decode_and_spell_themselves() {
+    assert_eq!(VulkanDeviceType::from_raw(0), VulkanDeviceType::Other);
+    assert_eq!(VulkanDeviceType::from_raw(INTEGRATED).as_str(), "integrated");
+    assert_eq!(VulkanDeviceType::from_raw(DISCRETE).to_string(), "discrete");
+    assert_eq!(VulkanDeviceType::from_raw(VIRTUAL), VulkanDeviceType::VirtualGpu);
+    assert_eq!(VulkanDeviceType::from_raw(DEVICE_TYPE_CPU), VulkanDeviceType::Cpu);
+    assert_eq!(VulkanDeviceType::from_raw(99), VulkanDeviceType::Other);
+}
+
+#[test]
+fn vulkan_api_versions_decode_without_their_variant() {
+    assert_eq!(api_version_parts(VULKAN_1_3 | 290), (1, 3, 290));
+    assert_eq!(api_version_parts((1 << 29) | VULKAN_1_0), (1, 0, 0));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn vulkan_devices_is_empty_off_linux() {
+    assert!(vulkan_devices().is_empty());
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

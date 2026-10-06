@@ -322,7 +322,10 @@ mod o11y {
 
 #[cfg(feature = "sysinfo")]
 mod sysinfo {
-    use rust_sak::sysinfo::{CudaDevice, CudaInfo, cpu_info, cuda_info, gpu_info, memory_info};
+    use rust_sak::sysinfo::{
+        CudaDevice, CudaInfo, VulkanDevice, VulkanDeviceType, cpu_info, cuda_info, gpu_info, memory_info,
+        vulkan_devices,
+    };
 
     #[test]
     fn the_probes_answer() {
@@ -337,6 +340,9 @@ mod sysinfo {
 
         // No CUDA driver is the normal answer on most runners.
         let _ = cuda_info();
+
+        // Empty off Linux and on a runner without Vulkan, which is most of them.
+        let _ = vulkan_devices();
     }
 
     #[test]
@@ -352,6 +358,18 @@ mod sysinfo {
         };
 
         assert!(cuda.devices.iter().all(|device| device.compute_capability < (7, 5)));
+    }
+
+    #[test]
+    fn the_vulkan_types_can_be_built_from_outside() {
+        let device = VulkanDevice {
+            name: "Intel(R) Graphics (BMG G21)".to_string(),
+            device_type: VulkanDeviceType::DiscreteGpu,
+            api_version: (1, 3, 290),
+            device_local_memory: Some(12 << 30),
+        };
+
+        assert_eq!(device.device_type.as_str(), "discrete");
     }
 }
 

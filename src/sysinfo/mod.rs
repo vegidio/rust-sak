@@ -1,8 +1,9 @@
-//! Hardware probes: what processor, how much memory, which graphics adapters, what CUDA the NVIDIA driver offers, and
-//! whether WebGPU can run.
+//! Hardware probes: what processor, how much memory, which graphics adapters, what CUDA the NVIDIA driver offers,
+//! whether WebGPU can run, and which devices Vulkan lists.
 //!
 //! Five questions are answered here — [`cpu_info`] for the processor, [`memory_info`] for RAM and swap,
-//! [`gpu_info`] for the graphics adapters, [`cuda_info`] for CUDA and [`is_webgpu_supported`] for WebGPU. All of it
+//! [`gpu_info`] for the graphics adapters, [`cuda_info`] for CUDA and [`is_webgpu_supported`] for WebGPU, with
+//! [`vulkan_devices`] listing what that WebGPU check saw on Linux. All of it
 //! is **synchronous** and none of it spawns a process: each platform is asked through its own interface, which is
 //! both faster and more reliable than parsing the output of a command-line tool.
 //!
@@ -65,7 +66,7 @@ pub use gpu::GpuInfo;
 pub use gpu_info::gpu_info;
 pub use memory::MemoryInfo;
 pub use memory_info::memory_info;
-pub use webgpu::is_webgpu_supported;
+pub use webgpu::{VulkanDevice, VulkanDeviceType, is_webgpu_supported, vulkan_devices};
 
 #[cfg(test)]
 mod tests;

@@ -22,6 +22,7 @@ rust-sak = { version = "2", features = ["sysinfo"] }
 | `gpu_info`            | `fn gpu_info() -> Result<Vec<GpuInfo>>` | Every graphics adapter the OS reports.         |
 | `cuda_info`           | `fn cuda_info() -> Option<CudaInfo>`    | CUDA driver version, devices and their VRAM.   |
 | `is_webgpu_supported` | `fn is_webgpu_supported() -> bool`      | Whether a WebGPU implementation can run here.  |
+| `vulkan_devices`      | `fn vulkan_devices() -> Vec<VulkanDevice>` | Every Vulkan device, on Linux.              |
 
 ### Why only one of them returns a `Result`
 
@@ -134,6 +135,19 @@ A **CPU device does not count**. `mesa-vulkan-drivers` also installs `lavapipe`,
 A `true` is what the machine offers, not a guarantee: an adapter can still lack a feature or limit a particular WebGPU implementation requires. Each call on Linux creates a Vulkan instance, which loads every installed driver, so hold onto the answer rather than asking repeatedly.
 
 **The drivers the probe loads stay loaded** for the rest of the process. GPU drivers are not written to be unloaded: they leave thread-local destructors and exit handlers behind that assume their code is still mapped, and unloading one turns the next thread exit into a segfault — which is exactly what happens under WSL2, where Mesa's `dzn` driver brings in `libd3d12core.so`. The probe marks everything it caused to be loaded as never to be unloaded, the same state a WebGPU implementation that goes on to use Vulkan leaves them in anyway.
+
+### Vulkan devices
+
+`vulkan_devices` lists what that same probe saw, so a caller can tell which adapters a WebGPU implementation on Linux has to choose from. It is **empty off Linux**, where WebGPU runs on Direct3D 12 or Metal and `gpu_info` already describes the adapters, and empty on a Linux machine with no Vulkan.
+
+| Field                 | Type                | Notes                                                                                                   |
+|-----------------------|---------------------|---------------------------------------------------------------------------------------------------------|
+| `name`                | `String`            | The driver's name for it, e.g. `"Intel(R) Graphics (BMG G21)"`.                                         |
+| `device_type`         | `VulkanDeviceType`  | `DiscreteGpu`, `IntegratedGpu`, `VirtualGpu`, `Cpu` (`lavapipe`) or `Other`.                             |
+| `api_version`         | `(u32, u32, u32)`   | The newest Vulkan version the device supports.                                                          |
+| `device_local_memory` | `Option<u64>`       | Bytes in its device-local heaps: VRAM on a discrete GPU, the firmware carve-out on an integrated one. |
+
+The memory is the heaps' size, not what is free, and an integrated GPU can usually reach far more system memory than its device-local heap.
 
 ## Limitations worth knowing
 
