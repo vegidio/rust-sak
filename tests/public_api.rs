@@ -347,6 +347,7 @@ mod sysinfo {
             devices: vec![CudaDevice {
                 name: "NVIDIA GeForce GTX 1060".to_string(),
                 compute_capability: (6, 1),
+                total_memory: Some(6 << 30),
             }],
         };
 

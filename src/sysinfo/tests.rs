@@ -590,17 +590,34 @@ fn versions_compare_the_way_versions_do() {
 
 #[test]
 fn device_from_parts_reads_a_device() {
-    let device = device_from_parts("  NVIDIA GeForce GTX 1060 ", 6, 1).unwrap();
+    let device = device_from_parts("  NVIDIA GeForce GTX 1060 ", 6, 1, Some(6 << 30)).unwrap();
 
     assert_eq!(device.name, "NVIDIA GeForce GTX 1060");
     assert_eq!(device.compute_capability, (6, 1));
+    assert_eq!(device.total_memory, Some(6 << 30));
+}
+
+#[test]
+fn device_from_parts_keeps_a_device_whose_memory_the_driver_did_not_report() {
+    assert_eq!(
+        device_from_parts("NVIDIA GeForce RTX 3050", 8, 6, None)
+            .unwrap()
+            .total_memory,
+        None
+    );
+    assert_eq!(
+        device_from_parts("NVIDIA GeForce RTX 3050", 8, 6, Some(0))
+            .unwrap()
+            .total_memory,
+        None
+    );
 }
 
 #[test]
 fn device_from_parts_drops_a_device_the_driver_answered_badly_for() {
-    assert_eq!(device_from_parts("", 8, 9), None);
-    assert_eq!(device_from_parts("NVIDIA GeForce RTX 4090", -1, 9), None);
-    assert_eq!(device_from_parts("NVIDIA GeForce RTX 4090", 8, -1), None);
+    assert_eq!(device_from_parts("", 8, 9, None), None);
+    assert_eq!(device_from_parts("NVIDIA GeForce RTX 4090", -1, 9, None), None);
+    assert_eq!(device_from_parts("NVIDIA GeForce RTX 4090", 8, -1, None), None);
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

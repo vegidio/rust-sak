@@ -20,7 +20,7 @@ rust-sak = { version = "2", features = ["sysinfo"] }
 | `cpu_info`            | `fn cpu_info() -> CpuInfo`              | Processor model, core counts, architecture.    |
 | `memory_info`         | `fn memory_info() -> MemoryInfo`        | Total and available RAM, total swap, in bytes. |
 | `gpu_info`            | `fn gpu_info() -> Result<Vec<GpuInfo>>` | Every graphics adapter the OS reports.         |
-| `cuda_info`           | `fn cuda_info() -> Option<CudaInfo>`    | CUDA driver version, compute capabilities.     |
+| `cuda_info`           | `fn cuda_info() -> Option<CudaInfo>`    | CUDA driver version, devices and their VRAM.   |
 | `is_webgpu_supported` | `fn is_webgpu_supported() -> bool`      | Whether a WebGPU implementation can run here.  |
 
 ### Why only one of them returns a `Result`
@@ -96,10 +96,11 @@ On any other operating system `gpu_info` returns `SysinfoError::UnsupportedPlatf
 
 ### `CudaDevice`
 
-| Field                | Type         | Notes                                                  |
-|----------------------|--------------|--------------------------------------------------------|
-| `name`               | `String`     | `"NVIDIA GeForce GTX 1060"`.                           |
-| `compute_capability` | `(u32, u32)` | `(6, 1)` for Pascal, `(8, 9)` for Ada Lovelace.        |
+| Field                | Type          | Notes                                                                                       |
+|----------------------|---------------|---------------------------------------------------------------------------------------------|
+| `name`               | `String`      | `"NVIDIA GeForce GTX 1060"`.                                                                |
+| `compute_capability` | `(u32, u32)`  | `(6, 1)` for Pascal, `(8, 9)` for Ada Lovelace.                                             |
+| `total_memory`       | `Option<u64>` | Total VRAM in bytes, from `cuDeviceTotalMem`. Not what is free. `None` if not reported.     |
 
 Both versions are `(major, minor)` tuples, so they compare the way versions do. That is the whole of deciding whether a CUDA build can run here — CUDA 13, for instance, needs a driver of `(13, 0)` or newer and a device of `(7, 5)` or newer:
 

@@ -1,5 +1,5 @@
-//! What the installed NVIDIA driver offers CUDA: the newest CUDA version it supports, and the compute capability of
-//! every device it can run CUDA on.
+//! What the installed NVIDIA driver offers CUDA: the newest CUDA version it supports, and the compute capability and
+//! total memory of every device it can run CUDA on.
 //!
 //! The answer comes from the CUDA driver API itself — `nvcuda.dll` on Windows, `libcuda.so.1` on Linux — which is the
 //! library every CUDA runtime loads to reach the GPU. Asking it rather than NVML or a table of model names means the
@@ -36,6 +36,13 @@ pub struct CudaDevice {
     /// This is what a CUDA library build targets, and so what decides whether it can run here at all: CUDA 13, for
     /// one, needs `(7, 5)` or newer.
     pub compute_capability: (u32, u32),
+    /// The device's total memory in **bytes**, as `cuDeviceTotalMem` reports it, or `None` when the driver did not
+    /// answer.
+    ///
+    /// This is the whole framebuffer, fixed for the life of the device — not what is free. It is read without creating
+    /// a CUDA context, so asking costs no device memory, and it is the figure a CUDA program sizes itself against on
+    /// every platform, including Linux, where `GpuInfo::memory` cannot see an NVIDIA card's VRAM.
+    pub total_memory: Option<u64>,
 }
 
 /// Decodes the integer `cuDriverGetVersion` reports, `1000 × major + 10 × minor`, into `(major, minor)`.
@@ -50,8 +57,9 @@ pub(super) fn version_from_driver(raw: i32) -> Option<(u32, u32)> {
 /// Assembles a [`CudaDevice`] from what the driver reported for one device.
 ///
 /// A device with no name, or with a compute capability that is not a pair of non-negative numbers, is dropped: it
-/// cannot be told apart from a driver that answered badly.
-pub(super) fn device_from_parts(name: &str, major: i32, minor: i32) -> Option<CudaDevice> {
+/// cannot be told apart from a driver that answered badly. A zero memory figure becomes `None`, as it does on
+/// `GpuInfo`: no device CUDA runs on has no memory.
+pub(super) fn device_from_parts(name: &str, major: i32, minor: i32, total_memory: Option<u64>) -> Option<CudaDevice> {
     let name = name.trim();
     if name.is_empty() {
         return None;
@@ -60,6 +68,7 @@ pub(super) fn device_from_parts(name: &str, major: i32, minor: i32) -> Option<Cu
     Some(CudaDevice {
         name: name.to_string(),
         compute_capability: (u32::try_from(major).ok()?, u32::try_from(minor).ok()?),
+        total_memory: total_memory.filter(|bytes| *bytes > 0),
     })
 }
 
@@ -82,7 +91,8 @@ pub(super) fn device_from_parts(name: &str, major: i32, minor: i32) -> Option<Cu
 ///         println!("driver supports CUDA {}.{}", cuda.driver_version.0, cuda.driver_version.1);
 ///         for device in &cuda.devices {
 ///             let (major, minor) = device.compute_capability;
-///             println!("{} — compute capability {major}.{minor}", device.name);
+///             let memory = device.total_memory.unwrap_or(0) >> 20;
+///             println!("{} — compute capability {major}.{minor}, {memory} MiB", device.name);
 ///         }
 ///     }
 ///     None => println!("no CUDA driver"),
@@ -196,7 +206,7 @@ mod imp {
     /// `library` must be the CUDA driver.
     unsafe fn devices(library: &Library) -> Option<Vec<CudaDevice>> {
         // SAFETY: the signatures below are the ones `cuda.h` declares for these entry points.
-        let (init, count, get, name, attribute) = unsafe {
+        let (init, count, get, name, attribute, total_memory) = unsafe {
             let init: Symbol<unsafe extern "system" fn(c_uint) -> c_int> = library.get(b"cuInit\0").ok()?;
             let count: Symbol<unsafe extern "system" fn(*mut c_int) -> c_int> =
                 library.get(b"cuDeviceGetCount\0").ok()?;
@@ -206,8 +216,13 @@ mod imp {
                 library.get(b"cuDeviceGetName\0").ok()?;
             let attribute: Symbol<unsafe extern "system" fn(*mut c_int, c_int, Device) -> c_int> =
                 library.get(b"cuDeviceGetAttribute\0").ok()?;
+            // `_v2`, which is what `cuda.h` has mapped `cuDeviceTotalMem` to since CUDA 3.2: the unsuffixed export
+            // takes an `unsigned int`, which a card past 4 GiB overflows. Optional, so a driver without it still
+            // reports its devices.
+            let total_memory: Option<Symbol<unsafe extern "system" fn(*mut usize, Device) -> c_int>> =
+                library.get(b"cuDeviceTotalMem_v2\0").ok();
 
-            (init, count, get, name, attribute)
+            (init, count, get, name, attribute, total_memory)
         };
 
         // SAFETY: `0` is the only flag value `cuInit` accepts.
@@ -243,10 +258,17 @@ mod imp {
                         (unsafe { attribute(&mut value, which, device) } == SUCCESS).then_some(value)
                     };
 
+                    let memory = total_memory.as_ref().and_then(|total_memory| {
+                        let mut bytes: usize = 0;
+                        // SAFETY: `bytes` is a valid out-pointer, and `device` came from the driver.
+                        (unsafe { total_memory(&mut bytes, device) } == SUCCESS).then_some(bytes as u64)
+                    });
+
                     device_from_parts(
                         &device_name(&buffer),
                         read(COMPUTE_CAPABILITY_MAJOR)?,
                         read(COMPUTE_CAPABILITY_MINOR)?,
+                        memory,
                     )
                 })
                 .collect(),
