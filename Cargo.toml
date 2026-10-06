@@ -82,7 +82,6 @@ tokio = { version = "1.52.3", features = ["time", "rt-multi-thread", "macros", "
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 # `registry` is what names `LookupSpan` and span extensions, which is where the bridge keeps each span's state.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"], optional = true }
-trash = { version = "5.2.9", optional = true }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64", "alloc"], optional = true }
 uuid = { version = "1.26.0", default-features = false, features = ["v4"], optional = true }
 walkdir = { version = "2.5", optional = true }
@@ -99,6 +98,9 @@ zip = { version = "8.6", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# `fs::move_to_trash` asks `NSFileManager` itself on macOS, since `trash` drops where the item went, which
+# `fs::restore_from_trash` needs. These are the versions `trash` uses elsewhere.
+objc2 = { version = "0.6.2", optional = true }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "CFBase",
@@ -107,7 +109,19 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFNumber",
     "CFString",
 ], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "FoundationErrors",
+    "NSError",
+    "NSFileManager",
+    "NSString",
+    "NSURL",
+], optional = true }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "libc"], optional = true }
+
+# Only Windows, Linux and the BSDs: on macOS `fs` reaches the Trash through `objc2-foundation` above.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+trash = { version = "5.2.9", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `dl_iterate_phdr` and the `RTLD_NOLOAD`/`RTLD_NODELETE` flags, which pin the drivers the WebGPU probe loads. The flag
@@ -141,6 +155,8 @@ fs = [
     "dep:cap-std",
     "dep:dirs",
     "dep:liblzma",
+    "dep:objc2",
+    "dep:objc2-foundation",
     "dep:sevenz-rust2",
     "dep:tar",
     "dep:tempfile",

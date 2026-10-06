@@ -102,4 +102,14 @@ pub enum FsError {
         /// Why the platform refused.
         message: String,
     },
+    /// The platform refused to put a file back from its Trash, and the file stayed in the Trash.
+    ///
+    /// Like [`FsError::Trash`], the platform's error is flattened into `message`.
+    #[error("could not restore {path:?} from the Trash: {message}")]
+    Restore {
+        /// The path the file was to be restored to.
+        path: PathBuf,
+        /// Why the platform refused.
+        message: String,
+    },
 }

@@ -3,8 +3,8 @@
 //! Two groups of things live here. The first is the small filesystem chores an application repeats everywhere:
 //! [`file_exists`], temporary files and directories ([`mk_temp_file`], [`mk_temp_dir`]), per-application
 //! configuration paths ([`user_config_dir`], [`mk_user_config_file`]), directory listing ([`list_path`]), filtered
-//! copying ([`copy_files`], [`move_files`]) and moving a file to the platform's Trash ([`move_to_trash`]). All of it
-//! is **synchronous** — plain [`std::fs`], no async runtime.
+//! copying ([`copy_files`], [`move_files`]) and moving a file to the platform's Trash ([`move_to_trash`]) and back
+//! ([`restore_from_trash`]). All of it is **synchronous** — plain [`std::fs`], no async runtime.
 //!
 //! The second is an archive extractor for ZIP, 7z and TAR.XZ ([`extract`], [`extract_as`] when the
 //! [`ArchiveFormat`] is already known, or [`unzip`] / [`un7zip`] / [`untar_xz`] directly) that treats every entry as
@@ -59,8 +59,10 @@ mod mk_user_config_dir;
 mod mk_user_config_file;
 mod move_files;
 mod move_to_trash;
+mod restore_from_trash;
 mod safe_path;
 mod temp_handle;
+mod trashed;
 mod un7zip;
 mod untar_xz;
 mod unzip;
@@ -81,7 +83,9 @@ pub use mk_user_config_dir::mk_user_config_dir;
 pub use mk_user_config_file::mk_user_config_file;
 pub use move_files::move_files;
 pub use move_to_trash::move_to_trash;
+pub use restore_from_trash::restore_from_trash;
 pub use temp_handle::{NamedTempFile, TempDir};
+pub use trashed::Trashed;
 pub use un7zip::un7zip;
 pub use untar_xz::untar_xz;
 pub use unzip::unzip;

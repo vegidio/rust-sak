@@ -43,12 +43,13 @@ Both `name` and `sub_path` are validated with the same rules as archive entries,
 
 ### Listing, copying, moving
 
-| Function        | Signature                                                                                                   |
-|-----------------|-------------------------------------------------------------------------------------------------------------|
-| `list_path`     | `fn list_path(directory: impl AsRef<Path>, options: &ListOptions) -> Result<Vec<PathBuf>>`                  |
-| `copy_files`    | `fn copy_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
-| `move_files`    | `fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
-| `move_to_trash` | `fn move_to_trash(path: impl AsRef<Path>) -> Result<()>`                                                    |
+| Function             | Signature                                                                                                   |
+|----------------------|-------------------------------------------------------------------------------------------------------------|
+| `list_path`          | `fn list_path(directory: impl AsRef<Path>, options: &ListOptions) -> Result<Vec<PathBuf>>`                  |
+| `copy_files`         | `fn copy_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
+| `move_files`         | `fn move_files<I, P>(sources: I, dest_dir: impl AsRef<Path>, options: &CopyOptions) -> Result<CopySummary>` |
+| `move_to_trash`      | `fn move_to_trash(path: impl AsRef<Path>) -> Result<Trashed>`                                               |
+| `restore_from_trash` | `fn restore_from_trash(trashed: &Trashed) -> Result<PathBuf>`                                               |
 
 `list_path` fails when `directory` is missing or unreadable, and with `ErrorKind::NotADirectory` when it exists but is not a directory, so a mistyped path never comes back as an empty listing. A symbolic link to a directory counts as that directory.
 
@@ -67,12 +68,18 @@ let copying = CopyOptions::new().recursive(true).preserve_structure(true).extens
 
 `move_to_trash` sends one file to the platform's Trash — the macOS Trash, the Windows Recycle Bin, or the freedesktop.org trash on Linux — and **never deletes it outright**: a volume with no usable Trash is an `FsError::Trash` naming the file, and the file stays put. A missing path fails with `ErrorKind::NotFound` and a directory with `ErrorKind::IsADirectory`, before the platform is asked.
 
-```rust,no_run
-use rust_sak::fs::move_to_trash;
+It returns a `Trashed` handle, which `restore_from_trash` takes to put the file back at `trashed.original_path()`. A restore **never overwrites anything**: if the original path has been taken since, it fails with `ErrorKind::AlreadyExists` and nothing moves. A file no longer in the Trash — emptied, or restored by other means — fails with `ErrorKind::NotFound`, and a platform refusal is an `FsError::Restore`. A missing original folder is recreated. The handle lives in memory only, so a file can be restored only by the program that moved it, while it still holds the handle.
 
-move_to_trash("/tmp/unwanted.jpg")?;
+```rust,no_run
+use rust_sak::fs::{move_to_trash, restore_from_trash};
+
+let trashed = move_to_trash("/tmp/unwanted.jpg")?;
+let back = restore_from_trash(&trashed)?;
+assert_eq!(back, trashed.original_path());
 # Ok::<(), rust_sak::fs::FsError>(())
 ```
+
+How the file is found again differs per platform. On macOS, `move_to_trash` asks `NSFileManager` for the path the Trash gave the file and restores from exactly that. On Windows and Linux, the Trash is searched for items with the same original path deleted at or after the moment of the move (allowing 2 s for rounding), and the newest is taken. So if another program trashes a file at the same path in between, that newer copy is the one restored. On Linux the deletion time is stored in local time, so a daylight-saving change between the move and the restore can make the item not match, which reports `NotFound` and moves nothing.
 
 ### Extraction
 
@@ -175,6 +182,6 @@ the bytes on disk.
 
 ## Errors
 
-Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch`, `LimitExceeded` (carrying a typed `Limit`) and `Trash` (carrying the path and the platform's reason).
+Everything returns `fs::Result<T>` (`Result<T, FsError>`). `FsError` wraps the underlying libraries (`Io`, which also covers `tar` and `liblzma`; `Zip`; `SevenZ`) and adds this module's own: `EmptyName`, `NoConfigDir`, `UnknownArchiveFormat` (carrying the file name it rejected), `IllegalPath`, `IllegalSymlink`, `DeclaredSizeMismatch`, `LimitExceeded` (carrying a typed `Limit`), `Trash` and `Restore` (each carrying the path and the platform's reason).
 
 Rejections happen **before** anything is written, so an `IllegalPath` or `IllegalSymlink` means nothing landed outside the target directory. Extraction stops at the first bad entry; entries already written stay on disk.

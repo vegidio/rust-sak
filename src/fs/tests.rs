@@ -1106,9 +1106,121 @@ fn move_to_trash_removes_the_file_from_its_path() {
     let path = dir.path().join("rust-sak-trash-test.txt");
     fs::write(&path, b"trash me").unwrap();
 
-    move_to_trash(&path).unwrap();
+    let trashed = move_to_trash(&path).unwrap();
 
     assert!(!path.exists());
+    assert_eq!(
+        trashed.original_path(),
+        dir.path().canonicalize().unwrap().join("rust-sak-trash-test.txt")
+    );
+}
+
+// --- restore_from_trash tests ---
+
+#[test]
+fn restore_from_trash_refuses_a_taken_path_and_leaves_it_untouched() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("taken.txt");
+    fs::write(&path, b"newer").unwrap();
+
+    let error = restore_from_trash(&Trashed::for_tests(path.clone())).unwrap_err();
+    assert!(
+        matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::AlreadyExists),
+        "{error:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"newer");
+}
+
+#[test]
+fn restore_from_trash_fails_with_not_found_when_the_item_is_not_in_the_trash() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("missing").join("gone.txt");
+
+    let error = restore_from_trash(&Trashed::for_tests(path.clone())).unwrap_err();
+    assert!(
+        matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+    // Nothing is created for a file that can't come back.
+    assert!(!path.parent().unwrap().exists());
+}
+
+/// A file under the home directory to send to the real Trash, in a temp directory that removes itself.
+fn home_trash_fixture(name: &str, contents: &[u8]) -> (TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("rust-sak-restore-")
+        .tempdir_in(dirs::home_dir().unwrap())
+        .unwrap();
+    let path = dir.path().join(name);
+    fs::write(&path, contents).unwrap();
+    (dir, path)
+}
+
+// The tests below reach the real platform Trash; run by hand with `cargo test --features fs -- --ignored`.
+
+#[test]
+#[ignore = "moves a file to the real platform Trash and back"]
+fn restore_from_trash_puts_the_same_bytes_back() {
+    let (_dir, path) = home_trash_fixture("rust-sak-restore-round-trip.txt", b"round trip");
+
+    let trashed = move_to_trash(&path).unwrap();
+    assert!(!path.exists());
+
+    let back = restore_from_trash(&trashed).unwrap();
+    assert_eq!(back, trashed.original_path());
+    assert_eq!(fs::read(&path).unwrap(), b"round trip");
+}
+
+#[test]
+#[ignore = "moves a file to the real platform Trash and back"]
+fn restore_from_trash_never_overwrites_a_file_saved_since() {
+    let (_dir, path) = home_trash_fixture("rust-sak-restore-occupied.txt", b"old");
+
+    let trashed = move_to_trash(&path).unwrap();
+    fs::write(&path, b"new").unwrap();
+
+    let error = restore_from_trash(&trashed).unwrap_err();
+    assert!(
+        matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::AlreadyExists),
+        "{error:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+
+    // Clean up: the old copy is still in the Trash, and comes back once the path is free.
+    fs::remove_file(&path).unwrap();
+    restore_from_trash(&trashed).unwrap();
+}
+
+#[test]
+#[ignore = "moves a file to the real platform Trash and back"]
+fn restore_from_trash_fails_with_not_found_the_second_time() {
+    let (_dir, path) = home_trash_fixture("rust-sak-restore-twice.txt", b"twice");
+
+    let trashed = move_to_trash(&path).unwrap();
+    restore_from_trash(&trashed).unwrap();
+    fs::remove_file(&path).unwrap();
+
+    let error = restore_from_trash(&trashed).unwrap_err();
+    assert!(
+        matches!(error, FsError::Io(ref e) if e.kind() == io::ErrorKind::NotFound),
+        "{error:?}"
+    );
+}
+
+#[test]
+#[ignore = "moves a file to the real platform Trash and back"]
+fn restore_from_trash_recreates_a_removed_folder() {
+    let (dir, _) = home_trash_fixture("unused.txt", b"");
+    let folder = dir.path().join("nested");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join("rust-sak-restore-folder.txt");
+    fs::write(&path, b"folder").unwrap();
+
+    let trashed = move_to_trash(&path).unwrap();
+    fs::remove_dir(&folder).unwrap();
+
+    restore_from_trash(&trashed).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"folder");
 }
 
 // --- extraction budget tests ---
@@ -2480,6 +2592,13 @@ fn errors_display_usefully() {
                 message: "no trash on this volume".into(),
             },
             "no trash on this volume",
+        ),
+        (
+            FsError::Restore {
+                path: "photo.jpg".into(),
+                message: "permission denied".into(),
+            },
+            "could not restore",
         ),
     ];
 
