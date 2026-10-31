@@ -745,7 +745,10 @@ impl Fetch {
         options: RequestOptions,
     ) -> Download {
         let mode = options.download_mode.unwrap_or(self.download_mode);
-        let resume_key = options.resume_key.clone();
+        let resume = download::Resume {
+            key: options.resume_key.clone(),
+            across_urls: options.resume_across_urls,
+        };
         let algorithm = options.digest;
         let prepared = self.prepare(url, options);
         let path = path.as_ref().to_path_buf();
@@ -758,7 +761,7 @@ impl Fetch {
             path,
             tx,
             mode,
-            resume_key,
+            resume,
             algorithm,
             Arc::clone(&digest),
         ));

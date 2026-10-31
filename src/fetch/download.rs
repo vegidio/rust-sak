@@ -263,6 +263,14 @@ async fn join_handle(handle: &mut tokio::task::JoinHandle<Result<(), DownloadErr
     }
 }
 
+/// What the caller said identifies a download's bytes: [`RequestOptions::resume_key`](super::RequestOptions::resume_key)
+/// and [`RequestOptions::resume_across_urls`](super::RequestOptions::resume_across_urls).
+#[derive(Debug, Clone, Default)]
+pub(super) struct Resume {
+    pub key: Option<String>,
+    pub across_urls: bool,
+}
+
 /// An error from a streaming download: an HTTP/transport failure, a failure writing the file to disk, or cancellation.
 #[derive(Debug)]
 pub enum DownloadError {
@@ -369,7 +377,7 @@ fn fraction(total: Option<u64>, downloaded: u64) -> Option<f64> {
 ///
 /// Called inside the background task spawned by [`Fetch::download`](super::Fetch::download). `prepared` carries any
 /// setup error (an invalid URL or a client-build failure) so it surfaces through the handle. `mode` decides how an
-/// existing file at `path` is handled, and `resume_key` is the caller's optional identity for the bytes. `algorithm`
+/// existing file at `path` is handled, and `resume` is the caller's optional identity for the bytes. `algorithm`
 /// opts the transfer into hashing its own bytes, and the result is published through `digest`. On return, a final
 /// [`Progress`] with `completed = true` (and `failed` reflecting the outcome) is sent.
 pub(super) async fn run(
@@ -377,11 +385,11 @@ pub(super) async fn run(
     path: PathBuf,
     tx: watch::Sender<Progress>,
     mode: DownloadMode,
-    resume_key: Option<String>,
+    resume: Resume,
     algorithm: Option<DigestAlgorithm>,
     digest_out: Arc<OnceLock<String>>,
 ) -> Result<(), DownloadError> {
-    let result = stream_to_file(prepared, path, &tx, mode, resume_key, algorithm).await;
+    let result = stream_to_file(prepared, path, &tx, mode, resume, algorithm).await;
 
     // The single place a digest is published, so it cannot be set from a path that did not finish the transfer.
     if let Ok(Some(digest)) = &result {
@@ -486,7 +494,7 @@ async fn stream_to_file(
     path: PathBuf,
     tx: &watch::Sender<Progress>,
     mode: DownloadMode,
-    resume_key: Option<String>,
+    resume: Resume,
     algorithm: Option<DigestAlgorithm>,
 ) -> Result<Option<String>, DownloadError> {
     let prepared = prepared?;
@@ -505,7 +513,8 @@ async fn stream_to_file(
 
     let identity = partial::Identity {
         url: prepared.effective_url(),
-        resume_key,
+        resume_key: resume.key,
+        across_urls: resume.across_urls,
     };
 
     // The resume decision is made once, up front: whether these bytes are ours is knowable before the first byte is

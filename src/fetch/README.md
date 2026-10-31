@@ -111,6 +111,7 @@ A consuming builder. Anything left unset is inherited from the `Fetch` struct. H
 | `.download_mode(DownloadMode)`          | Override the download mode (no effect on `text`/`json`).                                                              |
 | `.max_body_bytes(u64)`                  | Override the body size cap for this request (no effect on downloads).                                                 |
 | `.resume_key(impl Into<String>)`        | Identify a download's bytes beyond their URL, so a partial recorded under a different key is discarded rather than resumed. A pinned content hash is the natural value. |
+| `.resume_across_urls(bool)`             | Let a matching `resume_key` alone identify a partial, so one requested from another URL (a new commit, a re-signed link) is resumed. Ignored without a key. |
 | `.digest(DigestAlgorithm)`              | Hash a download's bytes as they are written; read the result from `Download::digest()`. See [Content digests](#content-digests). |
 
 ## Response metadata
@@ -189,7 +190,7 @@ What a `Resume` request does with what it finds:
 | On disk                       | Sidecar                          | Action                                                             |
 |-------------------------------|----------------------------------|--------------------------------------------------------------------|
 | the target path exists        | —                                | complete; nothing is transferred                                   |
-| `.part` + matching sidecar    | `url` **and** `resume_key` match | `Range` from the `.part`'s length, plus `If-Range` if an `ETag` was recorded |
+| `.part` + matching sidecar    | `url` **and** `resume_key` match (only the key with `resume_across_urls`) | `Range` from the `.part`'s length, plus `If-Range` if an `ETag` was recorded |
 | `.part` + sidecar             | either differs                   | delete both, start fresh                                           |
 | `.part`, no sidecar           | —                                | delete, start fresh — the bytes' identity is unknowable            |
 | nothing                       | —                                | fresh                                                              |

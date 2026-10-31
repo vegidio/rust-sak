@@ -83,3 +83,56 @@ fn xxh3_file_missing_path_errors() {
     let path = std::env::temp_dir().join("rust_sak_crypto_xxh3_does_not_exist.bin");
     assert!(xxh3_file(&path).is_err());
 }
+
+const EMPTY_SHA1: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+const ABC_SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+/// FIPS 180's two-block vector.
+const TWO_BLOCK: &str = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+const TWO_BLOCK_SHA1: &str = "84983e441c3bd26ebaae4aa1f95129e5e54670f1";
+
+#[test]
+fn sha1_bytes_matches_known_vectors() {
+    assert_eq!(sha1_bytes(b""), EMPTY_SHA1);
+    assert_eq!(sha1_bytes(b"abc"), ABC_SHA1);
+    assert_eq!(sha1_bytes(TWO_BLOCK.as_bytes()), TWO_BLOCK_SHA1);
+}
+
+#[test]
+fn sha1_file_hashes_contents() {
+    assert_eq!(hash_temp_file("sha1", b"abc", |p| sha1_file(p)), ABC_SHA1);
+    assert_eq!(
+        hash_temp_file("sha1_two_block", TWO_BLOCK.as_bytes(), |p| sha1_file(p)),
+        TWO_BLOCK_SHA1
+    );
+}
+
+#[test]
+fn sha1_file_missing_path_errors() {
+    let path = std::env::temp_dir().join("rust_sak_crypto_sha1_does_not_exist.bin");
+    assert!(sha1_file(&path).is_err());
+    assert!(git_blob_sha1_file(&path).is_err());
+}
+
+#[test]
+fn git_blob_sha1_file_matches_git_hash_object() {
+    // What `git hash-object` prints for an empty file and for `hello world\n`.
+    assert_eq!(
+        hash_temp_file("git_blob_empty", b"", |p| git_blob_sha1_file(p)),
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    );
+    assert_eq!(
+        hash_temp_file("git_blob_hello", b"hello world\n", |p| git_blob_sha1_file(p)),
+        "3b18e512dba79e4c8300dd08aeb37f8e728b8dad"
+    );
+}
+
+#[test]
+fn git_blob_sha1_file_matches_the_object_id_hugging_face_reports() {
+    // SigLIP 2's `config.json` from `vegidio/general`, kept outside LFS: the API reports this `oid` for its 559 bytes.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/crypto/testdata/siglip2_config.json");
+    assert_eq!(fs::metadata(&path).unwrap().len(), 559);
+    assert_eq!(
+        git_blob_sha1_file(&path).unwrap(),
+        "7c1e0ed1759922fc4eb362d3b405958e829f364d"
+    );
+}

@@ -8,7 +8,10 @@
 
 #[cfg(feature = "crypto")]
 mod crypto {
-    use rust_sak::crypto::{sha256_bytes, sha256_file, sha256_string, xxh3_bytes, xxh3_file, xxh3_string};
+    use rust_sak::crypto::{
+        git_blob_sha1_file, sha1_bytes, sha1_file, sha256_bytes, sha256_file, sha256_string, xxh3_bytes, xxh3_file,
+        xxh3_string,
+    };
 
     #[test]
     fn hashes_are_reachable_and_agree_across_input_kinds() {
@@ -21,6 +24,12 @@ mod crypto {
         std::fs::write(&file, b"abc").unwrap();
         assert_eq!(sha256_file(&file).unwrap(), expected);
         assert_eq!(xxh3_file(&file).unwrap(), xxh3_string("abc"));
+        assert_eq!(sha1_file(&file).unwrap(), sha1_bytes(b"abc"));
+        // `printf abc | git hash-object --stdin`.
+        assert_eq!(
+            git_blob_sha1_file(&file).unwrap(),
+            "f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f"
+        );
         std::fs::remove_file(&file).unwrap();
     }
 }
@@ -504,5 +513,60 @@ mod tui {
             let err = Live::start(Target::Stdout, Line::from("x"), || {}).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         }
+    }
+}
+
+#[cfg(feature = "ai")]
+mod ai {
+    use rust_sak::ai::gpu::{GpuRequirement, meets_with};
+    use rust_sak::ai::hf::{Hash, HfError, Hub, RemoteFile};
+    use rust_sak::ai::{
+        Dependency, Event, Failure, InstallError, Kind, LoadError, Source, SourceError, asset_for, dirs, is_present,
+        runtime_library,
+    };
+
+    #[test]
+    fn the_installer_is_reachable_and_names_nothing_of_its_own() {
+        let source = Source::parse("https://huggingface.co/vegidio/general/tree/main/deps/cuda/13.3.0").unwrap();
+        let cuda = Dependency::libraries("NVIDIA CUDA", source.clone());
+        assert_eq!(cuda.kind, Kind::Libraries);
+        let root = rust_sak::fs::mk_temp_dir("api-ai").unwrap();
+        assert_eq!(dirs::dir_for(root.path(), &source), root.path().join("cuda/13.3.0"));
+        assert!(!is_present(root.path(), &cuda));
+        assert_eq!(runtime_library(root.path()), None);
+        assert!(matches!(
+            rust_sak::ai::load(root.path()),
+            Err(LoadError::NotInstalled { .. })
+        ));
+        assert!(Source::parse("https://example.com").is_err_and(|error: SourceError| !error.url.is_empty()));
+
+        let listing = [RemoteFile {
+            path: "deps/cuda/13.3.0/cuda_linux_x64.7z".into(),
+            size: 1,
+            hash: Hash::Sha256("aa".into()),
+        }];
+        assert!(asset_for(&listing, "linux", "x86_64").is_some());
+        assert_eq!(
+            Hub::default().url("c", "a/b"),
+            "https://huggingface.co/vegidio/general/resolve/c/a/b"
+        );
+        assert!(HfError::Network.is_unreachable());
+        assert!(!meets_with(
+            &[],
+            None,
+            &GpuRequirement {
+                min_driver: (13, 0),
+                min_compute: (7, 5)
+            }
+        ));
+
+        let error = InstallError {
+            dependency: "NVIDIA CUDA",
+            failure: Failure::Damaged,
+        };
+        assert!(error.to_string().starts_with("could not install NVIDIA CUDA"));
+        let _ = Event::Verifying {
+            dependency: "NVIDIA CUDA",
+        };
     }
 }

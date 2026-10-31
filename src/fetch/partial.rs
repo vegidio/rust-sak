@@ -23,6 +23,9 @@ pub(super) struct Identity {
     /// The caller's own identity for these bytes, from [`RequestOptions::resume_key`](super::RequestOptions::resume_key).
     /// `None` for the callers that have no such value, which is most of them.
     pub resume_key: Option<String>,
+    /// Whether a matching `resume_key` is enough, whatever URL the partial came from, from
+    /// [`RequestOptions::resume_across_urls`](super::RequestOptions::resume_across_urls).
+    pub across_urls: bool,
 }
 
 /// The `<path>.part.json` sidecar: everything needed to decide whether `<path>.part` may be resumed.
@@ -51,9 +54,11 @@ impl Sidecar {
     /// `true` when this sidecar describes the same bytes `identity` is asking for.
     ///
     /// Both halves must agree. The URL alone already catches the common case (a version bump moves the URL but not
-    /// the local file name); `resume_key` catches what it cannot — the same URL re-cut with different bytes.
+    /// the local file name); `resume_key` catches what it cannot — the same URL re-cut with different bytes. A caller
+    /// that opted into [`Identity::across_urls`] waives the URL half, but only when it has a key to compare.
     fn matches(&self, identity: &Identity) -> bool {
-        self.url == identity.url && self.resume_key == identity.resume_key
+        let same_url = self.url == identity.url || (identity.across_urls && identity.resume_key.is_some());
+        same_url && self.resume_key == identity.resume_key
     }
 }
 
@@ -178,22 +183,54 @@ mod tests {
         assert!(sidecar.matches(&Identity {
             url: "https://example.com/a.7z".to_string(),
             resume_key: Some("hash".to_string()),
+            across_urls: false,
         }));
         // Same file name, different release: the URL differs, so the partial is not ours.
         assert!(!sidecar.matches(&Identity {
             url: "https://example.com/v2/a.7z".to_string(),
             resume_key: Some("hash".to_string()),
+            across_urls: false,
         }));
         // Same URL, re-cut bytes: only the caller's key can tell.
         assert!(!sidecar.matches(&Identity {
             url: "https://example.com/a.7z".to_string(),
             resume_key: Some("other".to_string()),
+            across_urls: false,
         }));
         // A caller that stops supplying a key is not the same request either.
         assert!(!sidecar.matches(&Identity {
             url: "https://example.com/a.7z".to_string(),
             resume_key: None,
+            across_urls: false,
         }));
+    }
+
+    #[test]
+    fn across_urls_lets_a_matching_key_alone_identify_the_partial() {
+        let sidecar = Sidecar {
+            url: "https://example.com/resolve/commit1/a.7z".to_string(),
+            etag: None,
+            last_modified: None,
+            total: Some(10),
+            resume_key: Some("hash".to_string()),
+        };
+        let identity = |url: &str, key: Option<&str>| Identity {
+            url: url.to_string(),
+            resume_key: key.map(str::to_owned),
+            across_urls: true,
+        };
+
+        // A new commit moved the URL of unchanged bytes.
+        assert!(sidecar.matches(&identity("https://example.com/resolve/commit2/a.7z", Some("hash"))));
+        // The key still has to agree.
+        assert!(!sidecar.matches(&identity("https://example.com/resolve/commit2/a.7z", Some("other"))));
+        // With no key there is nothing but the URL to go on.
+        let keyless = Sidecar {
+            resume_key: None,
+            ..sidecar
+        };
+        assert!(!keyless.matches(&identity("https://example.com/resolve/commit2/a.7z", None)));
+        assert!(keyless.matches(&identity("https://example.com/resolve/commit1/a.7z", None)));
     }
 
     #[tokio::test]
@@ -229,6 +266,7 @@ mod tests {
         let identity = Identity {
             url: "https://example.com/x.bin".to_string(),
             resume_key: None,
+            across_urls: false,
         };
 
         let seed = async |name: &str, sidecar: Option<&Sidecar>| {

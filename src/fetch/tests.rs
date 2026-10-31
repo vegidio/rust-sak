@@ -1455,6 +1455,76 @@ async fn a_matching_resume_key_resumes() {
 }
 
 #[tokio::test]
+async fn a_matching_resume_key_resumes_across_urls_when_allowed() {
+    // A new commit moved the URL of unchanged bytes: with `resume_across_urls` the key alone keeps the partial.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}/resolve/commit2/a.7z");
+
+    seed_partial(
+        &path,
+        &format!("http://{addr}/resolve/commit1/a.7z"),
+        b"0123",
+        None,
+        Some("sha256:same"),
+    )
+    .await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            request.contains("bytes=4-"),
+            "expected a resume Range header, got: {request}"
+        );
+        write_partial_response(&mut stream, 4, 10, "456789").await;
+    });
+
+    let options = RequestOptions::new().resume_key("sha256:same").resume_across_urls(true);
+    let mut download = Fetch::new().download_with_options(&url, &path, options);
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"0123456789").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
+async fn a_partial_from_another_url_restarts_without_resume_across_urls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let path = temp_path(addr.port());
+    let url = format!("http://{addr}/resolve/commit2/a.7z");
+
+    seed_partial(
+        &path,
+        &format!("http://{addr}/resolve/commit1/a.7z"),
+        b"0123",
+        None,
+        Some("sha256:same"),
+    )
+    .await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(
+            !request.to_ascii_lowercase().contains("range:"),
+            "a partial from another URL must not be resumed by default, got: {request}"
+        );
+        write_response(&mut stream, "200 OK", "new bytes").await;
+    });
+
+    let mut download = Fetch::new().download_with_options(&url, &path, RequestOptions::new().resume_key("sha256:same"));
+    drain(&mut download).await;
+    server.await.unwrap();
+
+    assert_settled(&path, b"new bytes").await;
+    clean(&path).await;
+}
+
+#[tokio::test]
 async fn a_recorded_etag_is_sent_as_if_range() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

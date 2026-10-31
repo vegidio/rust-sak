@@ -47,6 +47,9 @@ pub struct RequestOptions {
     /// Caller-supplied identity for a download's bytes, recorded in the partial file's sidecar. `None` identifies a
     /// partial by its URL alone.
     pub(super) resume_key: Option<String>,
+    /// When `true`, a partial whose sidecar carries the same `resume_key` is resumed even if it was requested from
+    /// another URL. Has no effect without a `resume_key`.
+    pub(super) resume_across_urls: bool,
     /// Hash computed over a download's bytes as they are written, reported by
     /// [`Download::digest`](super::Download::digest). `None` hashes nothing.
     pub(super) digest: Option<DigestAlgorithm>,
@@ -170,6 +173,26 @@ impl RequestOptions {
     /// ```
     pub fn resume_key(mut self, key: impl Into<String>) -> Self {
         self.resume_key = Some(key.into());
+        self
+    }
+
+    /// Lets the [`resume_key`](Self::resume_key) alone identify a partial, so one requested from another URL is
+    /// resumed when its key matches.
+    ///
+    /// For bytes whose URL changes while they do not: a file addressed by a commit or a signed, expiring link, where a
+    /// new commit or a fresh signature moves the URL of an unchanged file. The key must then say everything about the
+    /// bytes (a content hash does), because the URL no longer helps. The resume still sends the recorded `ETag` as
+    /// `If-Range`, so a server whose bytes differ answers `200` and the transfer starts over.
+    ///
+    /// Off by default, and ignored without a `resume_key`: then the URL is all there is to tell partials apart.
+    ///
+    /// ```
+    /// use rust_sak::fetch::RequestOptions;
+    ///
+    /// let options = RequestOptions::new().resume_key("5cafbaae1f3d...").resume_across_urls(true);
+    /// ```
+    pub fn resume_across_urls(mut self, allow: bool) -> Self {
+        self.resume_across_urls = allow;
         self
     }
 

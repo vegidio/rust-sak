@@ -26,7 +26,8 @@ The crate is a collection of independent modules, each gated behind its own Carg
 
 | Feature        | Module                             | What it does                                                                                                     | Async?          |
 |----------------|------------------------------------|------------------------------------------------------------------------------------------------------------------|-----------------|
-| `crypto`       | [`crypto`](src/crypto/README.md)   | SHA-256 and XXH3-64 hashing of bytes, strings and files; always lowercase hex                                    | no              |
+| `ai`           | [`ai`](src/ai/README.md)           | Installs the ONNX Runtime and NVIDIA libraries from Hugging Face folders the caller names, verified against the API's hashes, and loads the runtime | **yes** (Tokio) |
+| `crypto`       | [`crypto`](src/crypto/README.md)   | SHA-256, SHA-1 (with git blob hashes) and XXH3-64 hashing of bytes, strings and files; always lowercase hex     | no              |
 | `fetch`        | [`fetch`](src/fetch/README.md)     | Reusable `reqwest` client with Fibonacci-backoff retries and resumable streaming downloads with live progress    | **yes** (Tokio) |
 | `fs`           | [`fs`](src/fs/README.md)           | Filesystem helpers, RAII temp handles, and a hardened ZIP/7z/TAR.XZ extractor that treats every entry as hostile | no              |
 | `github`       | [`github`](src/github/README.md)   | Latest GitHub release of a repository, and whether a given version is older than it (semver comparison)          | **yes** (Tokio) |
