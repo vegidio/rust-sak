@@ -252,7 +252,13 @@ impl Listing {
         Self::read_retrying(folder, RETRIES).await
     }
 
-    pub(super) async fn read_retrying(folder: &Folder, retries: u32) -> Result<Self, HfError> {
+    /// [`read`](Self::read) with `retries` retries of a transient failure instead of [`RETRIES`], as a test of an
+    /// unreachable Hub wants none.
+    ///
+    /// # Errors
+    ///
+    /// As [`read`](Self::read).
+    pub async fn read_retrying(folder: &Folder, retries: u32) -> Result<Self, HfError> {
         let hub = Hub::for_folder(folder).retries(retries);
         let commit = hub.resolve(folder.revision()).await?;
         let files = hub.list_pages(&commit, folder.path(), Unhashed::Skip).await?;

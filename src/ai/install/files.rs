@@ -174,7 +174,13 @@ pub async fn install_files(
     install_files_retrying(files, listing, hf::RETRIES, on_event).await
 }
 
-pub(in crate::ai) async fn install_files_retrying(
+/// [`install_files`] with `retries` retries of a transient transfer failure instead of [`hf::RETRIES`], as a test of a
+/// failing server wants none.
+///
+/// # Errors
+///
+/// As [`install_files`].
+pub async fn install_files_retrying(
     files: &Files,
     listing: Option<&Listing>,
     retries: u32,

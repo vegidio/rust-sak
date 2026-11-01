@@ -58,7 +58,7 @@ pub use ort;
 
 pub use error::{Failure, InstallError, LoadError, RungError, SessionError};
 pub use hf::Listing;
-pub use install::files::{Files, Outcome, Select, Trust, files_present, install_files};
+pub use install::files::{Files, Outcome, Select, Trust, files_present, install_files, install_files_retrying};
 pub use install::{Dependency, Kind, Plan, Planned, State, install, is_present, plan};
 pub use load::{LoadOptions, environment, load, load_with, runtime_library, webgpu_devices};
 pub use progress::{Event, Phase};
