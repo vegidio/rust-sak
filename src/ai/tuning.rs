@@ -327,13 +327,20 @@ mod tests {
     #[test]
     fn the_default_tuning_gives_exactly_the_baseline() {
         let tuning = Tuning::default();
+        // As the platform joins them, with backslashes on Windows.
+        let paths = paths();
+        let (coreml_dir, tensorrt_dir, timing_dir) = (
+            paths.coreml.display().to_string(),
+            paths.tensorrt.display().to_string(),
+            paths.timing.display().to_string(),
+        );
         let coreml = options(ExecutionProvider::CoreMl, &tuning);
         assert_eq!(
             coreml,
             options_from([
                 ("EnableOnSubgraphs", "0"),
                 ("MLComputeUnits", "ALL"),
-                ("ModelCacheDirectory", "/cache/siglip2/0123456789abcdef/coreml"),
+                ("ModelCacheDirectory", &coreml_dir),
                 ("ModelFormat", "MLProgram"),
                 ("RequireStaticInputShapes", "1"),
                 ("SpecializationStrategy", "Default"),
@@ -358,16 +365,13 @@ mod tests {
                 ("trt_builder_optimization_level", "5"),
                 ("trt_cuda_graph_enable", "0"),
                 ("trt_engine_cache_enable", "1"),
-                ("trt_engine_cache_path", "/cache/siglip2/0123456789abcdef/tensorrt"),
+                ("trt_engine_cache_path", &tensorrt_dir),
                 ("trt_engine_hw_compatible", "0"),
                 ("trt_fp16_enable", "0"),
                 ("trt_int8_enable", "0"),
                 ("trt_max_workspace_size", "4294967296"),
                 ("trt_timing_cache_enable", "1"),
-                (
-                    "trt_timing_cache_path",
-                    "/cache/siglip2/0123456789abcdef/tensorrt/timing"
-                ),
+                ("trt_timing_cache_path", &timing_dir),
             ])
         );
         assert!(options(ExecutionProvider::WebGpu, &tuning).is_empty());
