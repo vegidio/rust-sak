@@ -1,4 +1,4 @@
-//! Why an install or a load failed.
+//! Why an install, a load or a session build failed.
 
 use std::io;
 use std::path::PathBuf;
@@ -102,6 +102,17 @@ pub enum LoadError {
         /// The runtime's reason.
         reason: String,
     },
+}
+
+/// Why a session could not be built on any rung of its ladder, the CPU included: the model's path, and the CPU's
+/// reason.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}: {reason}", model.display())]
+pub struct SessionError {
+    /// The model file.
+    pub model: PathBuf,
+    /// The runtime's reason on the CPU, the last rung.
+    pub reason: String,
 }
 
 #[cfg(test)]

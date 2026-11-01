@@ -569,4 +569,59 @@ mod ai {
             dependency: "NVIDIA CUDA",
         };
     }
+
+    #[test]
+    fn sessions_are_reachable_with_the_pinned_ort() {
+        use std::path::Path;
+
+        use rust_sak::ai::{
+            AUTO_ORDER, Built, CachePaths, CoreMlComputeUnits, CoreMlSpecialization, ExecutionMode, ExecutionProvider,
+            SessionError, SessionRequest, Supported, Tuning, UnknownProvider, ladder, libpath, provider_options,
+            session, trt_workspace_bytes,
+        };
+
+        let bare = Supported {
+            cpu: true,
+            coreml: false,
+            cuda: false,
+            tensorrt: false,
+            webgpu: false,
+        };
+        assert_eq!(
+            ladder(&[ExecutionProvider::Auto], bare),
+            [Vec::<ExecutionProvider>::new()]
+        );
+        assert_eq!(AUTO_ORDER[0], ExecutionProvider::TensorRt);
+        assert!(
+            "metal"
+                .parse::<ExecutionProvider>()
+                .is_err_and(|error: UnknownProvider| error.name == "metal")
+        );
+
+        let tuning = Tuning {
+            coreml_compute_units: CoreMlComputeUnits::CpuAndGpu,
+            coreml_specialization: CoreMlSpecialization::FastPrediction,
+            execution_mode: ExecutionMode::Sequential,
+            ..Tuning::default()
+        };
+        let paths = CachePaths::under(Path::new("/cache"));
+        assert_eq!(
+            provider_options(ExecutionProvider::CoreMl, &tuning, &paths, None)["MLComputeUnits"],
+            "CPUAndGPU"
+        );
+        assert_eq!(trt_workspace_bytes(None), 4 << 30);
+        assert!(!libpath::search_path(&[Path::new("/a").into()], None).is_empty());
+
+        // The runtime is not loaded in this binary, so every rung fails, the CPU's last.
+        let request = SessionRequest {
+            model: Path::new("/nowhere/model.onnx"),
+            providers: &[ExecutionProvider::Cpu],
+            supported: bare,
+            tuning: &tuning,
+            cache_dir: Path::new("/nowhere/cache"),
+        };
+        let result: Result<Built, SessionError> = session(&request);
+        assert!(result.is_err_and(|error| error.model == Path::new("/nowhere/model.onnx")));
+        let _: Option<rust_sak::ai::ort::session::Session> = None;
+    }
 }

@@ -1,6 +1,7 @@
 //! Loading an installed ONNX Runtime, and the one environment the process runs it under.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ort::environment::Environment;
@@ -14,6 +15,9 @@ const TELEMETRY_OPT_OUT: (&str, &str) = ("ORT_DISABLE_TELEMETRY", "1");
 
 /// The process's environment, once loaded. `ort` keeps only a weak reference to it, and builds one per process.
 static ENVIRONMENT: Mutex<Option<Environment>> = Mutex::new(None);
+
+/// Whether the load registered the WebGPU plugin and it offered a device. Written once, by the load that succeeds.
+static WEBGPU: AtomicBool = AtomicBool::new(false);
 
 // ONNX Runtime 1.30 starts Microsoft's 1DS telemetry uploader on macOS and Linux when the environment is created, and
 // `with_telemetry(false)` does not stop it: that only governs Windows' ETW. Open Photo AI traced a SIGABRT at exit to
@@ -67,6 +71,11 @@ fn is_runtime_library(name: &str, os: &str) -> bool {
 /// Load the runtime installed in `runtime_dir`, the dependency's folder, and start the process's environment, its logs
 /// going to `tracing` at warning level and above, its telemetry off.
 ///
+/// The WebGPU plugin beside the runtime library is then registered, when this machine supports WebGPU, and
+/// [`Supported::detect`](super::Supported::detect) offers WebGPU when it offered a device. A machine without WebGPU,
+/// a missing plugin, a refused one or one with no device leaves WebGPU unoffered, with the reason logged, and never
+/// fails the load.
+///
 /// One runtime is loaded per process: a load after a successful one returns at once, whatever folder it names. A
 /// failed load can be tried again.
 ///
@@ -87,7 +96,9 @@ pub fn load(runtime_dir: &Path) -> Result<(), LoadError> {
     let path = runtime_library(runtime_dir).ok_or_else(|| LoadError::NotInstalled {
         path: runtime_dir.into(),
     })?;
-    *held = Some(start(&path)?);
+    let environment = start(&path)?;
+    WEBGPU.store(super::webgpu::register(&environment, runtime_dir), Ordering::Release);
+    *held = Some(environment);
     Ok(())
 }
 
@@ -118,6 +129,17 @@ fn start(path: &Path) -> Result<Environment, LoadError> {
     environment.set_log_level(LogLevel::Warning);
     tracing::info!("loaded the ONNX Runtime from {}", path.display());
     Ok(environment)
+}
+
+/// Whether the runtime's load registered the WebGPU plugin and it offered at least one device. `false` before a
+/// successful load.
+pub(super) fn webgpu_offered() -> bool {
+    WEBGPU.load(Ordering::Acquire)
+}
+
+/// The process's environment, once a load has succeeded.
+pub(super) fn environment() -> Option<Environment> {
+    lock().clone()
 }
 
 /// A load that panicked while holding the lock left either an environment or none, both still valid.
