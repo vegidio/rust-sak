@@ -103,6 +103,17 @@ async fn install_with(files: &Files, listing: Option<&Listing>) -> (Result<Outco
     (result, events)
 }
 
+/// Whether `result` failed as damaged.
+fn damaged(result: &Result<Outcome, InstallError>) -> bool {
+    matches!(
+        result,
+        Err(InstallError {
+            failure: Failure::Damaged { .. },
+            ..
+        })
+    )
+}
+
 fn failed(failure: Failure) -> Result<Outcome, InstallError> {
     Err(InstallError {
         dependency: NAME.into(),
@@ -289,7 +300,14 @@ async fn a_damaged_download_fails_and_is_deleted() {
     let setup = setup();
     setup.server.corrupt("models/x.onnx", b"not the graph that was listed");
     let (result, _) = setup.install(&setup.files()).await;
-    assert_eq!(result, failed(Failure::Damaged));
+    assert_eq!(
+        result,
+        failed(Failure::Damaged {
+            path: "models/x.onnx".into(),
+            expected: crate::crypto::sha256_bytes(GRAPH),
+            actual: crate::crypto::sha256_bytes(b"not the graph that was listed"),
+        })
+    );
     assert_eq!(setup.downloads(), ["x.onnx"], "a clean download is not retried");
     assert!(!setup.dir().join("x.onnx").exists());
     assert!(
@@ -312,22 +330,16 @@ async fn a_dropped_install_keeps_its_partial_and_the_next_one_resumes() {
     setup.server.hang_after("models/x.onnx.data", weights.len() / 2);
     let listing = setup.listing().await;
 
-    let (sender, mut progress) = tokio::sync::mpsc::unbounded_channel();
     let files = setup.files();
     let task = tokio::spawn({
         let listing = listing.clone();
-        async move {
-            install_files_retrying(&files, Some(&listing), 0, move |event| {
-                let _ = sender.send(event);
-            })
-            .await
-        }
+        async move { install_files_retrying(&files, Some(&listing), 0, |_| {}).await }
     });
     // Wait until bytes of the weights are on disk.
     let part = part_path(&setup.dir().join(STAGING).join("x.onnx.data"));
     tokio::time::timeout(Duration::from_secs(10), async {
         while std::fs::metadata(&part).map_or(0, |meta| meta.len()) == 0 {
-            let _ = progress.recv().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -449,11 +461,8 @@ async fn a_trusted_install_missing_a_file_installs_and_verifies() {
 
     setup.server.corrupt("models/x.onnx.data", b"damaged weights");
     std::fs::remove_file(setup.dir().join("x.onnx.data")).unwrap();
-    assert_eq!(
-        setup.install(&setup.trusting()).await.0,
-        failed(Failure::Damaged),
-        "trust changes nothing about a download"
-    );
+    let result = setup.install(&setup.trusting()).await.0;
+    assert!(damaged(&result), "trust changes nothing about a download: {result:?}");
 }
 
 #[tokio::test]
@@ -528,7 +537,7 @@ async fn a_resumed_download_that_does_not_match_is_downloaded_once_more_from_not
     setup.server.corrupt("models/x.onnx.data", &other);
     let before = setup.server.downloads().len();
     let (result, _) = install_with(&setup.files(), Some(&listing)).await;
-    assert_eq!(result, failed(Failure::Damaged));
+    assert!(damaged(&result), "{result:?}");
     let retried: Vec<Option<u64>> = setup.server.downloads()[before..]
         .iter()
         .map(|request| request.range_from)

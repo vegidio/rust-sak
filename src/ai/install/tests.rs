@@ -410,13 +410,17 @@ async fn a_hash_mismatch_deletes_the_archive_and_leaves_the_folder_alone() {
         .corrupt(&format!("{folder}/{}", asset("tensorrt")), b"not what the API reported");
 
     let (result, _) = setup.install(&[setup.libraries("NVIDIA TensorRT", &folder)]).await;
-    assert_eq!(
-        result,
-        Err(InstallError {
-            dependency: "NVIDIA TensorRT".into(),
-            failure: Failure::Damaged
-        })
-    );
+    let Err(InstallError {
+        dependency,
+        failure: Failure::Damaged { path, expected, actual },
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert_eq!(dependency, "NVIDIA TensorRT");
+    assert_eq!(path, format!("{folder}/{}", asset("tensorrt")));
+    assert_eq!(expected, crate::crypto::sha256_bytes(FIXTURE));
+    assert_eq!(actual, crate::crypto::sha256_bytes(b"not what the API reported"));
     assert!(
         !dir.join(STAGING).join(asset("tensorrt")).exists(),
         "the damaged archive is deleted"

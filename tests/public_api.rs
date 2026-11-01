@@ -607,7 +607,11 @@ mod ai {
 
         let error = InstallError {
             dependency: "NVIDIA CUDA".into(),
-            failure: Failure::Damaged,
+            failure: Failure::Damaged {
+                path: "deps/cuda/13.3.0/cuda_linux_x64.7z".into(),
+                expected: "aa".into(),
+                actual: "bb".into(),
+            },
         };
         assert!(error.to_string().starts_with("could not install NVIDIA CUDA"));
         let _ = Event::Verifying {

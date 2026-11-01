@@ -428,7 +428,11 @@ async fn fetch_verified(
             file.hash.hex()
         );
         std::fs::remove_file(staged)?;
-        return Err(Failure::Damaged);
+        return Err(Failure::Damaged {
+            path: file.path.clone(),
+            expected: file.hash.hex().to_owned(),
+            actual: digest,
+        });
     }
     Ok(())
 }

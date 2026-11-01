@@ -483,7 +483,11 @@ async fn fetch_checked(
         file.path,
         file.hash.hex()
     );
-    Err(Failure::Damaged)
+    Err(Failure::Damaged {
+        path: file.path.clone(),
+        expected: file.hash.hex().to_owned(),
+        actual: digest,
+    })
 }
 
 /// Delete `staged` and its partial and sidecar, so nothing of a download that did not match is resumed.

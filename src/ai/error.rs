@@ -33,9 +33,18 @@ pub enum Failure {
     /// Any other file error, with the system's reason.
     #[error("a file error stopped the install: {0}")]
     Io(String),
-    /// The download did not match the hash the Hugging Face API reported. It was deleted.
-    #[error("a downloaded file was damaged and has been deleted; run again to download it again")]
-    Damaged,
+    /// A download did not match the hash the Hugging Face API reported. It was deleted.
+    #[error(
+        "{path} hashed to {actual}, not the published {expected}, and has been deleted; run again to download it again"
+    )]
+    Damaged {
+        /// The file's path in the repository, as in `models/x.onnx`.
+        path: String,
+        /// The hash the API reported, in hex.
+        expected: String,
+        /// What the download hashed to, in hex.
+        actual: String,
+    },
     /// The dependency's folder has no archive for this platform, as spelled by `std::env::consts`.
     #[error("it is not available for {os}/{arch}")]
     UnsupportedPlatform {

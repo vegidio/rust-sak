@@ -71,9 +71,9 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 - `Event::Verifying { dependency }`, while a complete archive found in staging is hashed.
 - `Event::Current { dependency }`, once for each dependency that is installed and intact, including one another process finished while this one waited for its lock.
 
-`InstallError { dependency, failure }` displays as `could not install NVIDIA cuDNN: the server answered with HTTP 404`. `Failure` is one of `Network`, `Http(status)`, `DiskFull`, `Io(reason)`, `Damaged`, `UnsupportedPlatform { os, arch }`, `Malformed(reason)`, and, for file installs, `NotListed` (the listing names no file for the selection) and `Unlisted` (no listing, and nothing intact to use).
+`InstallError { dependency, failure }` displays as `could not install NVIDIA cuDNN: the server answered with HTTP 404`. `Failure` is one of `Network`, `Http(status)`, `DiskFull`, `Io(reason)`, `Damaged { path, expected, actual }` (the file's path in the repository, and the API's and the download's hashes), `UnsupportedPlatform { os, arch }`, `Malformed(reason)`, and, for file installs, `NotListed` (the listing names no file for the selection) and `Unlisted` (no listing, and nothing intact to use).
 
-An event's and an error's `dependency` is a `Cow<'static, str>`: a dependency's `&'static str` name, or a file install's `Files::name`, which may be built at run time. **Breaking in 26.11.0:** it was `&'static str`; match on it with `dependency.as_ref()` or compare it to a `&str`.
+An event's and an error's `dependency` is a `Cow<'static, str>`: a dependency's `&'static str` name, or a file install's `Files::name`, which may be built at run time. **Breaking in 26.11.0:** it was `&'static str`; match on it with `dependency.as_ref()` or compare it to a `&str`. `Failure::Damaged` gained its fields in the same release.
 
 ## How an install works
 
