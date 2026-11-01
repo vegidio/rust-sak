@@ -518,11 +518,11 @@ mod tui {
 
 #[cfg(feature = "ai")]
 mod ai {
-    use rust_sak::ai::gpu::{GpuRequirement, meets_with};
+    use rust_sak::ai::gpu::{GpuRefusal, GpuRequirement, check_with, meets_with};
     use rust_sak::ai::hf::{Hash, HfError, Hub, RemoteFile};
     use rust_sak::ai::{
-        Dependency, Event, Failure, InstallError, Kind, LoadError, Source, SourceError, asset_for, dirs, is_present,
-        runtime_library,
+        Dependency, Event, Failure, InstallError, Kind, LoadError, LoadOptions, Phase, Plan, Planned, Source,
+        SourceError, State, asset_for, dirs, environment, is_present, load_with, runtime_library,
     };
 
     #[test]
@@ -551,14 +551,30 @@ mod ai {
             "https://huggingface.co/vegidio/general/resolve/c/a/b"
         );
         assert!(HfError::Network.is_unreachable());
-        assert!(!meets_with(
-            &[],
-            None,
-            &GpuRequirement {
-                min_driver: (13, 0),
-                min_compute: (7, 5)
-            }
+        let requirement = GpuRequirement {
+            min_driver: (13, 0),
+            min_compute: (7, 5),
+        };
+        assert!(!meets_with(&[], None, &requirement));
+        assert_eq!(check_with(&[], None, &requirement), Err(GpuRefusal::NoAdapter));
+
+        assert!(matches!(
+            load_with(
+                root.path(),
+                &LoadOptions {
+                    name: "api",
+                    ..LoadOptions::default()
+                }
+            ),
+            Err(LoadError::NotInstalled { .. })
         ));
+        assert!(environment().is_none());
+        let _: Option<Plan> = None;
+        let _ = Planned {
+            name: "NVIDIA CUDA",
+            state: State::Missing,
+            size: 1,
+        };
 
         let error = InstallError {
             dependency: "NVIDIA CUDA",
@@ -567,6 +583,16 @@ mod ai {
         assert!(error.to_string().starts_with("could not install NVIDIA CUDA"));
         let _ = Event::Verifying {
             dependency: "NVIDIA CUDA",
+        };
+        let _ = Event::Current {
+            dependency: "NVIDIA CUDA",
+        };
+        let _ = Event::Progress {
+            dependency: "NVIDIA CUDA",
+            phase: Phase::Download,
+            bytes: 0,
+            total: 1,
+            fraction: 0.0,
         };
     }
 

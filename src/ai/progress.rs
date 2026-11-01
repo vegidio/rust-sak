@@ -1,7 +1,6 @@
 //! What an install reports, and one dependency's fraction done.
 
-/// What [`install`](super::install) reports while it works. Nothing is reported for a dependency that is already
-/// installed and current.
+/// What [`install`](super::install) reports while it works.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// How far `dependency` has got, from 0 to 1. The download fills 0 to 0.8 and the extraction 0.8 to 1. It never
@@ -9,6 +8,14 @@ pub enum Event {
     Progress {
         /// The dependency's name, as the caller gave it.
         dependency: &'static str,
+        /// The step `bytes` and `total` count.
+        phase: Phase,
+        /// Bytes done in this phase: on disk while downloading (a resumed partial included), written while
+        /// extracting.
+        bytes: u64,
+        /// The phase's total: the archive's size while downloading, the archive's declared contents while
+        /// extracting (0 when it declares none).
+        total: u64,
         /// From 0 to 1.
         fraction: f64,
     },
@@ -17,6 +24,21 @@ pub enum Event {
         /// The dependency's name, as the caller gave it.
         dependency: &'static str,
     },
+    /// `dependency` is installed and intact, so nothing is done for it. Reported once for each such dependency,
+    /// including one another process finished installing while this one waited for it.
+    Current {
+        /// The dependency's name, as the caller gave it.
+        dependency: &'static str,
+    },
+}
+
+/// The step of an install a [`Event::Progress`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The archive is downloading.
+    Download,
+    /// The archive is extracting.
+    Extract,
 }
 
 /// The share of an archive's fraction its download fills, the extraction filling the rest.

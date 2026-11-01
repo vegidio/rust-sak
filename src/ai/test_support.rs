@@ -36,6 +36,8 @@ struct State {
     hang_after: BTreeMap<String, usize>,
     /// Downloads of these paths send this many bytes of the body, then close the connection.
     break_after: BTreeMap<String, usize>,
+    /// Downloads of these paths wait this long before answering.
+    delay: BTreeMap<String, Duration>,
     page_size: Option<usize>,
     requests: Vec<Request>,
 }
@@ -118,6 +120,11 @@ impl Server {
         self.lock().break_after.insert(path.into(), bytes);
     }
 
+    /// Wait `delay` before answering each download of `path`.
+    pub fn delay(&self, path: &str, delay: Duration) {
+        self.lock().delay.insert(path.into(), delay);
+    }
+
     pub fn page_size(&self, size: usize) {
         self.lock().page_size = Some(size);
     }
@@ -168,14 +175,22 @@ fn answer(mut stream: TcpStream, state: &Mutex<State>) {
         }
     }
 
-    let reply = {
+    let (reply, delay) = {
         let mut state = lock(state);
         state.requests.push(Request {
             path: path.clone(),
             range_from,
         });
-        route(&mut state, &path, range_from)
+        let delay = state
+            .delay
+            .iter()
+            .find(|(file, _)| path.contains("/resolve/") && path.ends_with(file.as_str()))
+            .map(|(_, delay)| *delay);
+        (route(&mut state, &path, range_from), delay)
     };
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
     match reply {
         Reply::Whole(response) => {
             let _ = stream.write_all(&response);

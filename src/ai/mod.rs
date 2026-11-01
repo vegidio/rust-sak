@@ -11,7 +11,9 @@
 //!
 //! ```text
 //! <root>/<name>/<version>/                     installed: the archive's entries, at the paths it gives them
-//! <root>/<name>/<version>/.installed           the archive's verified hash: written last, deleted first
+//! <root>/<name>/<version>/.installed           the archive's verified hash and size, and every file it produced
+//!                                              with its size: written last, deleted first
+//! <root>/<name>/<version>/.lock                held by the process installing into the folder
 //! <root>/<name>/<version>/.staging/<asset>     the archive (and the download's .part and sidecar while it downloads)
 //! <root>/<name>/<version>/.staging/extract/    this attempt's extraction
 //! ```
@@ -49,9 +51,9 @@ mod test_support;
 pub use ort;
 
 pub use error::{Failure, InstallError, LoadError, SessionError};
-pub use install::{Dependency, Kind, install, is_present};
-pub use load::{load, runtime_library};
-pub use progress::Event;
+pub use install::{Dependency, Kind, Plan, Planned, State, install, is_present, plan};
+pub use load::{LoadOptions, environment, load, load_with, runtime_library, webgpu_devices};
+pub use progress::{Event, Phase};
 pub use providers::{AUTO_ORDER, ExecutionProvider, Supported, UnknownProvider, ladder};
 pub use session::{Built, SessionRequest, session};
 pub use source::{Source, SourceError, asset_for};

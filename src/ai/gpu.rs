@@ -1,7 +1,7 @@
 //! Whether this machine's NVIDIA GPU meets minimums the caller gives, probed with `sysinfo`'s `gpu_info` and
 //! `cuda_info`.
 //!
-//! The probe and the comparison are separate: [`meets_with`] is a pure function of what a probe returned, so every
+//! The probe and the comparison are separate: [`check_with`] is a pure function of what a probe returned, so every
 //! branch is tested against constructed values on a machine with no NVIDIA GPU.
 
 use crate::sysinfo::{self, CudaInfo, GpuInfo, SysinfoError};
@@ -15,23 +15,78 @@ pub struct GpuRequirement {
     pub min_compute: (u32, u32),
 }
 
+/// Why a machine does not meet a [`GpuRequirement`]. Each names the versions involved, and displays as a sentence
+/// for a log.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GpuRefusal {
+    /// The machine has no NVIDIA graphics adapter, so the CUDA driver was not asked.
+    #[error("there is no NVIDIA graphics adapter")]
+    NoAdapter,
+    /// No CUDA driver answered: none is installed, or it is too old to report a version.
+    #[error("no CUDA driver answered")]
+    NoDriver,
+    /// The driver supports an older CUDA than required.
+    #[error("the driver supports CUDA {}, and {} is required", version(*driver), version(*required))]
+    DriverTooOld {
+        /// The CUDA version the driver supports.
+        driver: (u32, u32),
+        /// [`GpuRequirement::min_driver`].
+        required: (u32, u32),
+    },
+    /// The driver answered, but reports no CUDA device.
+    #[error("the CUDA {} driver reports no device", version(*driver))]
+    NoDevice {
+        /// The CUDA version the driver supports.
+        driver: (u32, u32),
+    },
+    /// The first CUDA device, the one CUDA opens, has a lower compute capability than required.
+    #[error("{name} has compute capability {}, and {} is required", version(*compute), version(*required))]
+    DeviceTooOld {
+        /// The device's name, as the driver reports it.
+        name: String,
+        /// Its compute capability.
+        compute: (u32, u32),
+        /// [`GpuRequirement::min_compute`].
+        required: (u32, u32),
+    },
+    /// The graphics adapters could not be enumerated.
+    #[error("the graphics adapters could not be enumerated: {0}")]
+    ProbeFailed(String),
+}
+
+fn version((major, minor): (u32, u32)) -> String {
+    format!("{major}.{minor}")
+}
+
 /// Whether this machine has an NVIDIA GPU meeting `requirement`. A probe that fails counts as no GPU, with a warning.
 /// The CUDA driver is asked only when an NVIDIA adapter is present, since that wakes the GPU.
 pub fn meets(requirement: &GpuRequirement) -> bool {
-    meets_probed(sysinfo::gpu_info(), sysinfo::cuda_info, requirement)
+    check(requirement).is_ok()
 }
 
-/// [`meets`], over the adapter probe's `outcome`, asking `cuda` only for a machine with an NVIDIA adapter.
-fn meets_probed(
+/// Whether this machine has an NVIDIA GPU meeting `requirement`, and if not, why. A probe that fails is
+/// [`GpuRefusal::ProbeFailed`], with a warning. The CUDA driver is asked only when an NVIDIA adapter is present, since
+/// that wakes the GPU.
+///
+/// # Errors
+///
+/// The [`GpuRefusal`] saying why the machine does not meet `requirement`.
+pub fn check(requirement: &GpuRequirement) -> Result<(), GpuRefusal> {
+    check_probed(sysinfo::gpu_info(), sysinfo::cuda_info, requirement)
+}
+
+/// [`check`], over the adapter probe's `outcome`, asking `cuda` only for a machine with an NVIDIA adapter.
+fn check_probed(
     outcome: Result<Vec<GpuInfo>, SysinfoError>,
     cuda: impl FnOnce() -> Option<CudaInfo>,
     requirement: &GpuRequirement,
-) -> bool {
+) -> Result<(), GpuRefusal> {
     match outcome {
-        Ok(gpus) => gpus.iter().any(is_nvidia) && meets_with(&gpus, cuda().as_ref(), requirement),
+        Ok(gpus) if gpus.iter().any(is_nvidia) => check_with(&gpus, cuda().as_ref(), requirement),
+        Ok(_) => Err(GpuRefusal::NoAdapter),
         Err(error) => {
             tracing::warn!(%error, "the graphics adapters could not be enumerated; continuing as a machine with none");
-            false
+            Err(GpuRefusal::ProbeFailed(error.to_string()))
         }
     }
 }
@@ -39,13 +94,35 @@ fn meets_probed(
 /// Whether `gpus` include an NVIDIA adapter, and `cuda` reports a driver supporting at least
 /// `requirement.min_driver` and a first device (the one CUDA opens) of at least `requirement.min_compute`.
 pub fn meets_with(gpus: &[GpuInfo], cuda: Option<&CudaInfo>, requirement: &GpuRequirement) -> bool {
-    let Some(cuda) = cuda else { return false };
-    gpus.iter().any(is_nvidia)
-        && cuda.driver_version >= requirement.min_driver
-        && cuda
-            .devices
-            .first()
-            .is_some_and(|device| device.compute_capability >= requirement.min_compute)
+    check_with(gpus, cuda, requirement).is_ok()
+}
+
+/// [`meets_with`], saying why not. Pure: every refusal is reached from constructed probe results.
+///
+/// # Errors
+///
+/// The first [`GpuRefusal`] in the order the adapter, the driver, its version and the device are checked.
+pub fn check_with(gpus: &[GpuInfo], cuda: Option<&CudaInfo>, requirement: &GpuRequirement) -> Result<(), GpuRefusal> {
+    if !gpus.iter().any(is_nvidia) {
+        return Err(GpuRefusal::NoAdapter);
+    }
+    let cuda = cuda.ok_or(GpuRefusal::NoDriver)?;
+    let driver = cuda.driver_version;
+    if driver < requirement.min_driver {
+        return Err(GpuRefusal::DriverTooOld {
+            driver,
+            required: requirement.min_driver,
+        });
+    }
+    let device = cuda.devices.first().ok_or(GpuRefusal::NoDevice { driver })?;
+    if device.compute_capability < requirement.min_compute {
+        return Err(GpuRefusal::DeviceTooOld {
+            name: device.name.clone(),
+            compute: device.compute_capability,
+            required: requirement.min_compute,
+        });
+    }
+    Ok(())
 }
 
 /// Whether `gpu` is NVIDIA's: its vendor or its name says so. Linux takes the vendor from `pci.ids`, which a machine
@@ -133,17 +210,84 @@ mod tests {
     #[test]
     fn a_probe_error_counts_as_no_gpu_and_never_asks_cuda() {
         let error = SysinfoError::UnsupportedPlatform { os: "plan9" };
-        assert!(!meets_probed(
-            Err(error),
-            || panic!("CUDA must not be probed"),
-            &REQUIREMENT
-        ));
-        assert!(!meets_probed(
-            Ok(vec![gpu("AMD Radeon", Some("AMD"))]),
-            || panic!("CUDA is not probed without an NVIDIA adapter"),
-            &REQUIREMENT
-        ));
-        assert!(meets_probed(Ok(rtx()), || Some(cuda((13, 2), (8, 6))), &REQUIREMENT));
+        let reason = error.to_string();
+        assert_eq!(
+            check_probed(Err(error), || panic!("CUDA must not be probed"), &REQUIREMENT),
+            Err(GpuRefusal::ProbeFailed(reason))
+        );
+        assert_eq!(
+            check_probed(
+                Ok(vec![gpu("AMD Radeon", Some("AMD"))]),
+                || panic!("CUDA is not probed without an NVIDIA adapter"),
+                &REQUIREMENT
+            ),
+            Err(GpuRefusal::NoAdapter)
+        );
+        assert_eq!(
+            check_probed(Ok(rtx()), || Some(cuda((13, 2), (8, 6))), &REQUIREMENT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_refusal_names_the_versions_involved() {
+        assert_eq!(check_with(&rtx(), None, &REQUIREMENT), Err(GpuRefusal::NoDriver));
+        assert_eq!(
+            check_with(&rtx(), Some(&cuda((12, 4), (8, 6))), &REQUIREMENT),
+            Err(GpuRefusal::DriverTooOld {
+                driver: (12, 4),
+                required: (13, 0)
+            })
+        );
+        let no_device = CudaInfo {
+            driver_version: (13, 2),
+            devices: Vec::new(),
+        };
+        assert_eq!(
+            check_with(&rtx(), Some(&no_device), &REQUIREMENT),
+            Err(GpuRefusal::NoDevice { driver: (13, 2) })
+        );
+        let old = GpuRefusal::DeviceTooOld {
+            name: "NVIDIA GeForce RTX 3080".into(),
+            compute: (6, 1),
+            required: (7, 5),
+        };
+        assert_eq!(
+            check_with(&rtx(), Some(&cuda((13, 2), (6, 1))), &REQUIREMENT),
+            Err(old.clone())
+        );
+        assert_eq!(
+            check_with(&[gpu("Apple M3 Max", Some("Apple"))], None, &REQUIREMENT),
+            Err(GpuRefusal::NoAdapter)
+        );
+
+        assert_eq!(
+            GpuRefusal::DriverTooOld {
+                driver: (12, 4),
+                required: (13, 0)
+            }
+            .to_string(),
+            "the driver supports CUDA 12.4, and 13.0 is required"
+        );
+        assert_eq!(
+            GpuRefusal::NoDevice { driver: (13, 2) }.to_string(),
+            "the CUDA 13.2 driver reports no device"
+        );
+        assert_eq!(
+            old.to_string(),
+            "NVIDIA GeForce RTX 3080 has compute capability 6.1, and 7.5 is required"
+        );
+    }
+
+    #[test]
+    fn the_driver_is_judged_before_the_device() {
+        assert_eq!(
+            check_with(&rtx(), Some(&cuda((12, 4), (6, 1))), &REQUIREMENT),
+            Err(GpuRefusal::DriverTooOld {
+                driver: (12, 4),
+                required: (13, 0)
+            })
+        );
     }
 
     #[test]

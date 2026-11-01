@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
+use ort::device::Device;
 use ort::environment::Environment;
-use ort::logging::LogLevel;
+use ort::logging::{LogLevel, LoggerFunction};
 
 use super::LoadError;
 use super::install::MARKER;
@@ -68,22 +69,65 @@ fn is_runtime_library(name: &str, os: &str) -> bool {
     }
 }
 
-/// Load the runtime installed in `runtime_dir`, the dependency's folder, and start the process's environment, its logs
-/// going to `tracing` at warning level and above, its telemetry off.
+/// How [`load_with`] starts the environment.
+#[derive(Clone)]
+pub struct LoadOptions<'a> {
+    /// The environment's name, which the runtime's records carry as their logger id. Name it after the application.
+    pub name: &'a str,
+    /// Where the runtime's records go. `None` sends them to `tracing`, under the target `ort`, with their severity.
+    pub logger: Option<LoggerFunction>,
+}
+
+impl Default for LoadOptions<'_> {
+    /// Named `rust-sak`, its records going to `tracing`.
+    fn default() -> Self {
+        Self {
+            name: "rust-sak",
+            logger: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for LoadOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadOptions")
+            .field("name", &self.name)
+            .field("logger", &self.logger.as_ref().map(|_| "custom"))
+            .finish()
+    }
+}
+
+/// Load the runtime installed in `runtime_dir`, the dependency's folder, with [`LoadOptions::default`]. See
+/// [`load_with`].
+///
+/// # Errors
+///
+/// As [`load_with`].
+pub fn load(runtime_dir: &Path) -> Result<(), LoadError> {
+    load_with(runtime_dir, &LoadOptions::default())
+}
+
+/// Load the runtime installed in `runtime_dir`, the dependency's folder, and start the process's environment, named
+/// and logging as `options` say, at warning level and above, its telemetry off. The environment is then
+/// [`environment`].
 ///
 /// The WebGPU plugin beside the runtime library is then registered, when this machine supports WebGPU, and
 /// [`Supported::detect`](super::Supported::detect) offers WebGPU when it offered a device. A machine without WebGPU,
 /// a missing plugin, a refused one or one with no device leaves WebGPU unoffered, with the reason logged, and never
 /// fails the load.
 ///
-/// One runtime is loaded per process: a load after a successful one returns at once, whatever folder it names. A
-/// failed load can be tried again.
+/// The runtime's logging is dropped to fatal as the process exits, before the runtime releases its environment: a
+/// record it logged while being torn down would otherwise reach a logger whose thread-locals are already gone, and
+/// abort the process after its work is done.
+///
+/// One runtime is loaded per process: a load after a successful one returns at once, whatever folder or options it
+/// names. A failed load can be tried again.
 ///
 /// # Errors
 ///
 /// [`LoadError`], naming the path: the folder has no install marker or no runtime library, the library cannot be
 /// opened or is older than the runtime this crate's `ort` was built for, or it would not start an environment.
-pub fn load(runtime_dir: &Path) -> Result<(), LoadError> {
+pub fn load_with(runtime_dir: &Path, options: &LoadOptions<'_>) -> Result<(), LoadError> {
     let mut held = lock();
     if held.is_some() {
         return Ok(());
@@ -96,14 +140,15 @@ pub fn load(runtime_dir: &Path) -> Result<(), LoadError> {
     let path = runtime_library(runtime_dir).ok_or_else(|| LoadError::NotInstalled {
         path: runtime_dir.into(),
     })?;
-    let environment = start(&path)?;
+    let environment = start(&path, options)?;
     WEBGPU.store(super::webgpu::register(&environment, runtime_dir), Ordering::Release);
     *held = Some(environment);
+    silence_on_exit();
     Ok(())
 }
 
 /// Open the library at `path` and start an environment on it.
-fn start(path: &Path) -> Result<Environment, LoadError> {
+fn start(path: &Path, options: &LoadOptions<'_>) -> Result<Environment, LoadError> {
     let (name, value) = TELEMETRY_OPT_OUT;
     if std::env::var_os(name).is_none_or(|set| set != value) {
         tracing::warn!("{name} is not {value}; the ONNX Runtime may send telemetry");
@@ -114,21 +159,49 @@ fn start(path: &Path) -> Result<Environment, LoadError> {
         });
     }
 
-    let builder = ort::init_from(path).map_err(|cause| LoadError::Open {
+    let mut builder = ort::init_from(path)
+        .map_err(|cause| LoadError::Open {
+            path: path.into(),
+            reason: cause.to_string(),
+        })?
+        .with_name(options.name)
+        .with_telemetry(false);
+    if let Some(logger) = &options.logger {
+        builder = builder.with_logger(logger.clone());
+    }
+    let environment = builder.build().map_err(|cause| LoadError::Start {
         path: path.into(),
         reason: cause.to_string(),
     })?;
-    let environment = builder
-        .with_name("rust-sak")
-        .with_telemetry(false)
-        .build()
-        .map_err(|cause| LoadError::Start {
-            path: path.into(),
-            reason: cause.to_string(),
-        })?;
     environment.set_log_level(LogLevel::Warning);
-    tracing::info!("loaded the ONNX Runtime from {}", path.display());
+    tracing::info!("loaded the ONNX Runtime from {} as {}", path.display(), options.name);
     Ok(environment)
+}
+
+/// Drop the environment's log level to fatal at process exit. Registered after the environment exists, so it runs
+/// before `ort`'s own release of it: exit handlers run in reverse order of registration, and on Linux and Windows the
+/// release runs later still. Registered once, by the load that succeeds.
+fn silence_on_exit() {
+    unsafe extern "C" {
+        fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+    }
+
+    extern "C" fn silence() {
+        // `try_lock`: an exit while a thread holds the lock must not hang on it. Nothing here touches a thread-local.
+        let held = match ENVIRONMENT.try_lock() {
+            Ok(held) => held,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if let Some(environment) = held.as_ref() {
+            environment.set_log_level(LogLevel::Fatal);
+        }
+    }
+
+    // SAFETY: `silence` is a plain `extern "C"` function with no arguments, as `atexit` requires.
+    if unsafe { atexit(silence) } != 0 {
+        tracing::warn!("the runtime's logging could not be silenced at exit");
+    }
 }
 
 /// Whether the runtime's load registered the WebGPU plugin and it offered at least one device. `false` before a
@@ -137,9 +210,16 @@ pub(super) fn webgpu_offered() -> bool {
     WEBGPU.load(Ordering::Acquire)
 }
 
-/// The process's environment, once a load has succeeded.
-pub(super) fn environment() -> Option<Environment> {
+/// The process's environment, once a load has succeeded: the one every session is built under. It lives until the
+/// process exits.
+pub fn environment() -> Option<Environment> {
     lock().clone()
+}
+
+/// The devices the WebGPU plugin registered with `environment`, in the runtime's order. None unless the load
+/// registered the plugin.
+pub fn webgpu_devices(environment: &Environment) -> impl Iterator<Item = Device<'_>> {
+    super::webgpu::devices(environment)
 }
 
 /// A load that panicked while holding the lock left either an environment or none, both still valid.
@@ -242,7 +322,10 @@ mod tests {
     fn a_missing_library_fails_with_its_path() {
         let dir = temp();
         let path = dir.path().join("libonnxruntime.1.30.0.dylib");
-        assert_eq!(start(&path).err(), Some(LoadError::NotInstalled { path }));
+        assert_eq!(
+            start(&path, &LoadOptions::default()).err(),
+            Some(LoadError::NotInstalled { path })
+        );
     }
 
     #[test]
@@ -252,7 +335,7 @@ mod tests {
         for name in ["first.dylib", "second.dylib"] {
             let path = dir.path().join(name);
             std::fs::write(&path, b"not a library").unwrap();
-            match start(&path) {
+            match start(&path, &LoadOptions::default()) {
                 Err(LoadError::Open { path: reported, reason }) => {
                     assert!(reported.ends_with(name), "{} for {name}", reported.display());
                     assert!(reason.contains(name), "the reason names {name}: {reason}");

@@ -30,14 +30,20 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 | `Source::parse(url)`                  | Parses a Hugging Face folder URL (`https://huggingface.co/<owner>/<repo>/tree/<revision>/<folder>`) into its repo, revision and folder. The folder's last two segments are the dependency's name and version.                        |
 | `Dependency::runtime(name, source)`   | The ONNX Runtime. Installed only while its library is in its folder, and a platform its folder has no archive for fails the install.                                                                                                |
 | `Dependency::libraries(name, source)` | Libraries no one file stands for, such as CUDA. Its marker alone decides, and a platform its folder has no archive for is skipped.                                                                                                   |
-| `install(root, &deps, on_event)`      | Installs each dependency that is missing or out of date into `dirs::dir_for(root, source)`, in order, reporting `Event`s. Fails with an `InstallError` naming the dependency.                                                        |
-| `is_present(root, &dep)`              | Local only: whether a dependency's marker (and, for the runtime, its library) is there. For deciding whether to load, with no network.                                                                                              |
-| `load(runtime_dir)`                   | Loads the runtime installed in `runtime_dir` and starts the process's environment, its logs going to `tracing` at warning and above, then registers the WebGPU plugin beside it. Once per process: a later call returns at once. A failed load can be tried again. |
+| `plan(root, &deps)`                   | What an install will do, before anything moves: a `Planned { name, state, size }` per dependency, in order. `Present` (intact, sized from its marker, no network), `Missing` (sized from its folder's listing) or `Unavailable` (libraries with no archive for this platform). |
+| `Plan::install(on_event)`             | Installs each `Missing` dependency into `dirs::dir_for(root, source)`, in order, from the plan's listing, reporting `Event`s. Fails with an `InstallError` naming the dependency.                                                    |
+| `install(root, &deps, on_event)`      | `plan`, then `Plan::install`.                                                                                                                                                                                                         |
+| `is_present(root, &dep)`              | Local only: whether a dependency is installed and intact (its marker is there, every file it records is there at its recorded size, and, for the runtime, its library is a file). No network.                                        |
+| `load(runtime_dir)`                   | `load_with` and `LoadOptions::default()`: the environment named `rust-sak`, its records going to `tracing`.                                                                                                                         |
+| `load_with(runtime_dir, &LoadOptions { name, logger })` | Loads the runtime installed in `runtime_dir` and starts the process's environment under `name`, its records going to `logger` (or to `tracing` when `None`) at warning and above, then registers the WebGPU plugin beside it. The log level drops to fatal at process exit. Once per process: a later call returns at once. A failed load can be tried again. |
+| `environment()`                       | The process's environment once a load succeeded, the one every session is built under. It lives until the process exits.                                                                                                           |
+| `webgpu_devices(&environment)`        | The devices the WebGPU plugin registered with the environment, in the runtime's order.                                                                                                                                             |
 | `runtime_library(dir)`                | The runtime library in `dir`: `libonnxruntime*.dylib`, `libonnxruntime.so*` or `onnxruntime.dll`, never a `*_providers_*` plugin.                                                                                                   |
 | `asset_for(listing, os, arch)`        | The one `*_<macos\|linux\|windows>_<arm64\|x64>.7z` in a folder's listing, for `std::env::consts` spellings.                                                                                                                        |
 | `dirs::dir_for(root, source)`         | `<root>/<name>/<version>`.                                                                                                                                                                                                           |
-| `gpu::meets(&GpuRequirement)`         | Whether this machine has an NVIDIA GPU whose driver supports at least `min_driver` (CUDA version) and whose first CUDA device has at least `min_compute` (compute capability). A probe that fails counts as no GPU, with a warning. |
-| `gpu::meets_with(gpus, cuda, req)`    | The same comparison over probe results the caller already has. Pure.                                                                                                                                                                |
+| `gpu::check(&GpuRequirement)`         | Whether this machine has an NVIDIA GPU whose driver supports at least `min_driver` (CUDA version) and whose first CUDA device has at least `min_compute` (compute capability), and if not, the `GpuRefusal`: `NoAdapter`, `NoDriver`, `DriverTooOld { driver, required }`, `NoDevice { driver }`, `DeviceTooOld { name, compute, required }` or `ProbeFailed(reason)`, each displaying as a sentence for a log. |
+| `gpu::meets(&GpuRequirement)`         | `check(..).is_ok()`.                                                                                                                                                                                                                 |
+| `gpu::check_with(gpus, cuda, req)` / `gpu::meets_with(..)` | The same comparison over probe results the caller already has. Pure.                                                                                                                                           |
 | `hf::Hub`                             | A Hugging Face client for one repository: `resolve(revision)` gives the commit it points at, `list(commit, folder)` gives each file's `size` and `hash`, and `url(commit, path)` builds the `resolve` URL.                          |
 | `hf::Hash`                            | `Sha256` (the LFS hash) or `GitBlobSha1` (the object id of a file kept outside LFS), with `verify_file(path)`.                                                                                                                       |
 | `ExecutionProvider`                   | `Auto`, `Cpu`, `CoreMl`, `Cuda`, `TensorRt`, `WebGpu`, spelled `Auto`, `CPU`, `CoreML`, `CUDA`, `TensorRT`, `WebGPU` (as Open Photo AI does) by `Display`, `as_str` and serde. `FromStr` ignores case; an unknown name is an `UnknownProvider` listing the six. |
@@ -53,33 +59,44 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 
 ### Events and errors
 
-`on_event` receives `Event::Progress { dependency, fraction }` and `Event::Verifying { dependency }`. A dependency's fraction runs from 0 to 1: the download fills 0 to 0.8 (a resumed partial counted from the first report), and the extraction fills 0.8 to 1. It never decreases, and is exactly 1 only once the marker is written. A dependency that is already current reports nothing.
+`on_event` receives:
+
+- `Event::Progress { dependency, phase, bytes, total, fraction }`. `phase` is `Phase::Download` (`bytes` on disk of the archive's `total`, a resumed partial included) or `Phase::Extract` (`bytes` written of the archive's declared `total`, 0 when it declares none); every download report comes before the first extraction one. A dependency's fraction runs from 0 to 1: the download fills 0 to 0.8 (a resumed partial counted from the first report), and the extraction fills 0.8 to 1. It never decreases, and is exactly 1 only once the marker is written.
+- `Event::Verifying { dependency }`, while a complete archive found in staging is hashed.
+- `Event::Current { dependency }`, once for each dependency that is installed and intact, including one another process finished while this one waited for its lock.
 
 `InstallError { dependency, failure }` displays as `could not install NVIDIA cuDNN: the server answered with HTTP 404`. `Failure` is one of `Network`, `Http(status)`, `DiskFull`, `Io(reason)`, `Damaged`, `UnsupportedPlatform { os, arch }` and `Malformed(reason)`.
 
 ## How an install works
 
-For each dependency, in the order given:
+**The plan**, for each dependency, in the order given:
 
-1. The source's revision (`main`) is resolved to a commit, once per repository per call. Everything after uses that commit, so a file re-uploaded mid-install cannot look damaged.
-2. The folder is listed at that commit, and the archive for this platform is picked from the listing.
-3. The dependency is **current** when its marker holds the hash the API reports now (and, for the runtime, its library is a file). It is skipped, with no event.
-4. Otherwise the archive is downloaded into `.staging/` from `resolve/<commit>/<path>`, resuming a partial whose hash is still the API's, even after `main` moved to a new commit. It is verified against the API's hash, extracted in staging with every entry treated as untrusted, and moved into place: the marker deleted first, every other entry but staging removed, the extracted entries moved in, and the marker written last.
+1. **Local first.** A dependency whose folder holds a marker, with every file the marker records still there at its recorded size (a link checked as a link, so the `libfoo.so -> libfoo.so.1` chains of the Linux archives are not read as corruption), and, for the runtime, its library, is `Present`. Nothing is asked of the network, so a launch on which everything is installed makes **no request at all**, online or not. The check is a `stat` per file, never a hash: the contents were verified when they were installed.
+2. Otherwise the source's revision (`main`) is resolved to a commit, once per repository per call. Everything after uses that commit, so a file re-uploaded mid-install cannot look damaged.
+3. The folder is listed at that commit, and the archive for this platform is picked from the listing. The dependency is `Missing`, sized from the listing.
 
-When the API cannot be reached (no network, a timeout, or a 5xx after the retries), a dependency that `is_present` is used as it is, with a warning. Only a missing install needs the network. Every request retries transient failures 5 times with Fibonacci backoff, and times out after 30 seconds of connecting or of silence.
+**The install**, for each `Missing` dependency, in order:
 
-Dropping the `install` future stops it. A download keeps its partial to resume from. An extraction that has begun runs to its end on its blocking thread, so a marker never stands over an incomplete install.
+1. The folder's **lock** is taken: the operating system's advisory lock on `<folder>/.lock`, so the system releases it when the process holding it ends, however it ends. A process that finds it held waits, then checks the folder again, and reports `Current` for an install the other process finished rather than repeating it.
+2. The archive is downloaded into `.staging/` from `resolve/<commit>/<path>`, resuming a partial whose hash is still the API's, even after `main` moved to a new commit. It is verified against the API's hash, extracted in staging with every entry treated as untrusted, and moved into place: the marker deleted first, every other entry but the lock and staging removed, the extracted entries moved in, and the marker, recording the archive's hash and size and every file with its size, written last.
+3. The dependency's **other versions** (the other folders under `<root>/<name>/`) are removed, the marker of each first. One whose lock another process holds is left in place. A removal that fails is logged and does not fail the install.
+
+Only a missing or damaged install needs the network. Every request retries transient failures 5 times with Fibonacci backoff, and times out after 30 seconds of connecting or of silence.
+
+Dropping the `install` future stops it and releases the lock. A download keeps its partial to resume from. An extraction that has begun runs to its end on its blocking thread, so a marker never stands over an incomplete install.
 
 ### On disk
 
 ```text
 <root>/<name>/<version>/                     installed: the archive's entries, at the paths it gives them
-<root>/<name>/<version>/.installed           the archive's verified hash: written last, deleted first
+<root>/<name>/<version>/.installed           JSON: the archive's verified hash and size, and every file it produced
+                                             with its size: written last, deleted first
+<root>/<name>/<version>/.lock                locked by the process installing into the folder
 <root>/<name>/<version>/.staging/<asset>     the archive (and the download's .part and sidecar while it downloads)
 <root>/<name>/<version>/.staging/extract/    this attempt's extraction
 ```
 
-Apps that pass the same root share the installs, and different versions of a dependency live side by side.
+Apps that pass the same root share the installs: a runtime one app installed is used by the next with no download. A root holds one version of each dependency once an install of it finishes, so **apps sharing a root should pin the same versions**: two apps pinning different ones replace each other's on every install.
 
 ### One version per folder
 
@@ -92,7 +109,7 @@ The hash comes from the same host as the file, so verification catches corruptio
 ```rust,no_run
 use std::path::Path;
 
-use rust_sak::ai::{self, Dependency, Event, Source, gpu::GpuRequirement};
+use rust_sak::ai::{self, Dependency, Event, LoadOptions, Phase, Source, gpu::GpuRequirement};
 
 const GPU: GpuRequirement = GpuRequirement { min_driver: (13, 0), min_compute: (7, 5) };
 
@@ -101,21 +118,32 @@ let folder = |path: &str| Source::parse(&format!("https://huggingface.co/vegidio
 let runtime = folder("deps/onnx/1.30.0")?;
 
 let mut dependencies = vec![Dependency::runtime("ONNX Runtime", runtime.clone())];
-if ai::gpu::meets(&GPU) {
-    dependencies.push(Dependency::libraries("NVIDIA CUDA", folder("deps/cuda/13.3.0")?));
-    dependencies.push(Dependency::libraries("NVIDIA cuDNN", folder("deps/cudnn/9.23.1")?));
-    dependencies.push(Dependency::libraries("NVIDIA TensorRT", folder("deps/tensorrt/10.14.1")?));
+match ai::gpu::check(&GPU) {
+    Ok(()) => {
+        dependencies.push(Dependency::libraries("NVIDIA CUDA", folder("deps/cuda/13.3.0")?));
+        dependencies.push(Dependency::libraries("NVIDIA cuDNN", folder("deps/cudnn/9.23.1")?));
+        dependencies.push(Dependency::libraries("NVIDIA TensorRT", folder("deps/tensorrt/10.14.1")?));
+    }
+    Err(refusal) => println!("no NVIDIA libraries: {refusal}"),
 }
 
 let root = Path::new("/path/the/app/chose/io.vinicius.ai");
-ai::install(root, &dependencies, |event| {
-    if let Event::Progress { dependency, fraction } = event {
-        println!("{dependency}: {:.0}%", fraction * 100.0);
+let plan = ai::plan(root, &dependencies).await?;
+for row in plan.dependencies() {
+    println!("{}: {:?}, {} bytes", row.name, row.state, row.size);
+}
+plan.install(|event| match event {
+    Event::Progress { dependency, phase: Phase::Download, bytes, total, .. } => {
+        println!("{dependency}: {bytes} of {total} bytes");
     }
+    Event::Current { dependency } => println!("{dependency} is already installed"),
+    _ => {}
 })
 .await?;
 
-ai::load(&ai::dirs::dir_for(root, &runtime))?;
+let options = LoadOptions { name: "io.vinicius.myapp", ..LoadOptions::default() };
+ai::load_with(&ai::dirs::dir_for(root, &runtime), &options)?;
+let _environment = ai::environment().expect("loaded");
 # Ok(())
 # }
 ```
@@ -222,6 +250,6 @@ fn main() {
 ## Platform notes
 
 - The archives exist for macOS arm64, Linux arm64/x64 and Windows arm64/x64 (the runtime), and Linux arm64/x64 and Windows x64 (the NVIDIA libraries). Intel Macs have no runtime archive. Finding that out takes the folder's listing, so the unsupported-platform failure comes after one API request.
-- **Only macOS is tested.** The GPU paths (the NVIDIA probe passing, and the CUDA, cuDNN and TensorRT installs) have never run on real hardware. Their logic is covered by pure tests against constructed probe results, and the platform-specific code is written to be correct by construction, but it is **untested on Linux and Windows**.
+- **Only macOS is tested.** The GPU paths (the NVIDIA probe passing, and the CUDA, cuDNN and TensorRT installs) have never run on real hardware. The folder lock is tested on macOS, between tasks and against a process that exited holding it; on Windows it is `LockFileEx`, untested. Their logic is covered by pure tests against constructed probe results, and the platform-specific code is written to be correct by construction, but it is **untested on Linux and Windows**.
 - On macOS, the ladder, the option maps and the search path are tested as pure functions, and CoreML, WebGPU and CPU sessions are built for real. **CUDA and TensorRT sessions, the Linux restart, the WSL2 driver folder and the Windows `PATH` step have never run**: they are written to be correct by construction, after Open Photo AI's code, and are untested.
 - CoreML is offered on every macOS the runtime loads on, with no OS-version probe: the 1.30 runtime's macOS build already needs a newer macOS than CoreML's ML Program format (12). Were that wrong, the CoreML rung would fail and the ladder would move on.
