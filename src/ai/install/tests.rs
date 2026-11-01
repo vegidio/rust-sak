@@ -124,25 +124,27 @@ fn fractions(events: &[Event], dependency: &str) -> Vec<f64> {
                 dependency: name,
                 fraction,
                 ..
-            } if *name == dependency => Some(*fraction),
+            } if name == dependency => Some(*fraction),
             _ => None,
         })
         .collect()
 }
 
-fn names(events: &[Event]) -> Vec<&'static str> {
+fn names(events: &[Event]) -> Vec<&str> {
     events
         .iter()
         .map(|event| match event {
             Event::Progress { dependency, .. } | Event::Verifying { dependency } | Event::Current { dependency } => {
-                *dependency
+                dependency.as_ref()
             }
         })
         .collect()
 }
 
 fn current(dependency: &'static str) -> Event {
-    Event::Current { dependency }
+    Event::Current {
+        dependency: dependency.into(),
+    }
 }
 
 /// The hash the marker in `dir` records.
@@ -368,7 +370,7 @@ async fn offline_without_an_install_fails() {
     assert_eq!(
         result,
         Err(InstallError {
-            dependency: "NVIDIA CUDA",
+            dependency: "NVIDIA CUDA".into(),
             failure: Failure::Network
         })
     );
@@ -390,7 +392,7 @@ async fn offline_without_an_install_fails() {
     assert_eq!(
         result,
         Err(InstallError {
-            dependency: "ONNX Runtime",
+            dependency: "ONNX Runtime".into(),
             failure: Failure::Network
         })
     );
@@ -411,7 +413,7 @@ async fn a_hash_mismatch_deletes_the_archive_and_leaves_the_folder_alone() {
     assert_eq!(
         result,
         Err(InstallError {
-            dependency: "NVIDIA TensorRT",
+            dependency: "NVIDIA TensorRT".into(),
             failure: Failure::Damaged
         })
     );
@@ -439,7 +441,7 @@ async fn a_staged_archive_that_matches_is_rehashed_and_installed_without_a_downl
     assert_eq!(result, Ok(()));
     assert!(
         events.contains(&Event::Verifying {
-            dependency: "NVIDIA CUDA"
+            dependency: "NVIDIA CUDA".into()
         }),
         "{events:?}"
     );
@@ -692,7 +694,7 @@ async fn a_failure_names_its_dependency_and_leaves_the_ones_before_installed() {
     assert_eq!(
         error,
         InstallError {
-            dependency: "NVIDIA cuDNN",
+            dependency: "NVIDIA cuDNN".into(),
             failure: Failure::Http(404)
         }
     );
@@ -733,7 +735,7 @@ async fn a_folder_with_no_archive_for_the_platform_skips_libraries_and_fails_the
     assert_eq!(
         result,
         Err(InstallError {
-            dependency: "ONNX Runtime",
+            dependency: "ONNX Runtime".into(),
             failure: Failure::UnsupportedPlatform { os, arch }
         })
     );

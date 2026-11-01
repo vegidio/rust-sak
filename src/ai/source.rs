@@ -1,4 +1,4 @@
-//! A dependency's Hugging Face folder, as the caller names it, and the archive in it for a platform.
+//! A Hugging Face folder, and a dependency's folder, as the caller names them, and the archive in it for a platform.
 
 use std::fmt;
 
@@ -6,15 +6,97 @@ use reqwest::Url;
 
 use super::hf::RemoteFile;
 
+/// A folder on Hugging Face, parsed from its URL: `https://huggingface.co/<owner>/<repo>/tree/<revision>/<folder>`,
+/// where the folder has one segment or more, as in `models` or `models/insightface`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Folder {
+    base: String,
+    repo: String,
+    revision: String,
+    path: String,
+}
+
+/// A URL that is not a Hugging Face folder URL.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{url} is not a Hugging Face folder URL of the form https://huggingface.co/<owner>/<repo>/tree/<revision>/<folder>"
+)]
+pub struct FolderError {
+    /// The URL as given.
+    pub url: String,
+}
+
+impl Folder {
+    /// Parse a Hugging Face folder URL. The host is kept, so a mirror or a local test server works the same way.
+    ///
+    /// # Errors
+    ///
+    /// [`FolderError`] when `url` is not an `http(s)` URL with the path `/<owner>/<repo>/tree/<revision>/<folder>`,
+    /// where the folder has at least one segment and none is `.` or `..`, or when it carries a query or a fragment.
+    pub fn parse(url: &str) -> Result<Self, FolderError> {
+        let error = || FolderError { url: url.to_owned() };
+        let parsed = Url::parse(url).map_err(|_| error())?;
+        if !matches!(parsed.scheme(), "https" | "http")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(error());
+        }
+
+        let segments: Vec<&str> = parsed.path().split('/').filter(|segment| !segment.is_empty()).collect();
+        let [owner, repo, "tree", revision, folder @ ..] = segments.as_slice() else {
+            return Err(error());
+        };
+        if folder.is_empty() || folder.iter().any(|segment| matches!(*segment, "." | "..")) {
+            return Err(error());
+        }
+
+        let mut base = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default());
+        if let Some(port) = parsed.port() {
+            base.push_str(&format!(":{port}"));
+        }
+        Ok(Self {
+            base,
+            repo: format!("{owner}/{repo}"),
+            revision: (*revision).to_owned(),
+            path: folder.join("/"),
+        })
+    }
+
+    /// The scheme and host, as in `https://huggingface.co`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The repository, as in `vegidio/open-photo-ai`.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// The branch, tag or commit the URL names, as in `main`.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// The folder inside the repository, as in `models`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl fmt::Display for Folder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/tree/{}/{}", self.base, self.repo, self.revision, self.path)
+    }
+}
+
 /// A dependency's folder on Hugging Face, parsed from its URL:
 /// `https://huggingface.co/<owner>/<repo>/tree/<revision>/<folder>`. The folder's last two segments are the
 /// dependency's name and version, as in `deps/cuda/13.3.0`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Source {
-    base: String,
-    repo: String,
-    revision: String,
-    folder: String,
+    folder: Folder,
 }
 
 /// A URL that is not a Hugging Face folder URL with a name and a version.
@@ -32,57 +114,39 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// [`SourceError`] when `url` is not an `http(s)` URL with the path `/<owner>/<repo>/tree/<revision>/<folder>`,
-    /// where the folder has at least two segments, or when it carries a query or a fragment.
+    /// [`SourceError`] when `url` is not a [`Folder`] URL whose folder has at least two segments.
     pub fn parse(url: &str) -> Result<Self, SourceError> {
         let error = || SourceError { url: url.to_owned() };
-        let parsed = Url::parse(url).map_err(|_| error())?;
-        if !matches!(parsed.scheme(), "https" | "http")
-            || parsed.host_str().is_none()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
+        let folder = Folder::parse(url).map_err(|_| error())?;
+        if !folder.path.contains('/') {
             return Err(error());
         }
+        Ok(Self { folder })
+    }
 
-        let segments: Vec<&str> = parsed.path().split('/').filter(|segment| !segment.is_empty()).collect();
-        let [owner, repo, "tree", revision, folder @ ..] = segments.as_slice() else {
-            return Err(error());
-        };
-        if folder.len() < 2 || folder.iter().any(|segment| matches!(*segment, "." | "..")) {
-            return Err(error());
-        }
-
-        let mut base = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default());
-        if let Some(port) = parsed.port() {
-            base.push_str(&format!(":{port}"));
-        }
-        Ok(Self {
-            base,
-            repo: format!("{owner}/{repo}"),
-            revision: (*revision).to_owned(),
-            folder: folder.join("/"),
-        })
+    /// The folder this source is, as a [`Folder`].
+    pub fn as_folder(&self) -> &Folder {
+        &self.folder
     }
 
     /// The scheme and host, as in `https://huggingface.co`.
     pub fn base(&self) -> &str {
-        &self.base
+        self.folder.base()
     }
 
     /// The repository, as in `vegidio/general`.
     pub fn repo(&self) -> &str {
-        &self.repo
+        self.folder.repo()
     }
 
     /// The branch, tag or commit the URL names, as in `main`.
     pub fn revision(&self) -> &str {
-        &self.revision
+        self.folder.revision()
     }
 
     /// The folder inside the repository, as in `deps/cuda/13.3.0`.
     pub fn folder(&self) -> &str {
-        &self.folder
+        self.folder.path()
     }
 
     /// The dependency's name: the folder's next-to-last segment, as in `cuda`.
@@ -96,13 +160,13 @@ impl Source {
     }
 
     fn segment_from_end(&self, n: usize) -> &str {
-        self.folder.rsplit('/').nth(n).unwrap_or_default()
+        self.folder().rsplit('/').nth(n).unwrap_or_default()
     }
 }
 
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}/tree/{}/{}", self.base, self.repo, self.revision, self.folder)
+        self.folder.fmt(f)
     }
 }
 
@@ -181,6 +245,42 @@ mod tests {
         ] {
             let error = Source::parse(url).expect_err(url);
             assert_eq!(error.url, url);
+        }
+    }
+
+    #[test]
+    fn a_folder_of_one_segment_or_more_parses() {
+        let models = Folder::parse("https://huggingface.co/vegidio/open-photo-ai/tree/main/models").unwrap();
+        assert_eq!(
+            (models.base(), models.repo(), models.revision(), models.path()),
+            ("https://huggingface.co", "vegidio/open-photo-ai", "main", "models")
+        );
+        assert_eq!(
+            models.to_string(),
+            "https://huggingface.co/vegidio/open-photo-ai/tree/main/models"
+        );
+        let nested = Folder::parse("https://huggingface.co/vegidio/general/tree/main/models/insightface/").unwrap();
+        assert_eq!(nested.path(), "models/insightface");
+        assert_eq!(
+            Source::parse("https://huggingface.co/vegidio/general/tree/main/deps/cuda/13.3.0")
+                .unwrap()
+                .as_folder()
+                .path(),
+            "deps/cuda/13.3.0"
+        );
+    }
+
+    #[test]
+    fn a_folder_url_with_no_folder_is_refused() {
+        for url in [
+            "not a url",
+            "https://huggingface.co/vegidio/general/tree/main",
+            "https://huggingface.co/vegidio/general/tree/main/",
+            "https://huggingface.co/vegidio/general/blob/main/models",
+            "https://huggingface.co/vegidio/general/tree/main/models/..",
+            "https://huggingface.co/vegidio/general/tree/main/models?x=1",
+        ] {
+            assert_eq!(Folder::parse(url).expect_err(url).url, url);
         }
     }
 

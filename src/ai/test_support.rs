@@ -116,6 +116,11 @@ impl Server {
         self.lock().hang_after.insert(path.into(), bytes);
     }
 
+    /// Serve `path` whole again after [`hang_after`](Self::hang_after).
+    pub fn stop_hanging(&self, path: &str) {
+        self.lock().hang_after.remove(path);
+    }
+
     pub fn break_after(&self, path: &str, bytes: usize) {
         self.lock().break_after.insert(path.into(), bytes);
     }

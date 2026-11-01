@@ -1,5 +1,6 @@
 //! Why an install, a load or a session build failed.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
 
@@ -12,7 +13,7 @@ use crate::fs::FsError;
 #[error("could not install {dependency}: {failure}")]
 pub struct InstallError {
     /// The dependency's display name, as the caller gave it.
-    pub dependency: &'static str,
+    pub dependency: Cow<'static, str>,
     /// What went wrong.
     pub failure: Failure,
 }
@@ -46,6 +47,13 @@ pub enum Failure {
     /// The Hugging Face API answered with something that is not what it returns.
     #[error("the server's answer could not be read: {0}")]
     Malformed(String),
+    /// The folder's listing names no file for the selection (or, for exact names, not every one of them). Nothing was
+    /// transferred.
+    #[error("its folder's listing names no file for it")]
+    NotListed,
+    /// No listing was given, and the folder holds no intact install to use. Nothing was transferred.
+    #[error("its folder's listing could not be read, and it is not installed")]
+    Unlisted,
 }
 
 impl From<HfError> for Failure {
@@ -150,7 +158,7 @@ mod tests {
     #[test]
     fn the_error_names_the_dependency_and_the_reason() {
         let error = InstallError {
-            dependency: "NVIDIA cuDNN",
+            dependency: "NVIDIA cuDNN".into(),
             failure: Failure::Http(404),
         };
         assert_eq!(
@@ -158,7 +166,7 @@ mod tests {
             "could not install NVIDIA cuDNN: the server answered with HTTP 404"
         );
         let error = InstallError {
-            dependency: "ONNX Runtime",
+            dependency: "ONNX Runtime".into(),
             failure: Failure::UnsupportedPlatform {
                 os: "macos",
                 arch: "x86_64",

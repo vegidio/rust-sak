@@ -521,9 +521,38 @@ mod ai {
     use rust_sak::ai::gpu::{GpuRefusal, GpuRequirement, check_with, meets_with};
     use rust_sak::ai::hf::{Hash, HfError, Hub, RemoteFile};
     use rust_sak::ai::{
-        Dependency, Event, Failure, InstallError, Kind, LoadError, LoadOptions, Phase, Plan, Planned, Source,
-        SourceError, State, asset_for, dirs, environment, is_present, load_with, runtime_library,
+        Dependency, Event, Failure, Files, Folder, FolderError, InstallError, Kind, Listing, LoadError, LoadOptions,
+        Outcome, Phase, Plan, Planned, Select, Source, SourceError, State, Trust, asset_for, dirs, environment,
+        files_present, install_files, is_present, load_with, runtime_library,
     };
+
+    #[test]
+    fn the_file_installer_is_reachable() {
+        let folder = Folder::parse("https://huggingface.co/vegidio/open-photo-ai/tree/main/models").unwrap();
+        assert_eq!(folder.path(), "models");
+        assert!(Folder::parse("https://example.com").is_err_and(|error: FolderError| !error.url.is_empty()));
+        let root = rust_sak::fs::mk_temp_dir("api-ai-files").unwrap();
+        let files = Files {
+            name: "up_kyoto_4x_fp32".to_owned().into(),
+            folder,
+            select: Select::Prefix("up_kyoto_4x_fp32.onnx".into()),
+            dir: root.path().join("models/up_kyoto_4x_fp32"),
+            derived: vec![root.path().join("engines/up_kyoto_4x_fp32")],
+            trust: Trust::default(),
+        };
+        assert_eq!(files.trust, Trust::Published);
+        assert!(!files_present(&files));
+        let _: Option<Listing> = None;
+        drop(install_files(&files, None, |_: Event| {}));
+        let _ = [
+            Outcome::Installed,
+            Outcome::Current,
+            Outcome::Adopted,
+            Outcome::Offline,
+            Outcome::Trusted,
+        ];
+        let _ = [Failure::NotListed, Failure::Unlisted];
+    }
 
     #[test]
     fn the_installer_is_reachable_and_names_nothing_of_its_own() {
@@ -577,18 +606,18 @@ mod ai {
         };
 
         let error = InstallError {
-            dependency: "NVIDIA CUDA",
+            dependency: "NVIDIA CUDA".into(),
             failure: Failure::Damaged,
         };
         assert!(error.to_string().starts_with("could not install NVIDIA CUDA"));
         let _ = Event::Verifying {
-            dependency: "NVIDIA CUDA",
+            dependency: "NVIDIA CUDA".into(),
         };
         let _ = Event::Current {
-            dependency: "NVIDIA CUDA",
+            dependency: "NVIDIA CUDA".into(),
         };
         let _ = Event::Progress {
-            dependency: "NVIDIA CUDA",
+            dependency: "NVIDIA CUDA".into(),
             phase: Phase::Download,
             bytes: 0,
             total: 1,

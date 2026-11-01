@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::Source;
+use super::{Folder, Source};
 use crate::fetch::{Fetch, FetchError};
 
 /// Where the Hub lives.
@@ -146,7 +146,12 @@ impl Hub {
 
     /// The repository `source` is in, on its Hub.
     pub fn for_source(source: &Source) -> Self {
-        Self::with_base(source.base(), source.repo())
+        Self::for_folder(source.as_folder())
+    }
+
+    /// The repository `folder` is in, on its Hub.
+    pub fn for_folder(folder: &Folder) -> Self {
+        Self::with_base(folder.base(), folder.repo())
     }
 
     /// The same Hub with `retries` retries of a transient failure instead of [`RETRIES`].
@@ -193,6 +198,10 @@ impl Hub {
     /// [`HfError`] when the Hub cannot be reached, answers with an error status (404 for a folder that does not
     /// exist), or answers with something that is not a listing.
     pub async fn list(&self, commit: &str, folder: &str) -> Result<Vec<RemoteFile>, HfError> {
+        self.list_pages(commit, folder, Unhashed::Refuse).await
+    }
+
+    async fn list_pages(&self, commit: &str, folder: &str, unhashed: Unhashed) -> Result<Vec<RemoteFile>, HfError> {
         let mut url = format!(
             "{}/api/models/{}/tree/{commit}/{}",
             self.base,
@@ -203,7 +212,7 @@ impl Hub {
         // A large folder is paged, each page naming the next in a `Link` header.
         loop {
             let page = self.fetch.text_response(&url).await.map_err(|cause| failure(&cause))?;
-            files.extend(parse_listing(&page.body)?);
+            files.extend(parse_page(&page.body, unhashed)?);
             match page.link("next") {
                 Some(next) => url = next.to_owned(),
                 None => return Ok(files),
@@ -222,8 +231,70 @@ impl Hub {
     }
 }
 
+/// A folder's files at one commit, read once and passed to every [`install_files`](super::install_files) in that
+/// folder, so a caller with many installs there pays for one read, and every file of them comes from one revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    folder: Folder,
+    commit: String,
+    files: Vec<RemoteFile>,
+}
+
+impl Listing {
+    /// Resolve `folder`'s revision to its commit, then list every page of the folder at that commit. A file the API
+    /// reports no hash for is left out, as though it were not there, since nothing could verify it.
+    ///
+    /// # Errors
+    ///
+    /// [`HfError`] when the Hub cannot be reached, answers with an error status (404 for a folder that does not
+    /// exist), or answers with something that is not a listing.
+    pub async fn read(folder: &Folder) -> Result<Self, HfError> {
+        Self::read_retrying(folder, RETRIES).await
+    }
+
+    pub(super) async fn read_retrying(folder: &Folder, retries: u32) -> Result<Self, HfError> {
+        let hub = Hub::for_folder(folder).retries(retries);
+        let commit = hub.resolve(folder.revision()).await?;
+        let files = hub.list_pages(&commit, folder.path(), Unhashed::Skip).await?;
+        Ok(Self {
+            folder: folder.clone(),
+            commit,
+            files,
+        })
+    }
+
+    /// The folder listed.
+    pub fn folder(&self) -> &Folder {
+        &self.folder
+    }
+
+    /// The commit the folder's revision pointed at, which every download from this listing uses.
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    /// The files directly inside the folder, with their sizes and hashes.
+    pub fn files(&self) -> &[RemoteFile] {
+        &self.files
+    }
+}
+
+/// What a page's entry with no hash does to the listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unhashed {
+    /// The page is malformed.
+    Refuse,
+    /// The entry is left out.
+    Skip,
+}
+
 /// The files in one page of a listing.
+#[cfg(test)]
 pub(crate) fn parse_listing(body: &str) -> Result<Vec<RemoteFile>, HfError> {
+    parse_page(body, Unhashed::Refuse)
+}
+
+fn parse_page(body: &str, unhashed: Unhashed) -> Result<Vec<RemoteFile>, HfError> {
     #[derive(Deserialize)]
     struct Entry {
         #[serde(rename = "type")]
@@ -246,17 +317,18 @@ pub(crate) fn parse_listing(body: &str) -> Result<Vec<RemoteFile>, HfError> {
     entries
         .into_iter()
         .filter(|entry| entry.kind == "file")
-        .map(|entry| {
+        .filter_map(|entry| {
             let hash = match (entry.lfs, entry.oid) {
                 (Some(lfs), _) => Hash::Sha256(lfs.oid.to_ascii_lowercase()),
                 (None, Some(oid)) => Hash::GitBlobSha1(oid.to_ascii_lowercase()),
-                (None, None) => return Err(HfError::Malformed(format!("{} has no hash", entry.path))),
+                (None, None) if unhashed == Unhashed::Skip => return None,
+                (None, None) => return Some(Err(HfError::Malformed(format!("{} has no hash", entry.path)))),
             };
-            Ok(RemoteFile {
+            Some(Ok(RemoteFile {
                 path: entry.path,
                 size: entry.size,
                 hash,
-            })
+            }))
         })
         .collect()
 }
@@ -399,6 +471,45 @@ mod tests {
         let error = closed.resolve("main").await.unwrap_err();
         assert_eq!(error, HfError::Network);
         assert!(error.is_unreachable());
+    }
+
+    #[test]
+    fn a_listing_leaves_out_a_file_with_no_hash() {
+        let page = r#"[{"type":"file","size":3,"path":"models/bare.onnx"},
+                       {"type":"file","oid":"aa","size":1,"path":"models/x.onnx"}]"#;
+        let files = parse_page(page, Unhashed::Skip).unwrap();
+        assert_eq!(files.iter().map(RemoteFile::file_name).collect::<Vec<_>>(), ["x.onnx"]);
+        assert!(matches!(parse_listing(page), Err(HfError::Malformed(_))));
+    }
+
+    #[tokio::test]
+    async fn a_listing_reads_every_page_at_the_resolved_commit() {
+        let server = Server::start("test/repo", "0123abcd");
+        for name in ["a", "b", "c", "d", "e"] {
+            server.put(&format!("models/{name}.onnx"), name.as_bytes(), true);
+        }
+        server.put("models/sub/ignored.onnx", b"nested", true);
+        server.page_size(2);
+        let folder = Folder::parse(&server.tree_url("models")).unwrap();
+
+        let listing = Listing::read_retrying(&folder, 0).await.unwrap();
+        assert_eq!(listing.commit(), "0123abcd");
+        assert_eq!(listing.folder(), &folder);
+        let names: Vec<_> = listing.files().iter().map(RemoteFile::file_name).collect();
+        assert_eq!(names, ["a.onnx", "b.onnx", "c.onnx", "d.onnx", "e.onnx"]);
+        assert_eq!(listing.files()[0].hash, Hash::Sha256(crate::crypto::sha256_bytes(b"a")));
+        let pages = server
+            .requests()
+            .iter()
+            .filter(|path| path.starts_with("/api/models/test/repo/tree/0123abcd/models"))
+            .count();
+        assert_eq!(pages, 3, "five files, two to a page");
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_cannot_be_read_says_why() {
+        let folder = Folder::parse(&format!("{}/test/repo/tree/main/models", Server::closed_base())).unwrap();
+        assert_eq!(Listing::read_retrying(&folder, 0).await, Err(HfError::Network));
     }
 
     #[tokio::test]

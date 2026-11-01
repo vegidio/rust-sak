@@ -1,6 +1,6 @@
 # `ai` module
 
-Installs what ONNX inference needs (the ONNX Runtime, and NVIDIA's CUDA, cuDNN and TensorRT on machines whose GPU can use them) from **Hugging Face folders the caller names**, verifies every download against the **hash the Hugging Face API reports**, loads the runtime once per process, and **builds sessions** on the best execution provider the machine offers, falling back towards the CPU when one cannot take a model.
+Installs what ONNX inference needs (the ONNX Runtime, and NVIDIA's CUDA, cuDNN and TensorRT on machines whose GPU can use them, and the models themselves) from **Hugging Face folders the caller names**, verifies every download against the **hash the Hugging Face API reports**, loads the runtime once per process, and **builds sessions** on the best execution provider the machine offers, falling back towards the CPU when one cannot take a model.
 
 Nothing in this module names a dependency, a version, a folder, a size, a hash, a model, a tuning or a place on disk. The caller passes each dependency as its folder URL, such as `https://huggingface.co/vegidio/general/tree/main/deps/cuda/13.3.0`, and the root folder to install under. A new version on Hugging Face needs only a new URL in the calling app.
 
@@ -27,6 +27,11 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 
 | Item                                  | What it does                                                                                                                                                                                                                         |
 |---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Folder::parse(url)`                  | Parses a Hugging Face folder URL (`https://huggingface.co/<owner>/<repo>/tree/<revision>/<folder>`) whose folder has one segment or more, as in `models` or `models/insightface`, into its repo, revision and path. |
+| `Listing::read(&folder)`              | Resolves the folder's revision to a commit, then lists every page of the folder at that commit: each file's `size` and `hash`, and the commit every download from it uses. A file the API reports no hash for is left out. Read once and passed to every `install_files` in that folder. |
+| `Files { name, folder, select, dir, derived, trust }` | One file install: the files of `folder` that `select` takes (`Select::Names` or `Select::Prefix`), installed into `dir`, with the folders computed from them in `derived`. See "How a file install works". |
+| `install_files(&files, Some(&listing) \| None, on_event)` | Installs `files` against a listing, or, with none, uses an intact install as it is. Returns an `Outcome`: `Installed`, `Current`, `Adopted`, `Offline` or `Trusted`. |
+| `files_present(&files)`               | Local only: whether `files.dir` holds an intact install (a record of verified files, each still there at its recorded size). What `install_files` uses with no listing. No network. |
 | `Source::parse(url)`                  | Parses a Hugging Face folder URL (`https://huggingface.co/<owner>/<repo>/tree/<revision>/<folder>`) into its repo, revision and folder. The folder's last two segments are the dependency's name and version.                        |
 | `Dependency::runtime(name, source)`   | The ONNX Runtime. Installed only while its library is in its folder, and a platform its folder has no archive for fails the install.                                                                                                |
 | `Dependency::libraries(name, source)` | Libraries no one file stands for, such as CUDA. Its marker alone decides, and a platform its folder has no archive for is skipped.                                                                                                   |
@@ -66,7 +71,9 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 - `Event::Verifying { dependency }`, while a complete archive found in staging is hashed.
 - `Event::Current { dependency }`, once for each dependency that is installed and intact, including one another process finished while this one waited for its lock.
 
-`InstallError { dependency, failure }` displays as `could not install NVIDIA cuDNN: the server answered with HTTP 404`. `Failure` is one of `Network`, `Http(status)`, `DiskFull`, `Io(reason)`, `Damaged`, `UnsupportedPlatform { os, arch }` and `Malformed(reason)`.
+`InstallError { dependency, failure }` displays as `could not install NVIDIA cuDNN: the server answered with HTTP 404`. `Failure` is one of `Network`, `Http(status)`, `DiskFull`, `Io(reason)`, `Damaged`, `UnsupportedPlatform { os, arch }`, `Malformed(reason)`, and, for file installs, `NotListed` (the listing names no file for the selection) and `Unlisted` (no listing, and nothing intact to use).
+
+An event's and an error's `dependency` is a `Cow<'static, str>`: a dependency's `&'static str` name, or a file install's `Files::name`, which may be built at run time. **Breaking in 26.11.0:** it was `&'static str`; match on it with `dependency.as_ref()` or compare it to a `&str`.
 
 ## How an install works
 
@@ -104,6 +111,66 @@ Apps that pass the same root share the installs: a runtime one app installed is 
 Every app that installs from a folder accepts whatever archive the API reports there, including an archive re-uploaded after the app was released. **A version folder on Hugging Face must only ever hold that version.** Putting 1.31 bytes in `deps/onnx/1.30.0/` would break every released app on its next start. Publish a new version in a new folder, and point new builds at its URL.
 
 The hash comes from the same host as the file, so verification catches corruption, truncation and a re-upload during a resume, not a compromised repository. Integrity rests on HTTPS to Hugging Face and on control of the repository.
+
+## How a file install works
+
+An archive's version folder only ever holds one version, so the archive installer trusts a present install with no request. A **model folder is different**: it holds many models, and a model is republished at the same path when it changes. `install_files` is built for that:
+
+- **Selection.** `Select::Names(names)` takes exactly those files, every one of which the listing must name. `Select::Prefix(p)` takes every file whose name starts with `p`, so `x.onnx` takes `x.onnx` and a sibling `x.onnx.data` holding its external weights, and not `xy.onnx`. Only the files directly inside the folder are listed.
+- **One listing, many installs.** The caller reads `Listing::read(&folder)` once and passes it to each install in the folder. The listing pins the commit, so every file of one listing comes from one revision. A listing of another folder is refused as `Malformed`.
+- **Republish-aware.** With a listing, an install is `Current` only when its record names exactly the selected files, each recorded hash equals the listing's, and each file is still on disk at its recorded size (a `stat`, never a hash). Anything else installs.
+- **No listing.** An install whose record of verified files is intact is `Offline`: used as it is, with no request. Anything else fails as `Unlisted`, with nothing transferred, since nothing could verify it.
+
+**The install**, under the folder's lock (`<dir>/.lock`, as for archives):
+
+1. The record is deleted, and every `derived` folder is emptied, the folder itself kept. Only then can a byte move, so an interruption never leaves new files beside what was compiled from old ones.
+2. Each selected file already in `dir` at its listed size is kept when the record being replaced vouched for its hash, or else when it hashes to the listing's (`Event::Verifying`). This **adopts in place** a folder filled by an earlier release, or by hand, with nothing downloaded. Any other file is downloaded from `resolve/<commit>/<path>` into `<dir>/.staging/`, resuming a partial whose hash is still the listing's, verified, and renamed into `dir`. A file that does not match after a resume is downloaded once more from nothing; one that still does not, or a clean download that does not, is deleted and fails as `Damaged`.
+3. Every entry of `dir` that is neither selected nor the installer's own is removed, which drops a file the listing no longer names and an earlier release's own bookkeeping.
+4. The record, each file's name, size and hash, is written last.
+
+The outcome is `Adopted` when every file was kept and `Installed` when any was downloaded. Progress is `Phase::Download` over the sum of the selected files' sizes; there is no `Extract` phase. The fraction never decreases, and is exactly 1 only after the record is written. Nothing is reported for `Current`, `Offline` or `Trusted`. Dropping the future stops the install and releases the lock; a download keeps its partial in staging to resume from.
+
+**Trust.** Under `Trust::LocalFiles`, a folder holding every selected file (by the names given, else the listing's selection, else the recorded names, else the folder's own files the prefix takes) is used as it is, **with no hash and no request**, and the outcome is `Trusted`. It exists for running a model that has been re-exported and not yet published. Its identity is a stamp, SHA-256 over each file's name, size and modification time; when the stamp moves, the derived folders are emptied once and the new stamp recorded. A trusted record is never an intact install, so an install without trust (or with no listing) never uses it unchecked: it reinstalls, adopting whatever happens to match. A folder missing a selected file installs as under `Trust::Published`, every download verified.
+
+```text
+<dir>/<file>                 installed: the selected files, by name
+<dir>/.installed             JSON: {"kind":"files","files":[{path,size,hash}]} or {"kind":"trusted","stamp"}: written last,
+                             deleted first
+<dir>/.lock                  locked by the process installing into the folder
+<dir>/.staging/<file>        a download in flight (and its .part and sidecar)
+```
+
+```rust,no_run
+use std::path::Path;
+
+use rust_sak::ai::{self, Event, Files, Folder, Listing, Outcome, Select, Trust};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let folder = Folder::parse("https://huggingface.co/vegidio/open-photo-ai/tree/main/models")?;
+let listing = Listing::read(&folder).await.ok();
+let config = Path::new("/path/the/app/chose");
+for model in ["up_kyoto_4x_fp32", "dn_stockholm_fp32"] {
+    let files = Files {
+        name: model.into(),
+        folder: folder.clone(),
+        select: Select::Prefix(format!("{model}.onnx")),
+        dir: config.join("models").join(model),
+        derived: vec![config.join("engines").join(model)],
+        trust: Trust::Published,
+    };
+    let outcome = ai::install_files(&files, listing.as_ref(), |event| {
+        if let Event::Progress { bytes, total, .. } = event {
+            println!("{model}: {bytes} of {total} bytes");
+        }
+    })
+    .await?;
+    if outcome == Outcome::Offline {
+        println!("{model}: the listing could not be read; using the installed files");
+    }
+}
+# Ok(())
+# }
+```
 
 ## Usage
 
@@ -277,6 +344,7 @@ fn main() {
 ## Platform notes
 
 - The archives exist for macOS arm64, Linux arm64/x64 and Windows arm64/x64 (the runtime), and Linux arm64/x64 and Windows x64 (the NVIDIA libraries). Intel Macs have no runtime archive. Finding that out takes the folder's listing, so the unsupported-platform failure comes after one API request.
+- The file installer's rename over an existing file, and its removal of a file another process has mapped, are tested on macOS only; on Windows the rename replaces in place (`MoveFileEx`), untested.
 - **Only macOS is tested.** The GPU paths (the NVIDIA probe passing, and the CUDA, cuDNN and TensorRT installs) have never run on real hardware. The folder lock is tested on macOS, between tasks and against a process that exited holding it; on Windows it is `LockFileEx`, untested. Their logic is covered by pure tests against constructed probe results, and the platform-specific code is written to be correct by construction, but it is **untested on Linux and Windows**.
 - On macOS, the ladder, the option maps and the search path are tested as pure functions, and CoreML, WebGPU and CPU sessions are built for real, on the ladder and one rung at a time. The TensorRT lock, the timing-cache discard and the out-of-memory classification are tested against a fake build and constructed records. **CUDA and TensorRT sessions, the Linux restart, the WSL2 driver folder and the Windows `PATH` step have never run**: they are written to be correct by construction, after Open Photo AI's code, and are untested.
 - CoreML is offered on every macOS the runtime loads on, with no OS-version probe: the 1.30 runtime's macOS build already needs a newer macOS than CoreML's ML Program format (12). Were that wrong, the CoreML rung would fail and the ladder would move on.

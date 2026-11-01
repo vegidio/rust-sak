@@ -15,6 +15,7 @@ use super::{Failure, InstallError, Source, asset_for, dirs, runtime_library};
 use crate::fetch::{DigestAlgorithm, Download, DownloadError, Fetch, RequestOptions};
 use crate::fs::ExtractOptions;
 
+pub(super) mod files;
 mod lock;
 mod marker;
 
@@ -153,11 +154,13 @@ impl Plan {
             let name = entry.dependency.name;
             let dir = dirs::dir_for(&self.root, &entry.dependency.source);
             match (&entry.remote, entry.planned.state) {
-                (_, State::Present) => on_event(Event::Current { dependency: name }),
+                (_, State::Present) => on_event(Event::Current {
+                    dependency: name.into(),
+                }),
                 (Some(remote), State::Missing) => install_one(remote, &dir, &entry.dependency, &mut on_event)
                     .await
                     .map_err(|failure| InstallError {
-                        dependency: name,
+                        dependency: name.into(),
                         failure,
                     })?,
                 _ => {}
@@ -194,7 +197,7 @@ pub(super) async fn plan_retrying(
     for dependency in dependencies {
         let name = dependency.name;
         let failed = |failure: Failure| InstallError {
-            dependency: name,
+            dependency: name.into(),
             failure,
         };
         let dir = dirs::dir_for(root, &dependency.source);
@@ -292,7 +295,9 @@ async fn install_one(
     let name = dependency.name;
     let held = lock::acquire(dir).await?;
     if intact_in(dir, dependency.kind).is_some() {
-        on_event(Event::Current { dependency: name });
+        on_event(Event::Current {
+            dependency: name.into(),
+        });
         return Ok(());
     }
 
@@ -304,13 +309,15 @@ async fn install_one(
 
     let mut notify = |step: Step| match step {
         Step::OnDisk(bytes) => on_event(Event::Progress {
-            dependency: name,
+            dependency: name.into(),
             phase: Phase::Download,
             bytes,
             total: asset.size,
             fraction: fraction.download(bytes, asset.size),
         }),
-        Step::Verifying => on_event(Event::Verifying { dependency: name }),
+        Step::Verifying => on_event(Event::Verifying {
+            dependency: name.into(),
+        }),
     };
     fetch_verified(
         remote.hub.fetch(),
@@ -330,7 +337,7 @@ async fn install_one(
     while let Some((done, total)) = extracted.recv().await {
         extract_total = total;
         on_event(Event::Progress {
-            dependency: name,
+            dependency: name.into(),
             phase: Phase::Extract,
             bytes: done,
             total,
@@ -345,7 +352,7 @@ async fn install_one(
     remove_other_versions(dir);
     drop(held);
     on_event(Event::Progress {
-        dependency: name,
+        dependency: name.into(),
         phase: Phase::Extract,
         bytes: extract_total,
         total: extract_total,

@@ -22,6 +22,10 @@
 //! deleted before the first old entry is removed and written after the last new one is in place, so it exists only
 //! over a complete install, however the process ends.
 //!
+//! Models install with [`install_files`]: the files of a [`Folder`] that a [`Select`] takes, into a folder the caller
+//! chooses, against a [`Listing`] read once, current only while their record matches it, since a model is republished
+//! at the same path.
+//!
 //! A session is asked for with an ordered list of [`ExecutionProvider`]s, which [`ladder`] turns into rungs: each one
 //! keeps every accelerator below it attached, and the CPU is always the last. [`build`] builds on one rung, with each
 //! provider's baseline, the caller's [`Tuning`] over it and the caller's [`CachePaths`], and says whether a failure was
@@ -53,12 +57,14 @@ mod test_support;
 pub use ort;
 
 pub use error::{Failure, InstallError, LoadError, RungError, SessionError};
+pub use hf::Listing;
+pub use install::files::{Files, Outcome, Select, Trust, files_present, install_files};
 pub use install::{Dependency, Kind, Plan, Planned, State, install, is_present, plan};
 pub use load::{LoadOptions, environment, load, load_with, runtime_library, webgpu_devices};
 pub use progress::{Event, Phase};
 pub use providers::{AUTO_ORDER, ExecutionProvider, Supported, UnknownProvider, ladder};
 pub use session::{Built, SessionRequest, build, session};
-pub use source::{Source, SourceError, asset_for};
+pub use source::{Folder, FolderError, Source, SourceError, asset_for};
 pub use tuning::{
     CachePaths, CoreMlComputeUnits, CoreMlSpecialization, ExecutionMode, Tuning, provider_options, trt_workspace_bytes,
 };

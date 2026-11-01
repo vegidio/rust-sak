@@ -1,5 +1,7 @@
 //! What an install reports, and one dependency's fraction done.
 
+use std::borrow::Cow;
+
 /// What [`install`](super::install) reports while it works.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -7,7 +9,7 @@ pub enum Event {
     /// decreases, and is exactly 1 only once the dependency's marker is written.
     Progress {
         /// The dependency's name, as the caller gave it.
-        dependency: &'static str,
+        dependency: Cow<'static, str>,
         /// The step `bytes` and `total` count.
         phase: Phase,
         /// Bytes done in this phase: on disk while downloading (a resumed partial included), written while
@@ -22,13 +24,13 @@ pub enum Event {
     /// A complete download of `dependency`, found in staging, is being hashed.
     Verifying {
         /// The dependency's name, as the caller gave it.
-        dependency: &'static str,
+        dependency: Cow<'static, str>,
     },
     /// `dependency` is installed and intact, so nothing is done for it. Reported once for each such dependency,
     /// including one another process finished installing while this one waited for it.
     Current {
         /// The dependency's name, as the caller gave it.
-        dependency: &'static str,
+        dependency: Cow<'static, str>,
     },
 }
 
@@ -59,6 +61,11 @@ impl Fraction {
     /// `done` of the download's `total` bytes are on disk.
     pub fn download(&mut self, done: u64, total: u64) -> f64 {
         self.report(DOWNLOAD_SHARE * ratio(done, total))
+    }
+
+    /// `done` of `total` bytes are on disk, for an install with no extraction, whose download fills it all.
+    pub fn whole(&mut self, done: u64, total: u64) -> f64 {
+        self.report(ratio(done, total))
     }
 
     /// `done` of the extraction's `total` bytes are written.
