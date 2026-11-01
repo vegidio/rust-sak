@@ -294,10 +294,33 @@ async fn a_listing_of_another_folder_is_refused() {
     assert!(matches!(
         install_with(&files, Some(&listing)).await.0,
         Err(InstallError {
-            failure: Failure::Malformed(_),
+            failure: Failure::WrongListing { .. },
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn a_listed_file_named_like_the_installers_own_is_refused() {
+    let setup = setup();
+    setup.server.put("models/.installed", b"{}", false);
+    let files = Files {
+        select: Select::Prefix(String::new()),
+        ..setup.files()
+    };
+    let (result, _) = setup.install(&files).await;
+    assert!(
+        matches!(
+            result,
+            Err(InstallError {
+                failure: Failure::Malformed(_),
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    assert!(setup.downloads().is_empty());
+    assert!(!files.dir.join(MARKER).exists());
 }
 
 #[tokio::test]

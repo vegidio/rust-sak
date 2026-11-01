@@ -579,7 +579,7 @@ mod ai {
         }];
         assert!(asset_for(&listing, "linux", "x86_64").is_some());
         assert_eq!(
-            Hub::default().url("c", "a/b"),
+            Hub::new("vegidio/general").url("c", "a/b"),
             "https://huggingface.co/vegidio/general/resolve/c/a/b"
         );
         assert!(HfError::Network.is_unreachable());

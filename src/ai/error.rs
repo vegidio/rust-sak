@@ -20,6 +20,7 @@ pub struct InstallError {
 
 /// What went wrong installing one dependency.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Failure {
     /// The server could not be reached, or the connection broke or timed out, after the retries.
     #[error("the network could not be reached")]
@@ -63,6 +64,15 @@ pub enum Failure {
     /// No listing was given, and the folder holds no intact install to use. Nothing was transferred.
     #[error("its folder's listing could not be read, and it is not installed")]
     Unlisted,
+    /// The listing given is of another folder than the install's, or was read through a hub of another repository.
+    /// Nothing was transferred.
+    #[error("the listing is of {listing}, not of {folder}")]
+    WrongListing {
+        /// What the listing is of: its folder's URL, or the hub's repository.
+        listing: String,
+        /// The install's folder's URL.
+        folder: String,
+    },
 }
 
 impl From<HfError> for Failure {
@@ -71,6 +81,7 @@ impl From<HfError> for Failure {
             HfError::Network => Failure::Network,
             HfError::Http(status) => Failure::Http(status),
             HfError::Malformed(reason) => Failure::Malformed(reason),
+            HfError::WrongRepository { hub, folder } => Failure::WrongListing { listing: hub, folder },
         }
     }
 }
@@ -97,6 +108,7 @@ impl From<FsError> for Failure {
 
 /// Why the runtime could not be loaded. Each names the path it was looking at.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoadError {
     /// The runtime is not installed there: the folder has no marker, or no runtime library.
     #[error("the ONNX Runtime is not installed at {}", path.display())]

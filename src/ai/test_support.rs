@@ -134,6 +134,11 @@ impl Server {
         self.lock().page_size = Some(size);
     }
 
+    /// Name each next page of a listing on `base` rather than on this server.
+    pub fn link_pages_to(&self, base: &str) {
+        self.lock().base = base.into();
+    }
+
     /// Every request's path, in order.
     pub fn requests(&self) -> Vec<String> {
         self.lock()

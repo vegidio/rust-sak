@@ -7,12 +7,13 @@
 //! listed size is hashed and kept when it matches, rather than downloaded again.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::marker::{MARKER, STAGING, is_own, read_json, write_json};
+use super::marker::{MARKER, STAGING, installable, is_own, read_json, single, write_json};
 use super::{Step, already_on_disk, blocking, empty_dir, fetch_verified, lock, remove_if_present};
 use crate::ai::hf::{Listing, RemoteFile};
 use crate::ai::progress::{Event, Fraction, Phase};
@@ -163,8 +164,8 @@ pub fn files_present(files: &Files) -> bool {
 ///
 /// [`InstallError`] naming `files.name`: [`Failure::NotListed`] when the listing names no selected file, or not every
 /// named one, [`Failure::Unlisted`] with no listing and no intact install, [`Failure::Damaged`] for a download that
-/// does not match its hash, [`Failure::Malformed`] for a listing of another folder, and the transfer and file failures
-/// of any install.
+/// does not match its hash, [`Failure::WrongListing`] for a listing of another folder, [`Failure::Malformed`] for a
+/// selected file whose listed name is not a plain file name, and the transfer and file failures of any install.
 pub async fn install_files(
     files: &Files,
     listing: Option<&Listing>,
@@ -186,11 +187,10 @@ async fn run(
     if let Some(listing) = listing
         && listing.folder() != &files.folder
     {
-        return Err(Failure::Malformed(format!(
-            "the listing is of {}, not of {}",
-            listing.folder(),
-            files.folder
-        )));
+        return Err(Failure::WrongListing {
+            listing: listing.folder().to_string(),
+            folder: files.folder.to_string(),
+        });
     }
 
     let dir = &files.dir;
@@ -246,6 +246,9 @@ fn wanted(select: &Select, listing: &Listing) -> Result<Vec<RemoteFile>, Failure
     if wanted.is_empty() || !complete {
         return Err(Failure::NotListed);
     }
+    if let Some(file) = wanted.iter().find(|file| !installable(file.file_name())) {
+        return Err(Failure::Malformed(format!("{} is not a plain file name", file.path)));
+    }
     Ok(wanted)
 }
 
@@ -298,7 +301,7 @@ fn stamp(dir: &Path, names: &[String]) -> String {
                     .ok()
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or_else(|| "?".to_owned(), |since| since.as_nanos().to_string());
-                input.push_str(&format!("{}\0{modified}", meta.len()));
+                let _ = write!(input, "{}\0{modified}", meta.len());
             }
             Err(_) => input.push_str("absent"),
         }
@@ -454,15 +457,6 @@ fn present_at(dir: &Path, name: &str, size: u64) -> bool {
 /// Whether `path` is a regular file, a link not followed.
 fn is_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
-}
-
-/// Whether `name` is one plain path component, which a record this crate wrote always holds.
-fn single(name: &str) -> bool {
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    )
 }
 
 #[cfg(test)]

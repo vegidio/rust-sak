@@ -52,12 +52,9 @@ impl Folder {
             return Err(error());
         }
 
-        let mut base = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default());
-        if let Some(port) = parsed.port() {
-            base.push_str(&format!(":{port}"));
-        }
         Ok(Self {
-            base,
+            // `scheme://host`, with the port only when it is not the scheme's default.
+            base: parsed.origin().ascii_serialization(),
             repo: format!("{owner}/{repo}"),
             revision: (*revision).to_owned(),
             path: folder.join("/"),

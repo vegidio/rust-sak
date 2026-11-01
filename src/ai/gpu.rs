@@ -18,6 +18,7 @@ pub struct GpuRequirement {
 /// Why a machine does not meet a [`GpuRequirement`]. Each names the versions involved, and displays as a sentence
 /// for a log.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum GpuRefusal {
     /// The machine has no NVIDIA graphics adapter, so the CUDA driver was not asked.
     #[error("there is no NVIDIA graphics adapter")]

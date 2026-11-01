@@ -331,13 +331,11 @@ fn a_promote_ttl_of_zero_disables_promotion() {
 #[test]
 fn a_promoted_entry_never_outlives_the_disk_entry_it_came_from() {
     let dir = TempDir::new().unwrap();
-    // An hour of promotion over an entry with a fraction of a second left.
+    // An hour of promotion over an entry with `LONG` left. Not a fraction of a second: the deadline is taken before the
+    // commit, so a slow fsync could expire the entry before it is read, and then there is nothing to promote.
     let composite = CompositeStore::open(dir.path(), CacheOpts::new(), Duration::from_secs(3600)).unwrap();
 
-    composite
-        .disk
-        .set("k", bytes(b"v"), Duration::from_millis(200))
-        .unwrap();
+    composite.disk.set("k", bytes(b"v"), LONG).unwrap();
     composite.get("k").unwrap();
 
     let promoted = composite
@@ -348,7 +346,7 @@ fn a_promoted_entry_never_outlives_the_disk_entry_it_came_from() {
     let remaining = promoted.remaining.expect("a promoted entry keeps a deadline");
 
     assert!(
-        remaining <= Duration::from_millis(200),
+        remaining <= LONG,
         "promoted for {remaining:?}, which outlives its source"
     );
 }

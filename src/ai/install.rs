@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::task::JoinError;
 
 use super::hf::{self, Hash, Hub, RemoteFile};
 use super::progress::{Event, Fraction, Phase};
@@ -23,7 +24,7 @@ mod lock;
 mod marker;
 
 pub(super) use marker::MARKER;
-use marker::{Marker, STAGING};
+use marker::{Marker, STAGING, installable};
 
 /// The extraction folder, in staging.
 const EXTRACT: &str = "extract";
@@ -119,8 +120,28 @@ pub struct Plan {
 struct Entry {
     dependency: Dependency,
     planned: Planned,
-    /// Where a missing dependency's archive is, at the commit the plan resolved.
-    remote: Option<Remote>,
+    action: Action,
+}
+
+/// What [`Plan::install`] does for one dependency, which its [`State`] is read from.
+#[derive(Debug)]
+enum Action {
+    /// Present: reported current.
+    Keep,
+    /// Missing: installed from where its archive is, at the commit the plan resolved.
+    Install(Remote),
+    /// Unavailable: nothing.
+    Skip,
+}
+
+impl Action {
+    fn state(&self) -> State {
+        match self {
+            Action::Keep => State::Present,
+            Action::Install(_) => State::Missing,
+            Action::Skip => State::Unavailable,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -157,17 +178,17 @@ impl Plan {
         for entry in &self.entries {
             let name = entry.dependency.name;
             let dir = dirs::dir_for(&self.root, &entry.dependency.source);
-            match (&entry.remote, entry.planned.state) {
-                (_, State::Present) => on_event(Event::Current {
+            match &entry.action {
+                Action::Keep => on_event(Event::Current {
                     dependency: name.into(),
                 }),
-                (Some(remote), State::Missing) => install_one(remote, &dir, &entry.dependency, &mut on_event)
+                Action::Install(remote) => install_one(remote, &dir, &entry.dependency, &mut on_event)
                     .await
                     .map_err(|failure| InstallError {
                         dependency: name.into(),
                         failure,
                     })?,
-                _ => {}
+                Action::Skip => {}
             }
         }
         Ok(())
@@ -205,16 +226,17 @@ pub(super) async fn plan_retrying(
             failure,
         };
         let dir = dirs::dir_for(root, &dependency.source);
+        let entry = |action: Action, size: u64| Entry {
+            dependency: dependency.clone(),
+            planned: Planned {
+                name,
+                state: action.state(),
+                size,
+            },
+            action,
+        };
         if let Some(marker) = intact_in(&dir, dependency.kind) {
-            entries.push(Entry {
-                dependency: dependency.clone(),
-                planned: Planned {
-                    name,
-                    state: State::Present,
-                    size: marker.size,
-                },
-                remote: None,
-            });
+            entries.push(entry(Action::Keep, marker.size));
             continue;
         }
 
@@ -238,32 +260,28 @@ pub(super) async fn plan_retrying(
             .map_err(|error| failed(error.into()))?;
 
         let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-        let remote = match asset_for(&listing, os, arch) {
-            Some(asset) => Some(Remote {
-                hub,
-                commit,
-                asset: asset.clone(),
-            }),
+        entries.push(match asset_for(&listing, os, arch) {
+            Some(asset) if !installable(asset.file_name()) => {
+                return Err(failed(Failure::Malformed(format!(
+                    "{} is not a plain file name",
+                    asset.path
+                ))));
+            }
+            Some(asset) => entry(
+                Action::Install(Remote {
+                    hub,
+                    commit,
+                    asset: asset.clone(),
+                }),
+                asset.size,
+            ),
             None if dependency.kind == Kind::Runtime => {
                 return Err(failed(Failure::UnsupportedPlatform { os, arch }));
             }
             None => {
                 tracing::info!("{name} has no archive for {os}/{arch}; skipping it");
-                None
+                entry(Action::Skip, 0)
             }
-        };
-        entries.push(Entry {
-            dependency: dependency.clone(),
-            planned: Planned {
-                name,
-                state: if remote.is_some() {
-                    State::Missing
-                } else {
-                    State::Unavailable
-                },
-                size: remote.as_ref().map_or(0, |remote| remote.asset.size),
-            },
-            remote,
         });
     }
     Ok(Plan {
@@ -352,7 +370,7 @@ async fn install_one(
             fraction: fraction.extract(done, total),
         });
     }
-    task.await.map_err(|cause| Failure::Io(cause.to_string()))??;
+    joined(task.await)??;
 
     // Off the runtime's threads: an old version can be gigabytes.
     let replaced = dir.to_path_buf();
@@ -593,9 +611,16 @@ pub(super) fn empty_dir(dir: &Path, keep: impl Fn(&OsStr) -> bool) -> io::Result
 
 /// Run file work on a blocking thread.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, Failure> + Send + 'static) -> Result<T, Failure> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|cause| Failure::Io(cause.to_string()))?
+    joined(tokio::task::spawn_blocking(work).await)?
+}
+
+/// What a blocking task returned. A panic in it is resumed here, as the bug it is rather than a file error; only a task
+/// the runtime cancelled while shutting down is an error.
+fn joined<T>(result: Result<T, JoinError>) -> io::Result<T> {
+    result.map_err(|cause| match cause.try_into_panic() {
+        Ok(panic) => std::panic::resume_unwind(panic),
+        Err(cause) => io::Error::other(cause),
+    })
 }
 
 #[cfg(test)]

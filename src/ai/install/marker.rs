@@ -127,6 +127,22 @@ pub(super) fn write_json<T: Serialize>(dir: &Path, value: &T) -> io::Result<()> 
     std::fs::rename(&pending, dir.join(MARKER))
 }
 
+/// Whether `name` is one plain path component, which a record this crate wrote always holds.
+pub(super) fn single(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
+
+/// Whether a listed file named `name` can be installed at the top of a folder: one plain path component, and not one
+/// of the installer's own entries. The name comes from the server, so `\..\` on Windows or a file named `.installed`
+/// would otherwise land outside the folder or over the marker.
+pub(super) fn installable(name: &str) -> bool {
+    single(name) && !is_own(name)
+}
+
 /// A recorded path as a relative path, or `None` for one that would leave the folder, which a marker this crate wrote
 /// never holds.
 fn relative(path: &str) -> Option<PathBuf> {

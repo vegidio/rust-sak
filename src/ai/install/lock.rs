@@ -23,12 +23,13 @@ pub(super) async fn acquire(dir: &Path) -> io::Result<FolderLock> {
     }
     tracing::info!("waiting for another process installing into {}", dir.display());
     let (file, dir) = (open(dir)?, dir.to_path_buf());
-    tokio::task::spawn_blocking(move || {
-        file.lock()?;
-        held(file, &dir)
-    })
-    .await
-    .map_err(io::Error::other)?
+    super::joined(
+        tokio::task::spawn_blocking(move || {
+            file.lock()?;
+            held(file, &dir)
+        })
+        .await,
+    )?
 }
 
 /// Lock `dir`, creating it, unless another process holds the lock.

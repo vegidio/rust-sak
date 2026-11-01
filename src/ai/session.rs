@@ -108,6 +108,10 @@ pub fn build(request: &SessionRequest<'_>, rung: &[ExecutionProvider]) -> Result
 /// One attempt on `rung`, with the runtime's reason when it fails.
 fn attempt(request: &SessionRequest<'_>, rung: &[Accelerator]) -> Result<Session, String> {
     let environment = super::load::environment().ok_or_else(|| "the ONNX Runtime is not loaded".to_owned())?;
+    // The providers take their folders as text, so one that is not UTF-8 would be written somewhere else.
+    if let Some(folder) = written(request.cache, rung).find(|folder| folder.to_str().is_none()) {
+        return Err(format!("its cache folder is not valid UTF-8: {}", folder.display()));
+    }
     create_folders(request.cache, rung).map_err(|cause| format!("its cache folder could not be created: {cause}"))?;
     let device_memory = if rung.contains(&Accelerator::TensorRt) {
         *DEVICE_MEMORY.get_or_init(|| {
@@ -134,17 +138,16 @@ fn rung_error(providers: Vec<ExecutionProvider>, reason: String, mark: u64) -> R
 
 /// Creates the folders `rung`'s providers compile into, and no others.
 fn create_folders(paths: &CachePaths, rung: &[Accelerator]) -> io::Result<()> {
-    for accelerator in rung {
-        match accelerator {
-            Accelerator::CoreMl => std::fs::create_dir_all(&paths.coreml)?,
-            Accelerator::TensorRt => {
-                std::fs::create_dir_all(&paths.tensorrt)?;
-                std::fs::create_dir_all(&paths.timing)?;
-            }
-            Accelerator::Cuda | Accelerator::WebGpu => {}
-        }
-    }
-    Ok(())
+    written(paths, rung).try_for_each(std::fs::create_dir_all)
+}
+
+/// The folders `rung`'s providers compile into.
+fn written<'a>(paths: &'a CachePaths, rung: &'a [Accelerator]) -> impl Iterator<Item = &'a Path> {
+    rung.iter().flat_map(|accelerator| match accelerator {
+        Accelerator::CoreMl => vec![paths.coreml.as_path()],
+        Accelerator::TensorRt => vec![paths.tensorrt.as_path(), paths.timing.as_path()],
+        Accelerator::Cuda | Accelerator::WebGpu => Vec::new(),
+    })
 }
 
 /// Runs `build`, under [`TENSORRT_BUILD`] when `tensorrt`, emptying `timing` when such a build fails. A build without

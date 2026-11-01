@@ -3,6 +3,7 @@
 //!
 //! The requests go through [`fetch`](crate::fetch), with its retries and timeouts.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -95,6 +96,7 @@ impl Hash {
 
 /// Why a request to the Hub failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum HfError {
     /// The Hub could not be reached, or the connection broke or timed out, after the retries.
     #[error("the network could not be reached")]
@@ -105,6 +107,14 @@ pub enum HfError {
     /// The Hub answered with something that is not what its API returns.
     #[error("the server's answer could not be read: {0}")]
     Malformed(String),
+    /// [`Listing::read_with`] was given a hub of another repository than its folder's. Nothing was requested.
+    #[error("the hub is for {hub}, not for {folder}")]
+    WrongRepository {
+        /// The hub's scheme, host and repository, as in `https://huggingface.co/vegidio/general`.
+        hub: String,
+        /// The folder's URL.
+        folder: String,
+    },
 }
 
 impl HfError {
@@ -114,15 +124,8 @@ impl HfError {
         match self {
             HfError::Network => true,
             HfError::Http(status) => *status >= 500,
-            HfError::Malformed(_) => false,
+            HfError::Malformed(_) | HfError::WrongRepository { .. } => false,
         }
-    }
-}
-
-impl Default for Hub {
-    /// `vegidio/general` on huggingface.co.
-    fn default() -> Self {
-        Self::new("vegidio/general")
     }
 }
 
@@ -210,14 +213,22 @@ impl Hub {
             folder.trim_matches('/')
         );
         let mut files = Vec::new();
-        // A large folder is paged, each page naming the next in a `Link` header.
+        let mut visited = HashSet::new();
+        // A large folder is paged, each page naming the next in a `Link` header. The link is the server's, so it is
+        // followed only on this Hub, and only to a page not read yet.
         loop {
             let page = self.fetch.text_response(&url).await.map_err(|cause| failure(&cause))?;
             files.extend(parse_page(&page.body, unhashed)?);
-            match page.link("next") {
-                Some(next) => url = next.to_owned(),
-                None => return Ok(files),
+            visited.insert(url);
+            let Some(next) = page.link("next") else {
+                return Ok(files);
+            };
+            if !next.starts_with(&format!("{}/", self.base)) || visited.contains(next) {
+                return Err(HfError::Malformed(format!(
+                    "the listing's next page, {next}, is another host's or one already read"
+                )));
             }
+            url = next.to_owned();
         }
     }
 
@@ -260,14 +271,13 @@ impl Listing {
     ///
     /// # Errors
     ///
-    /// As [`read`](Self::read), and [`HfError::Malformed`] for a hub of another repository than `folder`'s.
+    /// As [`read`](Self::read), and [`HfError::WrongRepository`] for a hub of another repository than `folder`'s.
     pub async fn read_with(hub: Hub, folder: &Folder) -> Result<Self, HfError> {
         if hub.base() != folder.base().trim_end_matches('/') || hub.repo() != folder.repo() {
-            return Err(HfError::Malformed(format!(
-                "the hub is for {}/{}, not for {folder}",
-                hub.base(),
-                hub.repo()
-            )));
+            return Err(HfError::WrongRepository {
+                hub: format!("{}/{}", hub.base(), hub.repo()),
+                folder: folder.to_string(),
+            });
         }
         let commit = hub.resolve(folder.revision()).await?;
         let files = hub.list_pages(&commit, folder.path(), Unhashed::Skip).await?;
@@ -382,7 +392,7 @@ mod tests {
 
     #[test]
     fn urls_resolve_at_the_commit() {
-        let hub = Hub::default();
+        let hub = Hub::new("vegidio/general");
         assert_eq!(
             hub.url(
                 "501d7b94e6d22762667e213994b0242ccdb04588",
@@ -563,5 +573,34 @@ mod tests {
             .map(|file| file.file_name().to_owned())
             .collect();
         assert_eq!(names, ["a.bin", "b.bin", "c.bin"]);
+    }
+
+    #[tokio::test]
+    async fn a_next_page_on_another_host_is_not_followed() {
+        let server = Server::start("test/repo", "0123abcd");
+        for name in ["a", "b", "c"] {
+            server.put(&format!("big/folder/{name}.bin"), name.as_bytes(), true);
+        }
+        server.page_size(2);
+        server.link_pages_to("http://elsewhere.invalid");
+        let hub = Hub::with_base(server.base(), "test/repo").retries(0);
+        assert!(matches!(
+            hub.list("0123abcd", "big/folder").await,
+            Err(HfError::Malformed(_))
+        ));
+        let pages = server.requests().iter().filter(|path| path.contains("/tree/")).count();
+        assert_eq!(pages, 1, "only the first page was read");
+    }
+
+    #[tokio::test]
+    async fn a_hub_of_another_repository_is_refused_before_any_request() {
+        let server = Server::start("test/repo", "0123abcd");
+        let folder = Folder::parse(&server.tree_url("models")).unwrap();
+        let error = Listing::read_with(Hub::with_base(server.base(), "other/repo"), &folder)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HfError::WrongRepository { .. }), "{error:?}");
+        assert!(!error.is_unreachable());
+        assert!(server.requests().is_empty());
     }
 }
