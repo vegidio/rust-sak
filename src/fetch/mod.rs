@@ -16,7 +16,7 @@
 mod digest;
 mod download;
 mod error;
-mod partial;
+pub(crate) mod partial;
 mod prepared;
 mod proxy;
 mod request;

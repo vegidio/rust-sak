@@ -251,19 +251,19 @@ fn webgpu_options(tuning: &Tuning) -> BTreeMap<String, String> {
 
 /// The session-level settings, as the builder calls that carry them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionSettings {
+pub(super) struct SessionSettings {
     /// What `with_parallel_execution` is given.
-    pub(crate) parallel: bool,
+    pub(super) parallel: bool,
     /// What `with_memory_pattern` is given.
-    pub(crate) mem_pattern: bool,
+    pub(super) mem_pattern: bool,
     /// The disabled optimizers as the runtime's config entry takes them, or `None` to leave the entry unwritten.
-    pub(crate) disabled_optimizers: Option<String>,
+    pub(super) disabled_optimizers: Option<String>,
 }
 
 impl SessionSettings {
     /// The settings `tuning` asks for. Empty optimizer names are dropped, since the runtime would match nothing with
     /// them.
-    pub(crate) fn of(tuning: &Tuning) -> Self {
+    pub(super) fn of(tuning: &Tuning) -> Self {
         let names: Vec<&str> = tuning
             .disabled_optimizers
             .iter()

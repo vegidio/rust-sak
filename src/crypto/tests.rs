@@ -127,6 +127,15 @@ fn git_blob_sha1_file_matches_git_hash_object() {
 }
 
 #[test]
+fn git_blob_sha1_bytes_matches_git_hash_object() {
+    assert_eq!(git_blob_sha1_bytes(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+    assert_eq!(
+        git_blob_sha1_bytes(b"hello world\n"),
+        "3b18e512dba79e4c8300dd08aeb37f8e728b8dad"
+    );
+}
+
+#[test]
 fn git_blob_sha1_file_matches_the_object_id_hugging_face_reports() {
     // SigLIP 2's `config.json` from `vegidio/general`, kept outside LFS: the API reports this `oid` for its 559 bytes.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/crypto/testdata/siglip2_config.json");

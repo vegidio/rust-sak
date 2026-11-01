@@ -12,7 +12,7 @@ rust-sak = { version = "2", features = ["crypto"] }
 ```
 
 ```rust
-use rust_sak::crypto::{git_blob_sha1_file, sha1_bytes, sha1_file, sha256_bytes, sha256_string, sha256_file, xxh3_bytes, xxh3_string, xxh3_file};
+use rust_sak::crypto::{git_blob_sha1_bytes, git_blob_sha1_file, sha1_bytes, sha1_file, sha256_bytes, sha256_string, sha256_file, xxh3_bytes, xxh3_string, xxh3_file};
 ```
 
 ## Public API
@@ -29,11 +29,12 @@ Three algorithm families: **SHA-256** (cryptographic) and **XXH3-64** (fast, non
 
 ### SHA-1
 
-| Function             | Signature                                                              | What it does                                                                                                                                                                 |
-|----------------------|------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `sha1_bytes`         | `fn sha1_bytes(bytes: &[u8]) -> String`                                | Hashes an in-memory byte slice.                                                                                                                                              |
-| `sha1_file`          | `fn sha1_file<P: AsRef<Path>>(path: P) -> io::Result<String>`          | Hashes a file, streamed in chunks.                                                                                                                                           |
-| `git_blob_sha1_file` | `fn git_blob_sha1_file<P: AsRef<Path>>(path: P) -> io::Result<String>` | The file's **git blob hash**, what `git hash-object` prints: SHA-1 over `blob <length>\0` followed by the bytes, streamed. Hugging Face reports it as the `oid` of a file outside LFS. Fails with `InvalidData` if the file changes length while it is read. |
+| Function              | Signature                                                              | What it does                                                                                                                                                                                                                                                 |
+|-----------------------|------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `sha1_bytes`          | `fn sha1_bytes(bytes: &[u8]) -> String`                                | Hashes an in-memory byte slice.                                                                                                                                                                                                                              |
+| `sha1_file`           | `fn sha1_file<P: AsRef<Path>>(path: P) -> io::Result<String>`          | Hashes a file, streamed in chunks.                                                                                                                                                                                                                           |
+| `git_blob_sha1_bytes` | `fn git_blob_sha1_bytes(bytes: &[u8]) -> String`                       | The **git blob hash** of an in-memory byte slice: SHA-1 over `blob <length>\0` followed by the bytes.                                                                                                                                                        |
+| `git_blob_sha1_file`  | `fn git_blob_sha1_file<P: AsRef<Path>>(path: P) -> io::Result<String>` | The file's **git blob hash**, what `git hash-object` prints: SHA-1 over `blob <length>\0` followed by the bytes, streamed. Hugging Face reports it as the `oid` of a file outside LFS. Fails with `InvalidData` if the file changes length while it is read. |
 
 > SHA-1 is broken for collision resistance. Use it to check a digest someone else publishes as SHA-1, not to pick one.
 

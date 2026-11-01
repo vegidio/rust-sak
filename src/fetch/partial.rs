@@ -67,14 +67,14 @@ impl Sidecar {
 /// Appended to the whole name rather than replacing an extension, so `archive.tar.xz` becomes `archive.tar.xz.part`
 /// and the target's own format stays readable. It also keeps the partial in the same directory as its target, which
 /// is what makes the final rename a same-filesystem operation and therefore atomic.
-pub(super) fn part_path(path: &Path) -> PathBuf {
+pub(crate) fn part_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".part");
     PathBuf::from(name)
 }
 
 /// The path of the sidecar describing `<path>.part`.
-pub(super) fn sidecar_path(path: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
     let mut name = part_path(path).into_os_string();
     name.push(".json");
     PathBuf::from(name)

@@ -1,8 +1,9 @@
 use std::time::{Duration, SystemTime};
 
-use super::super::marker::LOCK;
 use super::*;
+use crate::ai::hf::Hub;
 use crate::ai::test_support::Server;
+use crate::fetch::partial::part_path;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const NAME: &str = "x";
@@ -59,7 +60,9 @@ impl Setup {
     }
 
     async fn listing(&self) -> Listing {
-        Listing::read_retrying(&self.folder, 0).await.unwrap()
+        Listing::read_with(Hub::for_folder(&self.folder).retries(0), &self.folder)
+            .await
+            .unwrap()
     }
 
     /// Install against a fresh listing, without retries, and return the outcome and every event.
@@ -99,7 +102,7 @@ impl Setup {
 
 async fn install_with(files: &Files, listing: Option<&Listing>) -> (Result<Outcome, InstallError>, Vec<Event>) {
     let mut events = Vec::new();
-    let result = install_files_retrying(files, listing, 0, |event| events.push(event)).await;
+    let result = install_files(files, listing, |event| events.push(event)).await;
     (result, events)
 }
 
@@ -149,7 +152,7 @@ fn verifying(events: &[Event]) -> usize {
         .count()
 }
 
-const INSTALLED: [&str; 4] = [MARKER, LOCK, "x.onnx", "x.onnx.data"];
+const INSTALLED: [&str; 3] = [MARKER, "x.onnx", "x.onnx.data"];
 
 #[test]
 fn a_prefix_takes_the_graph_and_its_weights_and_names_take_exactly_themselves() {
@@ -256,9 +259,11 @@ async fn a_file_dropped_from_the_listing_is_removed_and_a_stray_manifest_with_it
         folder: folder.clone(),
         ..setup.files()
     };
-    let listing = Listing::read_retrying(&folder, 0).await.unwrap();
+    let listing = Listing::read_with(Hub::for_folder(&folder).retries(0), &folder)
+        .await
+        .unwrap();
     assert_eq!(install_with(&files, Some(&listing)).await.0, Ok(Outcome::Adopted));
-    assert_eq!(entries(&setup.dir()), [MARKER, LOCK, "x.onnx"]);
+    assert_eq!(entries(&setup.dir()), [MARKER, "x.onnx"]);
 }
 
 #[tokio::test]
@@ -333,7 +338,7 @@ async fn a_dropped_install_keeps_its_partial_and_the_next_one_resumes() {
     let files = setup.files();
     let task = tokio::spawn({
         let listing = listing.clone();
-        async move { install_files_retrying(&files, Some(&listing), 0, |_| {}).await }
+        async move { install_files(&files, Some(&listing), |_| {}).await }
     });
     // Wait until bytes of the weights are on disk.
     let part = part_path(&setup.dir().join(STAGING).join("x.onnx.data"));
@@ -518,7 +523,7 @@ async fn a_resumed_download_that_does_not_match_is_downloaded_once_more_from_not
     let files = setup.files();
     let task = tokio::spawn({
         let listing = listing.clone();
-        async move { install_files_retrying(&files, Some(&listing), 0, |_| {}).await }
+        async move { install_files(&files, Some(&listing), |_| {}).await }
     });
     let part = part_path(&setup.dir().join(STAGING).join("x.onnx.data"));
     tokio::time::timeout(Duration::from_secs(10), async {

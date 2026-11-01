@@ -18,7 +18,7 @@ const LARGE: &[u8] = include_bytes!("../testdata/large.7z");
 const LINKS: &[u8] = include_bytes!("../testdata/links.7z");
 
 /// The fixture's entries, the marker and the lock.
-const INSTALLED: [&str; 4] = [".installed", ".lock", LIB, PLUGIN];
+const INSTALLED: [&str; 3] = [".installed", LIB, PLUGIN];
 
 const COMMIT: &str = "501d7b94e6d22762667e213994b0242ccdb04588";
 
@@ -104,7 +104,7 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             if entry.file_type().unwrap().is_dir() {
                 pending.push(entry.path());
-            } else if entry.file_name() == LOCK {
+            } else if entry.path().extension().is_some_and(|extension| extension == "lock") {
                 files.push((entry.path(), Vec::new()));
             } else {
                 files.push((entry.path(), std::fs::read(entry.path()).unwrap()));
@@ -153,7 +153,7 @@ fn marker_of(dir: &Path) -> Option<String> {
 }
 
 #[tokio::test]
-async fn a_clean_install_leaves_exactly_the_archives_entries_the_marker_and_the_lock() {
+async fn a_clean_install_leaves_exactly_the_archives_entries_and_the_marker() {
     let setup = setup();
     let folder = setup.publish("cuda", "13.3.0");
     let (result, events) = setup.install(&[setup.libraries("NVIDIA CUDA", &folder)]).await;
@@ -426,10 +426,7 @@ async fn a_hash_mismatch_deletes_the_archive_and_leaves_the_folder_alone() {
         "the damaged archive is deleted"
     );
     assert_eq!(marker_of(&dir), None);
-    let outside: Vec<_> = entries(&dir)
-        .into_iter()
-        .filter(|name| name != STAGING && name != LOCK)
-        .collect();
+    let outside: Vec<_> = entries(&dir).into_iter().filter(|name| name != STAGING).collect();
     assert_eq!(outside, ["libnvinfer.so.old"], "nothing outside staging changed");
 }
 
@@ -505,7 +502,7 @@ async fn an_interrupted_download_resumes_reporting_its_partial_first() {
     assert!(first >= 0.4, "{first}");
     assert_eq!(
         entries(&setup.dir(&folder)),
-        [".installed", ".lock", "libonnxruntime.test.dylib", "padding.bin"]
+        [".installed", "libonnxruntime.test.dylib", "padding.bin"]
     );
 }
 
@@ -562,7 +559,7 @@ async fn a_dropped_install_keeps_the_partial_and_releases_the_lock() {
     let part = std::fs::metadata(part_path(&dir.join(STAGING).join(asset("cuda")))).expect("the partial is kept");
     assert!(part.len() > 0, "it holds the bytes that arrived, to resume from");
     assert_eq!(marker_of(&dir), None);
-    assert_eq!(entries(&dir), [LOCK, STAGING], "nothing reached the folder");
+    assert_eq!(entries(&dir), [STAGING], "nothing reached the folder");
     assert!(
         lock::try_acquire(&dir).unwrap().is_some(),
         "the lock went with the install"
@@ -783,7 +780,11 @@ async fn installing_a_version_removes_the_others() {
     );
     assert!(!older.exists(), "{}", older.display());
     assert!(!newer.exists(), "a newer version too: the build names the one it wants");
-    assert_eq!(entries(&setup.root.path().join("onnx")), ["1.30.0"]);
+    // Each version's lock file stays beside it, so a process waiting on one never holds a lock no one else sees.
+    assert_eq!(
+        entries(&setup.root.path().join("onnx")),
+        ["1.29.0.lock", "1.30.0", "1.30.0.lock", "1.31.0.lock"]
+    );
     assert_eq!(entries(&setup.dir(&folder)), INSTALLED);
     assert!(unrelated.join(MARKER).is_file(), "another dependency is not touched");
 }
@@ -878,7 +879,7 @@ async fn a_lock_left_by_a_process_that_exited_does_not_block() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(dir.join(LOCK).is_file(), "the child left its lock file");
+    assert!(lock::path(&dir).is_file(), "the child left its lock file");
 
     let dependencies = [setup.libraries("NVIDIA CUDA", &folder)];
     let (result, _) = tokio::time::timeout(Duration::from_secs(10), setup.install(&dependencies))

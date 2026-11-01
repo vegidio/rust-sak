@@ -8,19 +8,20 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The marker, in the dependency's folder.
 pub(in crate::ai) const MARKER: &str = ".installed";
 
-/// The lock, in the dependency's folder. Kept out of the record, and never removed by an install.
-pub(super) const LOCK: &str = ".lock";
+/// The marker's pending write, renamed over it once whole.
+const PENDING: &str = ".installed.tmp";
 
 /// The staging folder, in the dependency's folder.
 pub(super) const STAGING: &str = ".staging";
 
 /// The entries of a dependency's folder that are the installer's own, not the archive's.
-const OWN: [&str; 3] = [MARKER, LOCK, STAGING];
+const OWN: [&str; 3] = [MARKER, PENDING, STAGING];
 
 /// What a finished install left in its folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,8 +47,7 @@ impl Marker {
     /// The marker in `dir`, if there is one that can be read. A marker of another format, such as the bare hash
     /// earlier releases wrote, reads as none, which costs a reinstall.
     pub fn read(dir: &Path) -> Option<Self> {
-        let bytes = std::fs::read(dir.join(MARKER)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        read_json(dir)
     }
 
     /// Record what `dir` now holds, every entry but the installer's own, for an archive of `hash` and `size`.
@@ -65,9 +65,7 @@ impl Marker {
     /// Write the marker into `dir`, whole: it is written beside and renamed into place, so it is never seen
     /// half-written.
     pub fn write(&self, dir: &Path) -> io::Result<()> {
-        let pending = dir.join(format!("{MARKER}.tmp"));
-        std::fs::write(&pending, serde_json::to_vec(self).map_err(io::Error::other)?)?;
-        std::fs::rename(&pending, dir.join(MARKER))
+        write_json(dir, self)
     }
 
     /// Whether every recorded entry is still in `dir` at its recorded size. A link is checked as a link, so the
@@ -91,30 +89,42 @@ fn walk(root: &Path, dir: &Path, files: &mut Vec<File>) -> io::Result<()> {
         if dir == root && entry.file_name().to_str().is_some_and(is_own) {
             continue;
         }
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            walk(root, &entry.path(), files)?;
+        let path = entry.path();
+        // Not followed, as `file_type` is not: a link is recorded at its own size.
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            walk(root, &path, files)?;
             continue;
         }
-        let path = entry.path();
         let relative = path.strip_prefix(root).map_err(io::Error::other)?;
         let path = relative
             .components()
             .map(|component| component.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        files.push(File {
-            path,
-            size: std::fs::symlink_metadata(entry.path())?.len(),
-        });
+        files.push(File { path, size: meta.len() });
     }
     Ok(())
 }
 
 /// Whether `name`, at the top of a dependency's folder, is the installer's own entry: the marker and its pending
-/// write, the lock, or staging.
+/// write, or staging.
 pub(super) fn is_own(name: &str) -> bool {
-    OWN.contains(&name) || name == format!("{MARKER}.tmp")
+    OWN.contains(&name)
+}
+
+/// The marker in `dir` read as a `T`, if there is one that can be read as one.
+pub(super) fn read_json<T: DeserializeOwned>(dir: &Path) -> Option<T> {
+    let bytes = std::fs::read(dir.join(MARKER)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write `value` as the marker in `dir`, whole: it is written beside and renamed into place, so it is never seen
+/// half-written.
+pub(super) fn write_json<T: Serialize>(dir: &Path, value: &T) -> io::Result<()> {
+    let pending = dir.join(PENDING);
+    std::fs::write(&pending, serde_json::to_vec(value).map_err(io::Error::other)?)?;
+    std::fs::rename(&pending, dir.join(MARKER))
 }
 
 /// A recorded path as a relative path, or `None` for one that would leave the folder, which a marker this crate wrote
@@ -142,7 +152,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/deeper/a.txt"), b"ab").unwrap();
         std::fs::create_dir_all(dir.path().join(STAGING)).unwrap();
         std::fs::write(dir.path().join(STAGING).join("x.7z.part"), b"partial").unwrap();
-        std::fs::write(dir.path().join(LOCK), b"").unwrap();
+        std::fs::write(dir.path().join(PENDING), b"half").unwrap();
         std::fs::write(dir.path().join(MARKER), b"old").unwrap();
 
         let marker = Marker::record(dir.path(), "abc", 42).unwrap();

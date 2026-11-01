@@ -44,7 +44,7 @@ pub enum Phase {
 }
 
 /// The share of an archive's fraction its download fills, the extraction filling the rest.
-pub(super) const DOWNLOAD_SHARE: f64 = 0.8;
+const DOWNLOAD_SHARE: f64 = 0.8;
 
 /// The most a fraction reads before [`Fraction::finish`]: just below 1, so 1 means installed.
 const UNFINISHED: f64 = 1.0_f64.next_down();

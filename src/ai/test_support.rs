@@ -293,7 +293,7 @@ fn listing(state: &State, folder: &str, cursor: usize, page: &str) -> Vec<u8> {
         .iter()
         .filter(|(path, _)| path.rsplit_once('/').is_some_and(|(parent, _)| parent == folder))
         .map(|(path, (bytes, lfs))| {
-            let oid = crate::crypto::sha1_bytes(&[format!("blob {}\0", bytes.len()).as_bytes(), bytes].concat());
+            let oid = crate::crypto::git_blob_sha1_bytes(bytes);
             let lfs = if *lfs {
                 format!(
                     r#","lfs":{{"oid":"{}","size":{}}}"#,

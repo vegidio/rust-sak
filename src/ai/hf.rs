@@ -5,6 +5,7 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -233,8 +234,10 @@ impl Hub {
 
 /// A folder's files at one commit, read once and passed to every [`install_files`](super::install_files) in that
 /// folder, so a caller with many installs there pays for one read, and every file of them comes from one revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// It keeps the [`Hub`] it was read through, so those installs download through its client.
+#[derive(Debug, Clone)]
 pub struct Listing {
+    hub: Arc<Hub>,
     folder: Folder,
     commit: String,
     files: Vec<RemoteFile>,
@@ -249,24 +252,36 @@ impl Listing {
     /// [`HfError`] when the Hub cannot be reached, answers with an error status (404 for a folder that does not
     /// exist), or answers with something that is not a listing.
     pub async fn read(folder: &Folder) -> Result<Self, HfError> {
-        Self::read_retrying(folder, RETRIES).await
+        Self::read_with(Hub::for_folder(folder), folder).await
     }
 
-    /// [`read`](Self::read) with `retries` retries of a transient failure instead of [`RETRIES`], as a test of an
-    /// unreachable Hub wants none.
+    /// [`read`](Self::read) through `hub`, a [`Hub::for_folder`] configured as the caller wants, such as with no
+    /// [`retries`](Hub::retries) for a test of an unreachable Hub.
     ///
     /// # Errors
     ///
-    /// As [`read`](Self::read).
-    pub async fn read_retrying(folder: &Folder, retries: u32) -> Result<Self, HfError> {
-        let hub = Hub::for_folder(folder).retries(retries);
+    /// As [`read`](Self::read), and [`HfError::Malformed`] for a hub of another repository than `folder`'s.
+    pub async fn read_with(hub: Hub, folder: &Folder) -> Result<Self, HfError> {
+        if hub.base() != folder.base().trim_end_matches('/') || hub.repo() != folder.repo() {
+            return Err(HfError::Malformed(format!(
+                "the hub is for {}/{}, not for {folder}",
+                hub.base(),
+                hub.repo()
+            )));
+        }
         let commit = hub.resolve(folder.revision()).await?;
         let files = hub.list_pages(&commit, folder.path(), Unhashed::Skip).await?;
         Ok(Self {
+            hub: Arc::new(hub),
             folder: folder.clone(),
             commit,
             files,
         })
+    }
+
+    /// The hub the listing was read through.
+    pub fn hub(&self) -> &Hub {
+        &self.hub
     }
 
     /// The folder listed.
@@ -284,6 +299,15 @@ impl Listing {
         &self.files
     }
 }
+
+/// Two listings are equal when they list the same folder at the same commit with the same files, whatever hub read them.
+impl PartialEq for Listing {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.folder, &self.commit, &self.files) == (&other.folder, &other.commit, &other.files)
+    }
+}
+
+impl Eq for Listing {}
 
 /// What a page's entry with no hash does to the listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,7 +522,9 @@ mod tests {
         server.page_size(2);
         let folder = Folder::parse(&server.tree_url("models")).unwrap();
 
-        let listing = Listing::read_retrying(&folder, 0).await.unwrap();
+        let listing = Listing::read_with(Hub::for_folder(&folder).retries(0), &folder)
+            .await
+            .unwrap();
         assert_eq!(listing.commit(), "0123abcd");
         assert_eq!(listing.folder(), &folder);
         let names: Vec<_> = listing.files().iter().map(RemoteFile::file_name).collect();
@@ -515,7 +541,10 @@ mod tests {
     #[tokio::test]
     async fn a_listing_that_cannot_be_read_says_why() {
         let folder = Folder::parse(&format!("{}/test/repo/tree/main/models", Server::closed_base())).unwrap();
-        assert_eq!(Listing::read_retrying(&folder, 0).await, Err(HfError::Network));
+        assert_eq!(
+            Listing::read_with(Hub::for_folder(&folder).retries(0), &folder).await,
+            Err(HfError::Network)
+        );
     }
 
     #[tokio::test]

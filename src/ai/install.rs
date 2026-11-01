@@ -4,14 +4,17 @@
 //! installed into, and once it is in place the dependency's other versions are removed.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use super::hf::{self, Hash, Hub, RemoteFile};
 use super::progress::{Event, Fraction, Phase};
 use super::{Failure, InstallError, Source, asset_for, dirs, runtime_library};
+use crate::fetch::partial::{part_path, sidecar_path};
 use crate::fetch::{DigestAlgorithm, Download, DownloadError, Fetch, RequestOptions};
 use crate::fs::ExtractOptions;
 
@@ -20,7 +23,7 @@ mod lock;
 mod marker;
 
 pub(super) use marker::MARKER;
-use marker::{LOCK, Marker, STAGING};
+use marker::{Marker, STAGING};
 
 /// The extraction folder, in staging.
 const EXTRACT: &str = "extract";
@@ -122,7 +125,8 @@ struct Entry {
 
 #[derive(Debug)]
 struct Remote {
-    hub: Hub,
+    /// Shared by every dependency in its repository, so they download through one client.
+    hub: Arc<Hub>,
     commit: String,
     asset: RemoteFile,
 }
@@ -192,7 +196,7 @@ pub(super) async fn plan_retrying(
     dependencies: &[Dependency],
     retries: u32,
 ) -> Result<Plan, InstallError> {
-    let mut commits: HashMap<(&str, &str, &str), String> = HashMap::new();
+    let mut repos: HashMap<(&str, &str, &str), (Arc<Hub>, String)> = HashMap::new();
     let mut entries = Vec::with_capacity(dependencies.len());
     for dependency in dependencies {
         let name = dependency.name;
@@ -215,17 +219,17 @@ pub(super) async fn plan_retrying(
         }
 
         let source = &dependency.source;
-        let hub = Hub::for_source(source).retries(retries);
         let repo = (source.base(), source.repo(), source.revision());
-        let commit = match commits.get(&repo) {
-            Some(commit) => commit.clone(),
+        let (hub, commit) = match repos.get(&repo) {
+            Some((hub, commit)) => (Arc::clone(hub), commit.clone()),
             None => {
+                let hub = Arc::new(Hub::for_source(source).retries(retries));
                 let commit = hub
                     .resolve(source.revision())
                     .await
                     .map_err(|error| failed(error.into()))?;
-                commits.insert(repo, commit.clone());
-                commit
+                repos.insert(repo, (Arc::clone(&hub), commit.clone()));
+                (hub, commit)
             }
         };
         let listing = hub
@@ -319,11 +323,15 @@ async fn install_one(
             dependency: name.into(),
         }),
     };
+    // Only a file left complete in staging by an earlier run, perhaps of another upload, is downloaded again rather
+    // than failing the install.
+    let retry = staged.is_file();
     fetch_verified(
         remote.hub.fetch(),
-        remote.hub.url(&remote.commit, &asset.path),
+        &remote.hub.url(&remote.commit, &asset.path),
         &staged,
         asset,
+        retry,
         &mut notify,
     )
     .await?;
@@ -346,10 +354,16 @@ async fn install_one(
     }
     task.await.map_err(|cause| Failure::Io(cause.to_string()))??;
 
-    if let Err(cause) = std::fs::remove_dir_all(&staging) {
-        tracing::warn!("could not remove {}: {cause}", staging.display());
-    }
-    remove_other_versions(dir);
+    // Off the runtime's threads: an old version can be gigabytes.
+    let replaced = dir.to_path_buf();
+    blocking(move || {
+        if let Err(cause) = std::fs::remove_dir_all(&staging) {
+            tracing::warn!("could not remove {}: {cause}", staging.display());
+        }
+        remove_other_versions(&replaced);
+        Ok(())
+    })
+    .await?;
     drop(held);
     on_event(Event::Progress {
         dependency: name.into(),
@@ -377,8 +391,7 @@ fn remove_other_versions(dir: &Path) {
         match lock::try_acquire(&other) {
             Ok(Some(_held)) => {
                 // The marker first, so a removal that stops part-way never leaves a folder that reads as installed.
-                // The lock file goes with the folder while it is held, so no one is left waiting on a lock no one
-                // else can see.
+                // The lock file beside it stays, so a process waiting on it still locks the one every process opens.
                 let removed =
                     remove_if_present(&other.join(MARKER), false).and_then(|()| std::fs::remove_dir_all(&other));
                 match removed {
@@ -400,53 +413,64 @@ enum Step {
     Verifying,
 }
 
-/// Download `url` to `staged` and check it against `file`'s hash. A file found already complete in staging is
-/// re-hashed (reporting `Verifying`), and downloaded again once if it does not match. A file that still does not match
-/// is deleted, and the install fails as damaged.
+/// Download `url` to `staged` and check it against `file`'s hash. A download that does not match is deleted, with its
+/// partial and sidecar, and downloaded once more from nothing when `retry`, as it is when bytes already on disk were
+/// used rather than downloaded by this one. One that still does not match fails the install as damaged.
 async fn fetch_verified(
     fetch: &Fetch,
-    url: String,
+    url: &str,
     staged: &Path,
     file: &RemoteFile,
+    retry: bool,
     notify: &mut (dyn FnMut(Step) + Send),
 ) -> Result<(), Failure> {
-    let (mut digest, was_staged) = fetch_hashed(fetch, url.clone(), staged, &file.hash, notify).await?;
-    if was_staged && !file.hash.matches(&digest) {
-        // Left complete in staging by an earlier run, perhaps of another upload, and never downloaded by this one: it
-        // is downloaded again once rather than failing the install.
-        tracing::warn!(
-            "the staged {} does not match the API's hash; downloading it again",
-            file.path
-        );
-        std::fs::remove_file(staged)?;
-        (digest, _) = fetch_hashed(fetch, url, staged, &file.hash, notify).await?;
+    let mut digest = fetch_hashed(fetch, url, staged, &file.hash, notify).await?;
+    if file.hash.matches(&digest) {
+        return Ok(());
     }
-    if !file.hash.matches(&digest) {
-        tracing::error!(
-            "{} hashed to {digest}, not the API's {}; deleting it",
+    discard(staged)?;
+    if retry {
+        tracing::warn!(
+            "{} on disk came to {digest}, not the API's {}; downloading it again from nothing",
             file.path,
             file.hash.hex()
         );
-        std::fs::remove_file(staged)?;
-        return Err(Failure::Damaged {
-            path: file.path.clone(),
-            expected: file.hash.hex().to_owned(),
-            actual: digest,
-        });
+        digest = fetch_hashed(fetch, url, staged, &file.hash, notify).await?;
+        if file.hash.matches(&digest) {
+            return Ok(());
+        }
+        discard(staged)?;
+    }
+    tracing::error!(
+        "{} hashed to {digest}, not the API's {}; deleting it",
+        file.path,
+        file.hash.hex()
+    );
+    Err(Failure::Damaged {
+        path: file.path.clone(),
+        expected: file.hash.hex().to_owned(),
+        actual: digest,
+    })
+}
+
+/// Delete `staged` and its partial and sidecar, so nothing of a download that did not match is resumed.
+fn discard(staged: &Path) -> io::Result<()> {
+    for path in [staged.to_path_buf(), part_path(staged), sidecar_path(staged)] {
+        remove_if_present(&path, false)?;
     }
     Ok(())
 }
 
-/// Download `url` to `staged`, and return its hash, of `expected`'s kind, and whether it was already complete in
-/// staging, so the transfer did not download it.
+/// Download `url` to `staged`, and return its hash, of `expected`'s kind. A file already complete in staging is not
+/// downloaded, and is re-hashed, reporting `Verifying`.
 async fn fetch_hashed(
     fetch: &Fetch,
-    url: String,
+    url: &str,
     staged: &Path,
     expected: &Hash,
     notify: &mut (dyn FnMut(Step) + Send),
-) -> Result<(String, bool), Failure> {
-    let was_staged = std::fs::metadata(staged).is_ok_and(|meta| meta.is_file());
+) -> Result<String, Failure> {
+    let was_staged = staged.is_file();
     // The transfer's first update comes only once the response's headers land, so the bytes already on disk are
     // reported first, counted from the start.
     notify(Step::OnDisk(already_on_disk(staged)));
@@ -469,17 +493,15 @@ async fn fetch_hashed(
         return Err(download_failure(cause));
     }
     if let Some(digest) = download.0.digest() {
-        return Ok((digest, false));
+        return Ok(digest);
     }
 
     if was_staged {
         notify(Step::Verifying);
     }
     let (path, expected) = (staged.to_path_buf(), expected.clone());
-    let hash = tokio::task::spawn_blocking(move || expected.of_file(path))
-        .await
-        .map_err(|cause| Failure::Io(cause.to_string()))??;
-    Ok((hash.hex().to_owned(), was_staged))
+    let hash = blocking(move || Ok(expected.of_file(path)?)).await?;
+    Ok(hash.hex().to_owned())
 }
 
 /// A download that is cancelled when dropped, as it is when the install is: `fetch`'s own handle leaves its task
@@ -498,13 +520,6 @@ fn already_on_disk(path: &Path) -> u64 {
     len(path).or_else(|| len(&part_path(path))).unwrap_or(0)
 }
 
-/// Where `fetch` keeps the partial of `path`.
-fn part_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".part");
-    PathBuf::from(name)
-}
-
 /// What a failed download means.
 fn download_failure(cause: DownloadError) -> Failure {
     match cause {
@@ -519,7 +534,7 @@ fn download_failure(cause: DownloadError) -> Failure {
 }
 
 /// Extract the verified archive at `staged` into staging, then replace `dir`'s contents with it: the marker deleted
-/// first, every other entry but the lock and staging removed, the extracted entries moved in, then the marker,
+/// first, every other entry but staging removed, the extracted entries moved in, then the marker,
 /// recording `hash`, `size` and every entry, written. The extraction's `(done, total)` bytes go to `progress`.
 fn unpack(
     dir: &Path,
@@ -542,13 +557,7 @@ fn unpack(
     })?;
 
     remove_if_present(&dir.join(MARKER), false)?;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name != STAGING && name != LOCK {
-            remove_if_present(&entry.path(), entry.file_type()?.is_dir())?;
-        }
-    }
+    empty_dir(dir, |name| name == STAGING)?;
     for entry in std::fs::read_dir(&extract)? {
         let entry = entry?;
         std::fs::rename(entry.path(), dir.join(entry.file_name()))?;
@@ -569,6 +578,24 @@ fn remove_if_present(path: &Path, dir: bool) -> io::Result<()> {
         Err(cause) if cause.kind() != io::ErrorKind::NotFound => Err(cause),
         _ => Ok(()),
     }
+}
+
+/// Remove every entry in `dir` whose name `keep` refuses, keeping `dir`.
+pub(super) fn empty_dir(dir: &Path, keep: impl Fn(&OsStr) -> bool) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !keep(&entry.file_name()) {
+            remove_if_present(&entry.path(), entry.file_type()?.is_dir())?;
+        }
+    }
+    Ok(())
+}
+
+/// Run file work on a blocking thread.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, Failure> + Send + 'static) -> Result<T, Failure> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|cause| Failure::Io(cause.to_string()))?
 }
 
 #[cfg(test)]

@@ -22,9 +22,7 @@ pub(super) fn plugin_in(dir: &Path, os: &str) -> Option<PathBuf> {
         _ => "libonnxruntime_providers_webgpu.so",
     };
     let path = dir.join(name);
-    std::fs::metadata(&path)
-        .is_ok_and(|meta| meta.is_file())
-        .then_some(path)
+    path.is_file().then_some(path)
 }
 
 /// Registers the plugin found in `dir`, the runtime's folder, with `environment`, and says whether it offers a device.

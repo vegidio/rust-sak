@@ -9,8 +9,8 @@
 #[cfg(feature = "crypto")]
 mod crypto {
     use rust_sak::crypto::{
-        git_blob_sha1_file, sha1_bytes, sha1_file, sha256_bytes, sha256_file, sha256_string, xxh3_bytes, xxh3_file,
-        xxh3_string,
+        git_blob_sha1_bytes, git_blob_sha1_file, sha1_bytes, sha1_file, sha256_bytes, sha256_file, sha256_string,
+        xxh3_bytes, xxh3_file, xxh3_string,
     };
 
     #[test]
@@ -30,6 +30,7 @@ mod crypto {
             git_blob_sha1_file(&file).unwrap(),
             "f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f"
         );
+        assert_eq!(git_blob_sha1_bytes(b"abc"), git_blob_sha1_file(&file).unwrap());
         std::fs::remove_file(&file).unwrap();
     }
 }
@@ -543,6 +544,8 @@ mod ai {
         assert_eq!(files.trust, Trust::Published);
         assert!(!files_present(&files));
         let _: Option<Listing> = None;
+        let _ = Listing::read_with;
+        let _ = Listing::hub;
         drop(install_files(&files, None, |_: Event| {}));
         let _ = [
             Outcome::Installed,

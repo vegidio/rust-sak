@@ -12,9 +12,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::marker::{MARKER, STAGING, is_own};
-use super::{Step, already_on_disk, fetch_hashed, lock, part_path, remove_if_present};
-use crate::ai::hf::{self, Hub, Listing, RemoteFile};
+use super::marker::{MARKER, STAGING, is_own, read_json, write_json};
+use super::{Step, already_on_disk, blocking, empty_dir, fetch_verified, lock, remove_if_present};
+use crate::ai::hf::{Listing, RemoteFile};
 use crate::ai::progress::{Event, Fraction, Phase};
 use crate::ai::{Failure, Folder, InstallError};
 
@@ -109,15 +109,12 @@ impl Record {
     /// The record in `dir`, if there is one of this shape. An archive's marker, or an earlier release's file, reads as
     /// none.
     fn read(dir: &Path) -> Option<Self> {
-        let bytes = std::fs::read(dir.join(MARKER)).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        read_json(dir)
     }
 
     /// Write the record into `dir`, whole: it is written beside and renamed into place.
     fn write(&self, dir: &Path) -> io::Result<()> {
-        let pending = dir.join(format!("{MARKER}.tmp"));
-        std::fs::write(&pending, serde_json::to_vec(self).map_err(io::Error::other)?)?;
-        std::fs::rename(&pending, dir.join(MARKER))
+        write_json(dir, self)
     }
 
     /// The recorded files, when this is a record of verified files that are all still in `dir` at their recorded
@@ -156,6 +153,8 @@ pub fn files_present(files: &Files) -> bool {
 /// - With none, an intact install is [`Outcome::Offline`], and anything else fails as [`Failure::Unlisted`].
 /// - Under [`Trust::LocalFiles`], a folder holding every selected file is [`Outcome::Trusted`] before either.
 ///
+/// Downloads go through the [`Hub`](crate::ai::hf::Hub) the listing was read through, retrying as it does.
+///
 /// Dropping the future stops the install and releases the lock. A download keeps its partial to resume from.
 ///
 /// Needs a Tokio runtime, as [`fetch`](crate::fetch) does.
@@ -169,24 +168,9 @@ pub fn files_present(files: &Files) -> bool {
 pub async fn install_files(
     files: &Files,
     listing: Option<&Listing>,
-    on_event: impl FnMut(Event) + Send,
-) -> Result<Outcome, InstallError> {
-    install_files_retrying(files, listing, hf::RETRIES, on_event).await
-}
-
-/// [`install_files`] with `retries` retries of a transient transfer failure instead of [`hf::RETRIES`], as a test of a
-/// failing server wants none.
-///
-/// # Errors
-///
-/// As [`install_files`].
-pub async fn install_files_retrying(
-    files: &Files,
-    listing: Option<&Listing>,
-    retries: u32,
     mut on_event: impl FnMut(Event) + Send,
 ) -> Result<Outcome, InstallError> {
-    run(files, listing, retries, &mut on_event)
+    run(files, listing, &mut on_event)
         .await
         .map_err(|failure| InstallError {
             dependency: files.name.clone(),
@@ -197,7 +181,6 @@ pub async fn install_files_retrying(
 async fn run(
     files: &Files,
     listing: Option<&Listing>,
-    retries: u32,
     on_event: &mut (dyn FnMut(Event) + Send),
 ) -> Result<Outcome, Failure> {
     if let Some(listing) = listing
@@ -243,7 +226,7 @@ async fn run(
     {
         return Ok(Outcome::Current);
     }
-    install(files, listing, &wanted, record.as_ref(), retries, on_event).await
+    install(files, listing, &wanted, record.as_ref(), on_event).await
 }
 
 /// The listing's files `select` takes, every named one present for [`Select::Names`].
@@ -329,7 +312,6 @@ async fn install(
     listing: &Listing,
     wanted: &[RemoteFile],
     record: Option<&Record>,
-    retries: u32,
     on_event: &mut (dyn FnMut(Event) + Send),
 ) -> Result<Outcome, Failure> {
     let (name, dir) = (&files.name, &files.dir);
@@ -337,7 +319,7 @@ async fn install(
     // what was compiled from the old ones.
     clear(dir, &files.derived).await?;
 
-    let hub = Hub::for_folder(listing.folder()).retries(retries);
+    let hub = listing.hub();
     let staging = dir.join(STAGING);
     let total: u64 = wanted.iter().map(|file| file.size).sum();
     let mut fraction = Fraction::default();
@@ -363,7 +345,10 @@ async fn install(
                     dependency: name.clone(),
                 }),
             };
-            fetch_checked(&hub, &hub.url(listing.commit(), &file.path), &staged, file, &mut notify).await?;
+            // Bytes already on disk, a partial or a complete file, that do not match are downloaded again once.
+            let retry = already_on_disk(&staged) > 0;
+            let url = hub.url(listing.commit(), &file.path);
+            fetch_verified(hub.fetch(), &url, &staged, file, retry, &mut notify).await?;
             std::fs::rename(&staged, &target)?;
             downloaded = true;
         }
@@ -390,16 +375,11 @@ async fn install(
     };
     let finishing = dir.clone();
     blocking(move || {
-        for entry in std::fs::read_dir(&finishing)? {
-            let entry = entry?;
-            let entry_name = entry.file_name();
-            let keep = entry_name
+        empty_dir(&finishing, |entry| {
+            entry
                 .to_str()
-                .is_some_and(|entry_name| is_own(entry_name) || keeping.iter().any(|kept| kept == entry_name));
-            if !keep {
-                remove_if_present(&entry.path(), entry.file_type()?.is_dir())?;
-            }
-        }
+                .is_some_and(|entry| is_own(entry) || keeping.iter().any(|kept| kept == entry))
+        })?;
         recorded.write(&finishing)?;
         Ok(())
     })
@@ -433,7 +413,7 @@ async fn keep(
     name: &str,
     on_event: &mut (dyn FnMut(Event) + Send),
 ) -> Result<bool, Failure> {
-    if !is_file(target) || std::fs::symlink_metadata(target).map(|meta| meta.len())? != file.size {
+    if !std::fs::symlink_metadata(target).is_ok_and(|meta| meta.is_file() && meta.len() == file.size) {
         return Ok(false);
     }
     if let Some(Record::Files { files }) = record
@@ -453,81 +433,17 @@ async fn keep(
     Ok(matches)
 }
 
-/// Download `url` to `staged` and check it against `file`'s hash. A download that resumed bytes already on disk and
-/// does not match is downloaded once more from nothing; one that still does not match, or a clean one that does not,
-/// is deleted, and the install fails as damaged.
-async fn fetch_checked(
-    hub: &Hub,
-    url: &str,
-    staged: &Path,
-    file: &RemoteFile,
-    notify: &mut (dyn FnMut(Step) + Send),
-) -> Result<(), Failure> {
-    let resumed = already_on_disk(staged) > 0;
-    let (digest, _) = fetch_hashed(hub.fetch(), url.to_owned(), staged, &file.hash, notify).await?;
-    if file.hash.matches(&digest) {
-        return Ok(());
-    }
-    discard(staged)?;
-    let digest = if resumed {
-        tracing::warn!(
-            "{} resumed to {digest}, not the listing's {}; downloading it again from nothing",
-            file.path,
-            file.hash.hex()
-        );
-        let (digest, _) = fetch_hashed(hub.fetch(), url.to_owned(), staged, &file.hash, notify).await?;
-        if file.hash.matches(&digest) {
-            return Ok(());
-        }
-        discard(staged)?;
-        digest
-    } else {
-        digest
-    };
-    tracing::error!(
-        "{} hashed to {digest}, not the listing's {}; deleting it",
-        file.path,
-        file.hash.hex()
-    );
-    Err(Failure::Damaged {
-        path: file.path.clone(),
-        expected: file.hash.hex().to_owned(),
-        actual: digest,
-    })
-}
-
-/// Delete `staged` and its partial and sidecar, so nothing of a download that did not match is resumed.
-fn discard(staged: &Path) -> io::Result<()> {
-    let part = part_path(staged);
-    let mut sidecar = part.clone().into_os_string();
-    sidecar.push(".json");
-    for path in [staged.to_path_buf(), part, PathBuf::from(sidecar)] {
-        remove_if_present(&path, false)?;
-    }
-    Ok(())
-}
-
 /// Delete the record in `dir`, then empty each of `derived` that exists, keeping the folder.
 async fn clear(dir: &Path, derived: &[PathBuf]) -> Result<(), Failure> {
     let (dir, derived) = (dir.to_path_buf(), derived.to_vec());
     blocking(move || {
         remove_if_present(&dir.join(MARKER), false)?;
         for folder in derived.iter().filter(|folder| folder.is_dir()) {
-            for entry in std::fs::read_dir(folder)? {
-                let entry = entry?;
-                remove_if_present(&entry.path(), entry.file_type()?.is_dir())?;
-            }
+            empty_dir(folder, |_| false)?;
         }
         Ok(())
     })
     .await
-}
-
-/// Run file work on a blocking thread.
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, Failure> + Send + 'static) -> Result<T, Failure> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|cause| Failure::Io(cause.to_string()))?
 }
 
 /// Whether `name`, a single plain component, is a regular file in `dir` of `size` bytes.

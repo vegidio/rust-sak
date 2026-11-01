@@ -158,25 +158,12 @@ fn serialized<T, E>(tensorrt: bool, timing: &Path, build: impl FnOnce() -> Resul
     build().inspect_err(|_| {
         // Swallowed: this is already returning the build's error, which a cache that would not go is not worth
         // replacing.
-        let _ = empty(timing);
+        let _ = super::install::empty_dir(timing, |_| false);
         tracing::info!(
             path = %timing.display(),
             "the TensorRT timing cache was discarded after a failed build; the next engine build will be slower"
         );
     })
-}
-
-/// Removes everything inside `dir`, keeping `dir`.
-fn empty(dir: &Path) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 /// A provider a rung attaches: the hardware, without `Auto` or the CPU.

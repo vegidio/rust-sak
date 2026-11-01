@@ -5,8 +5,8 @@
 //!
 //! - **SHA-256** — [`sha256_bytes`] (byte slice), [`sha256_string`] (string data), [`sha256_file`] (streams a file's
 //!   contents through the hasher, chunked, so it never loads the whole file).
-//! - **SHA-1** — [`sha1_bytes`], [`sha1_file`], and [`git_blob_sha1_file`], the object id Git (and Hugging Face, for a
-//!   file outside LFS) gives a file.
+//! - **SHA-1** — [`sha1_bytes`], [`sha1_file`], and [`git_blob_sha1_bytes`] / [`git_blob_sha1_file`], the object id Git
+//!   (and Hugging Face, for a file outside LFS) gives a file.
 //! - **XXH3 (64-bit)** — [`xxh3_bytes`], [`xxh3_string`], [`xxh3_file`]: the same trio backed by the fast,
 //!   non-cryptographic XXH3 algorithm.
 //!
@@ -26,6 +26,7 @@
 #![doc = include_str!("README.md")]
 
 mod chunked_read;
+mod git_blob_sha1_bytes;
 mod git_blob_sha1_file;
 mod sha1_bytes;
 mod sha1_file;
@@ -36,6 +37,7 @@ mod xxh3_bytes;
 mod xxh3_file;
 mod xxh3_string;
 
+pub use git_blob_sha1_bytes::git_blob_sha1_bytes;
 pub use git_blob_sha1_file::git_blob_sha1_file;
 pub use sha1_bytes::sha1_bytes;
 pub use sha1_file::sha1_file;

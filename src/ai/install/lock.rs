@@ -1,13 +1,13 @@
 //! The exclusive lock on a dependency's folder, so two processes sharing a root never install into one folder at once.
 //!
-//! It is the operating system's advisory lock on `<folder>/.lock` (`flock` on Unix, `LockFileEx` on Windows), held
-//! through an open file, so the system releases it when the process holding it ends, however it ends.
+//! It is the operating system's advisory lock on `<folder>.lock`, beside the folder (`flock` on Unix, `LockFileEx` on
+//! Windows), held through an open file, so the system releases it when the process holding it ends, however it ends.
+//! The lock file is never removed, so it stays the one every process opens even while the folder is replaced or
+//! removed, and the folder's contents never include it.
 
 use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-
-use super::marker::LOCK;
 
 /// A held lock on a dependency's folder, released when dropped.
 #[derive(Debug)]
@@ -22,63 +22,49 @@ pub(super) async fn acquire(dir: &Path) -> io::Result<FolderLock> {
         return Ok(lock);
     }
     tracing::info!("waiting for another process installing into {}", dir.display());
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || acquire_blocking(&dir))
-        .await
-        .map_err(io::Error::other)?
+    let (file, dir) = (open(dir)?, dir.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        file.lock()?;
+        held(file, &dir)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Lock `dir`, creating it, unless another process holds the lock.
 pub(super) fn try_acquire(dir: &Path) -> io::Result<Option<FolderLock>> {
-    loop {
-        let (file, path) = open(dir)?;
-        match file.try_lock() {
-            Ok(()) if still_at(&file, &path) => return Ok(Some(FolderLock { _file: file })),
-            // The folder was removed, its lock file with it, between the open and the lock: lock the new one.
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Ok(None),
-            Err(TryLockError::Error(cause)) => return Err(cause),
-        }
+    let file = open(dir)?;
+    match file.try_lock() {
+        Ok(()) => held(file, dir).map(Some),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(cause)) => Err(cause),
     }
 }
 
-fn acquire_blocking(dir: &Path) -> io::Result<FolderLock> {
-    loop {
-        let (file, path) = open(dir)?;
-        file.lock()?;
-        if still_at(&file, &path) {
-            return Ok(FolderLock { _file: file });
-        }
-    }
+/// The lock file of `dir`: its name with `.lock` appended, beside it.
+pub(super) fn path(dir: &Path) -> PathBuf {
+    let mut name = dir.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
 }
 
-fn open(dir: &Path) -> io::Result<(File, PathBuf)> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(LOCK);
-    let file = File::options()
+/// The lock file of `dir`, opened, creating it and the folder it is in.
+fn open(dir: &Path) -> io::Result<File> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)?;
-    Ok((file, path))
+        .open(path(dir))
 }
 
-/// Whether `file` is still the lock file at `path`. A process that removes a folder unlinks its lock file while it
-/// holds the lock, so one that was waiting on it ends up holding a lock no one else can see.
-#[cfg(unix)]
-fn still_at(file: &File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    match (file.metadata(), std::fs::metadata(path)) {
-        (Ok(held), Ok(now)) => (held.dev(), held.ino()) == (now.dev(), now.ino()),
-        _ => false,
-    }
-}
-
-/// Windows cannot delete a file another process has open, so the lock file at `path` is always the one held.
-#[cfg(not(unix))]
-fn still_at(_file: &File, _path: &Path) -> bool {
-    true
+/// The lock held through `file`, with `dir` created: the process it waited on may have removed the folder.
+fn held(file: File, dir: &Path) -> io::Result<FolderLock> {
+    std::fs::create_dir_all(dir)?;
+    Ok(FolderLock { _file: file })
 }
 
 #[cfg(test)]
@@ -92,7 +78,10 @@ mod tests {
         let dir = crate::fs::mk_temp_dir("rust-sak-ai-lock").unwrap();
         let folder = dir.path().join("cuda/13.3.0");
         let held = try_acquire(&folder).unwrap().expect("nobody holds it");
-        assert!(folder.join(LOCK).is_file(), "the folder and its lock file are created");
+        assert!(
+            folder.is_dir() && path(&folder).is_file(),
+            "the folder and its lock file beside it are created"
+        );
         assert!(try_acquire(&folder).unwrap().is_none(), "held by another file");
 
         let waiting = tokio::spawn({
@@ -109,9 +98,8 @@ mod tests {
         assert!(lock.is_ok());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn a_waiter_on_a_removed_folder_locks_the_new_one() {
+    async fn a_waiter_on_a_removed_folder_gets_it_back() {
         let dir = crate::fs::mk_temp_dir("rust-sak-ai-lock").unwrap();
         let folder = dir.path().join("cuda/13.3.0");
         let held = try_acquire(&folder).unwrap().unwrap();
@@ -128,7 +116,7 @@ mod tests {
             .expect("released")
             .unwrap()
             .unwrap();
-        assert!(folder.join(LOCK).is_file(), "a new lock file in a new folder");
-        assert!(try_acquire(&folder).unwrap().is_none(), "and it is the one held");
+        assert!(folder.is_dir(), "the folder is created again");
+        assert!(try_acquire(&folder).unwrap().is_none(), "and its lock is the one held");
     }
 }

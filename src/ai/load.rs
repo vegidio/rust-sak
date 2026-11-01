@@ -46,7 +46,7 @@ fn library_in(dir: &Path, os: &str) -> Option<PathBuf> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            let file = std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file());
+            let file = entry.path().is_file();
             let link = entry.file_type().is_ok_and(|kind| kind.is_symlink());
             (file && is_runtime_library(&name, os)).then_some((link, name))
         })
@@ -134,7 +134,7 @@ pub fn load_with(runtime_dir: &Path, options: &LoadOptions<'_>) -> Result<(), Lo
     if held.is_some() {
         return Ok(());
     }
-    if !std::fs::metadata(runtime_dir.join(MARKER)).is_ok_and(|meta| meta.is_file()) {
+    if !runtime_dir.join(MARKER).is_file() {
         return Err(LoadError::NotInstalled {
             path: runtime_dir.to_path_buf(),
         });
@@ -155,7 +155,7 @@ fn start(path: &Path, options: &LoadOptions<'_>) -> Result<Environment, LoadErro
     if std::env::var_os(name).is_none_or(|set| set != value) {
         tracing::warn!("{name} is not {value}; the ONNX Runtime may send telemetry");
     }
-    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+    if !path.is_file() {
         return Err(LoadError::NotInstalled {
             path: path.to_path_buf(),
         });

@@ -1,9 +1,10 @@
 use std::io;
 use std::path::Path;
 
-use sha1::{Digest, Sha1};
+use sha1::Digest;
 
 use super::chunked_read::for_each_chunk;
+use super::git_blob_sha1_bytes::git_blob_hasher;
 
 /// Computes the git blob hash of the file at `path`, the object id `git hash-object` prints for it, as a lowercase hex
 /// string: SHA-1 over `blob <length>\0` followed by the file's bytes.
@@ -18,8 +19,7 @@ use super::chunked_read::for_each_chunk;
 pub fn git_blob_sha1_file<P: AsRef<Path>>(path: P) -> io::Result<String> {
     let path = path.as_ref();
     let len = std::fs::metadata(path)?.len();
-    let mut hasher = Sha1::new();
-    hasher.update(format!("blob {len}\0"));
+    let mut hasher = git_blob_hasher(len);
     let mut read = 0u64;
     for_each_chunk(path, |chunk| {
         read += chunk.len() as u64;
