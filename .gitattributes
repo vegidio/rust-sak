@@ -1,0 +1,3 @@
+# Test fixtures are hashed and sized byte for byte, so a checkout must never rewrite their line endings (as Git does on
+# Windows with `core.autocrlf`).
+**/testdata/** -text
