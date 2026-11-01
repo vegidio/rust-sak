@@ -23,8 +23,9 @@
 //! over a complete install, however the process ends.
 //!
 //! A session is asked for with an ordered list of [`ExecutionProvider`]s, which [`ladder`] turns into rungs: each one
-//! keeps every accelerator below it attached, and the CPU is always the last. [`session`] builds on the first rung
-//! that works, with each provider's baseline, the caller's [`Tuning`] over it, and the caller's cache folder.
+//! keeps every accelerator below it attached, and the CPU is always the last. [`build`] builds on one rung, with each
+//! provider's baseline, the caller's [`Tuning`] over it and the caller's [`CachePaths`], and says whether a failure was
+//! the device running out of memory; [`session`] builds on the first rung that works.
 //! [`libpath`] makes the NVIDIA libraries findable, and is called first in `main`.
 
 #![doc = include_str!("README.md")]
@@ -36,6 +37,7 @@ pub mod hf;
 mod install;
 pub mod libpath;
 mod load;
+mod logger;
 mod progress;
 mod providers;
 mod session;
@@ -50,12 +52,12 @@ mod test_support;
 /// depending on it itself.
 pub use ort;
 
-pub use error::{Failure, InstallError, LoadError, SessionError};
+pub use error::{Failure, InstallError, LoadError, RungError, SessionError};
 pub use install::{Dependency, Kind, Plan, Planned, State, install, is_present, plan};
 pub use load::{LoadOptions, environment, load, load_with, runtime_library, webgpu_devices};
 pub use progress::{Event, Phase};
 pub use providers::{AUTO_ORDER, ExecutionProvider, Supported, UnknownProvider, ladder};
-pub use session::{Built, SessionRequest, session};
+pub use session::{Built, SessionRequest, build, session};
 pub use source::{Source, SourceError, asset_for};
 pub use tuning::{
     CachePaths, CoreMlComputeUnits, CoreMlSpecialization, ExecutionMode, Tuning, provider_options, trt_workspace_bytes,

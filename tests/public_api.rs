@@ -602,8 +602,8 @@ mod ai {
 
         use rust_sak::ai::{
             AUTO_ORDER, Built, CachePaths, CoreMlComputeUnits, CoreMlSpecialization, ExecutionMode, ExecutionProvider,
-            SessionError, SessionRequest, Supported, Tuning, UnknownProvider, ladder, libpath, provider_options,
-            session, trt_workspace_bytes,
+            RungError, SessionError, SessionRequest, Supported, Tuning, UnknownProvider, build, ladder, libpath,
+            provider_options, session, trt_workspace_bytes,
         };
 
         let bare = Supported {
@@ -644,10 +644,12 @@ mod ai {
             providers: &[ExecutionProvider::Cpu],
             supported: bare,
             tuning: &tuning,
-            cache_dir: Path::new("/nowhere/cache"),
+            cache: &paths,
         };
         let result: Result<Built, SessionError> = session(&request);
         assert!(result.is_err_and(|error| error.model == Path::new("/nowhere/model.onnx")));
+        let rung: Result<rust_sak::ai::ort::session::Session, RungError> = build(&request, &[]);
+        assert!(rung.is_err_and(|error| error.providers.is_empty() && !error.out_of_memory));
         let _: Option<rust_sak::ai::ort::session::Session> = None;
     }
 }

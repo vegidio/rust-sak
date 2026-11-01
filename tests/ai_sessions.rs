@@ -10,7 +10,7 @@ mod ai_support;
 use std::path::{Path, PathBuf};
 
 use rust_sak::ai::ExecutionProvider::{self, Auto, CoreMl, Cpu, WebGpu};
-use rust_sak::ai::{self, SessionRequest, Supported, Tuning};
+use rust_sak::ai::{self, CachePaths, SessionRequest, Supported, Tuning};
 use rust_sak::fs::TempDir;
 use tokio::sync::OnceCell;
 
@@ -45,9 +45,67 @@ fn built_on(
         providers,
         supported: Supported::detect(false, false),
         tuning: &tuning,
-        cache_dir: cache,
+        cache: &CachePaths::under(cache),
     };
     ai::session(&request).map(|built| built.providers)
+}
+
+/// A session for `model` built on exactly `rung`, its cache in `paths`.
+fn built_with(model: &Path, rung: &[ExecutionProvider], paths: &CachePaths) -> Result<(), ai::RungError> {
+    let tuning = Tuning::default();
+    let request = SessionRequest {
+        model,
+        providers: &[Auto],
+        supported: Supported::detect(false, false),
+        tuning: &tuning,
+        cache: paths,
+    };
+    ai::build(&request, rung).map(drop)
+}
+
+#[tokio::test]
+async fn one_rung_builds_on_the_cpu_coreml_and_webgpu() {
+    let Some((root, _)) = loaded().await else {
+        return;
+    };
+    let paths = CachePaths {
+        timing: root.path().join("cache/shared-timing"),
+        ..CachePaths::under(&root.path().join("cache/rung"))
+    };
+    built_with(&relu(), &[], &paths).unwrap();
+    assert!(
+        !root.path().join("cache/rung").exists(),
+        "the CPU creates no cache folder"
+    );
+    built_with(&relu(), &[WebGpu], &paths).unwrap();
+    built_with(&relu(), &[CoreMl], &paths).unwrap();
+    built_with(&relu(), &[CoreMl, WebGpu], &paths).unwrap();
+    assert!(
+        std::fs::read_dir(&paths.coreml).unwrap().count() > 0,
+        "CoreML compiled into its folder"
+    );
+    assert!(
+        !paths.tensorrt.exists() && !paths.timing.exists(),
+        "no TensorRT rung, no TensorRT folder"
+    );
+}
+
+#[tokio::test]
+async fn a_rung_that_fails_reports_its_providers_and_is_not_out_of_memory() {
+    let Some((root, _)) = loaded().await else {
+        return;
+    };
+    let model = root.path().join("not-a-model-for-a-rung.onnx");
+    std::fs::write(&model, b"not a model").unwrap();
+    let error = built_with(
+        &model,
+        &[CoreMl],
+        &CachePaths::under(&root.path().join("cache/bad-rung")),
+    )
+    .unwrap_err();
+    assert_eq!(error.providers, [CoreMl]);
+    assert!(!error.out_of_memory, "{error:?}");
+    assert!(!error.reason.is_empty());
 }
 
 #[tokio::test]

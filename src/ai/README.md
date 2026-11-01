@@ -35,7 +35,7 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 | `install(root, &deps, on_event)`      | `plan`, then `Plan::install`.                                                                                                                                                                                                         |
 | `is_present(root, &dep)`              | Local only: whether a dependency is installed and intact (its marker is there, every file it records is there at its recorded size, and, for the runtime, its library is a file). No network.                                        |
 | `load(runtime_dir)`                   | `load_with` and `LoadOptions::default()`: the environment named `rust-sak`, its records going to `tracing`.                                                                                                                         |
-| `load_with(runtime_dir, &LoadOptions { name, logger })` | Loads the runtime installed in `runtime_dir` and starts the process's environment under `name`, its records going to `logger` (or to `tracing` when `None`) at warning and above, then registers the WebGPU plugin beside it. The log level drops to fatal at process exit. Once per process: a later call returns at once. A failed load can be tried again. |
+| `load_with(runtime_dir, &LoadOptions { name, logger })` | Loads the runtime installed in `runtime_dir` and starts the process's environment under `name`, its records going to `logger` (or to `tracing`, in `ort`'s own shape, when `None`) at warning and above, each one counted first if it reports a failed device allocation (see "Out of memory"), then registers the WebGPU plugin beside it. The log level drops to fatal at process exit. Once per process: a later call returns at once. A failed load can be tried again. |
 | `environment()`                       | The process's environment once a load succeeded, the one every session is built under. It lives until the process exits.                                                                                                           |
 | `webgpu_devices(&environment)`        | The devices the WebGPU plugin registered with the environment, in the runtime's order.                                                                                                                                             |
 | `runtime_library(dir)`                | The runtime library in `dir`: `libonnxruntime*.dylib`, `libonnxruntime.so*` or `onnxruntime.dll`, never a `*_providers_*` plugin.                                                                                                   |
@@ -52,8 +52,9 @@ Linking `ai` sets `ORT_DISABLE_TELEMETRY=1` before `main`, which is the only ful
 | `Tuning`                              | A model's tuning over the providers' baseline. `Tuning::default()` changes nothing.                                                                                                                                                 |
 | `provider_options(p, &tuning, &paths, device_memory)` | The options provider `p` is attached with: its baseline, then the tuning. Pure.                                                                                                                                     |
 | `trt_workspace_bytes(device_memory)`  | TensorRT's workspace: a quarter of the card, at most 4 GiB, and 4 GiB when the memory is unknown.                                                                                                                                  |
-| `CachePaths::under(cache_dir)`        | The provider caches under a model's folder: `tensorrt/`, `tensorrt/timing/` and `coreml/`.                                                                                                                                         |
-| `session(&SessionRequest)`            | Builds a session on the first rung that works, returning `Built { session, providers }`, or a `SessionError { model, reason }` with the CPU's reason.                                                                              |
+| `CachePaths { tensorrt, timing, coreml }` | The folders the providers compile into. `CachePaths::under(cache_dir)` puts them under a model's folder: `tensorrt/`, `tensorrt/timing/` and `coreml/`. Override `timing` to share one timing cache between models. |
+| `build(&SessionRequest, &rung)`       | Builds a session on exactly one rung, on the calling thread, returning the `Session`, or a `RungError { providers, reason, out_of_memory }`. An empty rung is the CPU. See "Sessions".                                            |
+| `session(&SessionRequest)`            | `ladder` and `build` on each rung until one works, returning `Built { session, providers }`, or a `SessionError { model, reason }` with the CPU's reason.                                                                          |
 | `libpath::prepare(&dirs, guard)`      | Puts the library folders on the loader's search path. `unsafe`: the first statement of `main`. See "Library path".                                                                                                                 |
 | `libpath::search_path(&dirs, inherited)` | `dirs`, then the inherited entries, with repeats and empty entries removed. Pure.                                                                                                                                              |
 
@@ -174,7 +175,17 @@ A session is asked for with an **ordered list of providers**, which becomes a la
 
 Each rung keeps every accelerator below it attached, so a node one of them declines goes to the next accelerator, not to the CPU. A Mac's `Auto` is `[CoreML, WebGPU]`, `[WebGPU]`, then the CPU; asking for `CUDA` alone gives `[CUDA]`, then the CPU, and never attaches TensorRT. The ladder always ends on the CPU, so a session builds whenever the model file is valid.
 
-`session` tries each rung on a fresh builder, every provider attached with `error_on_failure()`, so a provider that rejects a setting fails its rung instead of being quietly dropped. A failed rung is logged with `tracing::warn!` (the model, the providers and the reason) and the next one is tried. `Built::providers` is the rung that worked; an empty list means the CPU. The build runs on the calling thread and needs the runtime loaded.
+`build` tries one rung on a fresh builder, every provider attached with `error_on_failure()`, so a provider that rejects a setting fails its rung instead of being quietly dropped. It runs **on the calling thread**, as a contract: the runtime logs a build's records there, so a span the caller enters around it decorates them, and it needs the runtime loaded. `Auto` and `CPU` inside a rung are ignored; `request.providers` and `request.supported` are not read, since the caller chose the rung.
+
+`session` is `ladder` and a loop over `build`: a failed rung is logged with `tracing::warn!` (the model, the providers and the reason) and the next one is tried. `Built::providers` is the rung that worked; an empty list means the CPU. An app whose policy sits between rungs (skipping one it has seen fail, retrying one after freeing memory) walks `ladder` itself and calls `build`.
+
+### Out of memory
+
+`RungError::out_of_memory` says whether the device ran out of memory during the build, the one failure that freeing other sessions' memory can cure. TensorRT's own error often says only that it *"failed to create engine"*; the cause is in a record logged on the way. So `load_with` always starts the environment with this module's logger, which counts each record reporting a failed device allocation (`OutOfMemory`, `out of memory`) on the thread that logged it, then passes the record on to `LoadOptions::logger` unchanged. A rung is out of memory when that count moved on the building thread during the build, or its error names a failed allocation (`out of memory`, `outofmemory`, `failed to allocate`, ignoring case). The CPU rung never is.
+
+### TensorRT builds
+
+Every `build` whose rung contains TensorRT holds one process-wide lock for the whole build, so two TensorRT builds never interleave into a shared timing cache (the runtime reads it at the start and rewrites it at the end with no locking of its own). A poisoned lock is taken anyway. When such a build fails, the timing folder is emptied, the folder itself kept, and an `info` record names its path: a half-written timing cache fails every later TensorRT build. A rung without TensorRT neither waits nor discards. The lock is in-process only, so two processes must not share a timing folder. The CUDA device's memory, which sizes TensorRT's workspace, is probed once per process, by the first TensorRT rung.
 
 ### Tuning and the baseline
 
@@ -192,7 +203,21 @@ Graph capture is off on both NVIDIA providers: with it on, TensorRT returns zero
 
 ### Cache folders
 
-`SessionRequest::cache_dir` is one folder per model, from the caller. CoreML keeps its compiled model in `<cache_dir>/coreml/`, and TensorRT its engines in `<cache_dir>/tensorrt/` and its timing cache in `<cache_dir>/tensorrt/timing/`. They are created when a rung that compiles is tried. CoreML keys its cache by the model's path, so **key the folder by the model file's content** (its hash), or a re-downloaded model at the same path can run on a stale compile.
+`SessionRequest::cache` is the `CachePaths` for one model, from the caller. `CachePaths::under(cache_dir)` puts CoreML's compiled model in `<cache_dir>/coreml/`, and TensorRT's engines in `<cache_dir>/tensorrt/` and its timing cache in `<cache_dir>/tensorrt/timing/`. Each folder is created when a rung whose provider writes it is tried, so a CPU-only model leaves none. CoreML keys its cache by the model's path, so **key the engine folders by the model file's content** (its hash), or a re-downloaded model at the same path can run on a stale compile.
+
+The timing cache need not be per model: kernel timings carry between graphs, so a build against a cache other models seeded is faster. Point every model's `timing` at one folder to share it:
+
+```rust,no_run
+# use std::path::Path;
+use rust_sak::ai::CachePaths;
+
+let paths = CachePaths {
+    timing: Path::new("/cache/engines/.timing").to_path_buf(),
+    ..CachePaths::under(Path::new("/cache/engines/scrfd"))
+};
+```
+
+**Breaking in 26.11.0:** `SessionRequest::cache_dir: &Path` became `cache: &CachePaths`. Pass `&CachePaths::under(dir)` for the old behaviour.
 
 ### WebGPU
 
@@ -203,7 +228,7 @@ WebGPU ships inside the runtime's archive as a plugin (`libonnxruntime_providers
 ```rust,no_run
 use std::path::Path;
 
-use rust_sak::ai::{self, ExecutionProvider, SessionRequest, Supported, Tuning};
+use rust_sak::ai::{self, CachePaths, ExecutionProvider, SessionRequest, Supported, Tuning};
 
 # fn run(runtime_dir: &Path, cuda_installed: bool, tensorrt_installed: bool) -> Result<(), Box<dyn std::error::Error>> {
 ai::load(runtime_dir)?;
@@ -216,7 +241,7 @@ let built = ai::session(&SessionRequest {
     providers: &[requested],
     supported,
     tuning: &tuning,
-    cache_dir: Path::new("/cache/scrfd/0123456789abcdef"),
+    cache: &CachePaths::under(Path::new("/cache/scrfd/0123456789abcdef")),
 })?;
 println!("ready on {:?}", built.providers);
 let _session: ai::ort::session::Session = built.session;
@@ -233,6 +258,8 @@ The NVIDIA libraries are installed in their own folders, which the platform's lo
 - **macOS**: nothing, and nothing is created.
 
 Call it as the **first statement of `main`**, before logging is set up and before any thread exists: it is `unsafe` because it writes the environment and, on Linux, replaces the process image.
+
+Because it runs before anything can probe the GPU (a CUDA probe starts threads), the folders are created whether or not the machine will ever install into them. On Linux and Windows a machine without an NVIDIA GPU therefore keeps empty `cuda`, `cudnn` and `tensorrt` version folders in the shared root. They are harmless: an empty folder has no marker, so it reads as not installed, and it is removed like any other version folder when a newer version is installed.
 
 ```rust,no_run
 use std::path::PathBuf;
@@ -251,5 +278,5 @@ fn main() {
 
 - The archives exist for macOS arm64, Linux arm64/x64 and Windows arm64/x64 (the runtime), and Linux arm64/x64 and Windows x64 (the NVIDIA libraries). Intel Macs have no runtime archive. Finding that out takes the folder's listing, so the unsupported-platform failure comes after one API request.
 - **Only macOS is tested.** The GPU paths (the NVIDIA probe passing, and the CUDA, cuDNN and TensorRT installs) have never run on real hardware. The folder lock is tested on macOS, between tasks and against a process that exited holding it; on Windows it is `LockFileEx`, untested. Their logic is covered by pure tests against constructed probe results, and the platform-specific code is written to be correct by construction, but it is **untested on Linux and Windows**.
-- On macOS, the ladder, the option maps and the search path are tested as pure functions, and CoreML, WebGPU and CPU sessions are built for real. **CUDA and TensorRT sessions, the Linux restart, the WSL2 driver folder and the Windows `PATH` step have never run**: they are written to be correct by construction, after Open Photo AI's code, and are untested.
+- On macOS, the ladder, the option maps and the search path are tested as pure functions, and CoreML, WebGPU and CPU sessions are built for real, on the ladder and one rung at a time. The TensorRT lock, the timing-cache discard and the out-of-memory classification are tested against a fake build and constructed records. **CUDA and TensorRT sessions, the Linux restart, the WSL2 driver folder and the Windows `PATH` step have never run**: they are written to be correct by construction, after Open Photo AI's code, and are untested.
 - CoreML is offered on every macOS the runtime loads on, with no OS-version probe: the 1.30 runtime's macOS build already needs a newer macOS than CoreML's ML Program format (12). Were that wrong, the CoreML rung would fail and the ladder would move on.

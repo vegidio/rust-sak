@@ -74,7 +74,9 @@ fn is_runtime_library(name: &str, os: &str) -> bool {
 pub struct LoadOptions<'a> {
     /// The environment's name, which the runtime's records carry as their logger id. Name it after the application.
     pub name: &'a str,
-    /// Where the runtime's records go. `None` sends them to `tracing`, under the target `ort`, with their severity.
+    /// Where the runtime's records go. `None` sends them to `tracing`, under the target `ort::logging`, in the shape
+    /// `ort`'s own bridge gives them. Either way each record passes through this module first, which counts the
+    /// out-of-memory ones a failed [`build`](super::build) is classified by.
     pub logger: Option<LoggerFunction>,
 }
 
@@ -159,16 +161,14 @@ fn start(path: &Path, options: &LoadOptions<'_>) -> Result<Environment, LoadErro
         });
     }
 
-    let mut builder = ort::init_from(path)
+    let builder = ort::init_from(path)
         .map_err(|cause| LoadError::Open {
             path: path.into(),
             reason: cause.to_string(),
         })?
         .with_name(options.name)
-        .with_telemetry(false);
-    if let Some(logger) = &options.logger {
-        builder = builder.with_logger(logger.clone());
-    }
+        .with_telemetry(false)
+        .with_logger(super::logger::wrap(options.logger.clone()));
     let environment = builder.build().map_err(|cause| LoadError::Start {
         path: path.into(),
         reason: cause.to_string(),

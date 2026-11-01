@@ -95,19 +95,25 @@ pub enum ExecutionMode {
     Sequential,
 }
 
-/// Where the providers keep what they compile from one model, all under the folder the caller passes per session.
+/// Where the providers keep what they compile from one model.
+///
+/// [`CachePaths::under`] puts all three under one model's folder. The engine folders belong to that model, but the
+/// timing cache need not: kernel timings carry between graphs, so a build against a timing cache other models seeded
+/// is faster than one against an empty cache, and an app with several models usually points every model's `timing` at
+/// one shared folder. [`build`](super::build) serialises TensorRT builds, so sharing it within a process is safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachePaths {
-    /// TensorRT's engine cache: `<cache_dir>/tensorrt/`.
+    /// TensorRT's engine cache: `<cache_dir>/tensorrt/` under [`CachePaths::under`].
     pub tensorrt: PathBuf,
-    /// TensorRT's timing cache: `<cache_dir>/tensorrt/timing/`.
+    /// TensorRT's timing cache: `<cache_dir>/tensorrt/timing/` under [`CachePaths::under`], or a folder shared by
+    /// every model.
     pub timing: PathBuf,
-    /// CoreML's compiled model: `<cache_dir>/coreml/`.
+    /// CoreML's compiled model: `<cache_dir>/coreml/` under [`CachePaths::under`].
     pub coreml: PathBuf,
 }
 
 impl CachePaths {
-    /// The cache folders under `cache_dir`. Computes the paths only.
+    /// The cache folders under `cache_dir`, the timing cache included. Computes the paths only.
     pub fn under(cache_dir: &Path) -> Self {
         let tensorrt = cache_dir.join("tensorrt");
         Self {

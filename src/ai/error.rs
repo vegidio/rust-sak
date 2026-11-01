@@ -3,6 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
+use super::ExecutionProvider;
 use super::hf::HfError;
 use crate::fs::FsError;
 
@@ -113,6 +114,21 @@ pub struct SessionError {
     pub model: PathBuf,
     /// The runtime's reason on the CPU, the last rung.
     pub reason: String,
+}
+
+/// Why a session could not be built on one rung. It displays as the runtime's reason alone, so it can be the source of
+/// a caller's own error without repeating what that names.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct RungError {
+    /// The rung's providers, in attach order. Empty for the CPU.
+    pub providers: Vec<ExecutionProvider>,
+    /// The runtime's reason.
+    pub reason: String,
+    /// Whether the device ran out of memory during the build: the runtime logged a failed device allocation on the
+    /// building thread, or its reason names one. Never on the CPU. Releasing other sessions' device memory and trying
+    /// the rung again may then work.
+    pub out_of_memory: bool,
 }
 
 #[cfg(test)]
