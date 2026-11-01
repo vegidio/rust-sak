@@ -95,7 +95,8 @@ fn entries(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Every file under `dir`, with its contents, sorted by path.
+/// Every file under `dir`, with its contents, sorted by path. A lock file is listed empty, as it always is: Windows
+/// refuses to read one another handle holds locked.
 fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut files = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -103,6 +104,8 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             if entry.file_type().unwrap().is_dir() {
                 pending.push(entry.path());
+            } else if entry.file_name() == LOCK {
+                files.push((entry.path(), Vec::new()));
             } else {
                 files.push((entry.path(), std::fs::read(entry.path()).unwrap()));
             }
