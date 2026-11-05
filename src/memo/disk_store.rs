@@ -340,6 +340,63 @@ impl Store for DiskStore {
         Ok(())
     }
 
+    fn remove(&self, key: &str) -> Result<bool> {
+        let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
+        let mut cadence = self.cadence();
+        let txn = DiskStore::database(&db).begin_write()?;
+
+        let removed = {
+            let mut table = match txn.open_table(ENTRIES) {
+                Ok(table) => table,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(false),
+                Err(err) => return Err(err.into()),
+            };
+
+            let record = table.remove(key)?;
+            record.is_some_and(|record| DiskStore::is_live(record.value()))
+        };
+
+        DiskStore::commit_durably(txn, &mut cadence)?;
+        Ok(removed)
+    }
+
+    fn retain(&self, keep: &mut dyn FnMut(&str) -> bool) -> Result<usize> {
+        let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
+        let mut cadence = self.cadence();
+        let txn = DiskStore::database(&db).begin_write()?;
+
+        let mut refused = 0_usize;
+        let mut dropped = 0_usize;
+        {
+            let mut table = match txn.open_table(ENTRIES) {
+                Ok(table) => table,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(0),
+                Err(err) => return Err(err.into()),
+            };
+
+            // Expired and corrupt records are dropped without being shown to `keep`, as the sweep drops them.
+            table.retain(|key, record| {
+                let kept = DiskStore::is_live(record) && {
+                    let kept = keep(key);
+                    refused += usize::from(!kept);
+                    kept
+                };
+
+                dropped += usize::from(!kept);
+                kept
+            })?;
+        }
+
+        // A pass that removed nothing writes nothing.
+        if dropped == 0 {
+            txn.abort()?;
+            return Ok(0);
+        }
+
+        DiskStore::commit_durably(txn, &mut cadence)?;
+        Ok(refused)
+    }
+
     fn flush(&self) -> Result<()> {
         let db = self.db.read().unwrap_or_else(PoisonError::into_inner);
         DiskStore::flush_into(DiskStore::database(&db), &mut self.cadence())
@@ -380,6 +437,27 @@ impl DiskStore {
         Ok(())
     }
 
+    /// Whether a stored record is readable and not past its deadline.
+    fn is_live(record: &[u8]) -> bool {
+        DiskStore::split(record)
+            .and_then(|(expires_at, _)| DiskStore::remaining(expires_at))
+            .is_some()
+    }
+
+    /// Commits a removal durably, whatever the cadence: a removal is rare, and one that a crash could undo would serve
+    /// the removed entry again. redb's durable commit also persists every deferred write before it.
+    fn commit_durably(txn: redb::WriteTransaction, cadence: &mut Cadence) -> Result<()> {
+        txn.commit()?;
+        cadence.committed(true);
+
+        #[cfg(test)]
+        {
+            cadence.durable_writes += 1;
+        }
+
+        Ok(())
+    }
+
     /// Locks the cadence until the guard drops, as the field documents.
     fn cadence(&self) -> MutexGuard<'_, Cadence> {
         self.cadence.lock().unwrap_or_else(PoisonError::into_inner)
@@ -406,9 +484,7 @@ impl DiskStore {
                 // A record too short to split is corrupt: drop it rather than leave it to be re-read forever.
                 let mut deleted = 0_u64;
                 table.retain(|_key, record| {
-                    let keep = DiskStore::split(record)
-                        .and_then(|(expires_at, _)| DiskStore::remaining(expires_at))
-                        .is_some();
+                    let keep = DiskStore::is_live(record);
 
                     deleted += u64::from(!keep);
                     keep

@@ -39,6 +39,8 @@ Wrap a computation that is expensive to repeat — an HTTP request, a database q
 | `get_or_compute`         | `fn(&str, Duration, F) -> Result<T>`                        | The cached value, or `compute`'s, cached.            |
 | `get_bytes`              | `fn(&str) -> Result<Option<Vec<u8>>>`                       | The raw bytes under a key.                           |
 | `set_bytes`              | `fn(&str, &[u8], Duration) -> Result<()>`                   | Writes raw bytes under a key.                        |
+| `remove`                 | `fn(&str) -> Result<bool>`                                  | Removes a key; whether a live entry was removed.     |
+| `retain`                 | `fn(impl FnMut(&str) -> bool) -> Result<usize>`             | Keeps only the keys accepted; how many were removed. |
 | `path`                   | `fn() -> Option<&Path>`                                     | The backing directory, or `None` for memory-only.    |
 | `cleanup`                | `fn() -> Result<()>`                                        | Reclaims the space expired entries hold.             |
 | `flush`                  | `fn() -> Result<()>`                                        | Makes every deferred disk write durable.             |
@@ -217,7 +219,29 @@ let cached: Option<Vec<u8>> = memo.get_bytes("thumbnail:42")?;
 # }
 ```
 
+### Removing entries
+
+`remove` drops one key from every tier and says whether a live entry was there. `retain` is the bulk form, for a cache whose keys can go stale: it asks a predicate about each live key once, in no promised order, and removes the ones it refuses — together with every expired entry — in a single durable transaction on disk. It returns how many live entries the predicate refused.
+
+```rust
+# use std::time::Duration;
+# use rust_sak::memo::{CacheOpts, Memo};
+# fn run() -> Result<(), Box<dyn std::error::Error>> {
+let memo = Memo::memory(CacheOpts::new())?;
+memo.set_bytes("v1:report", b"old", Duration::MAX)?;
+memo.set_bytes("v2:report", b"new", Duration::MAX)?;
+
+assert!(memo.remove("v2:report")?);
+assert_eq!(memo.retain(|key| !key.starts_with("v1:"))?, 1);
+# Ok(())
+# }
+```
+
+On disk both are committed durably, whatever `flush_every` asks, and a `retain` that removes nothing writes nothing. Neither compacts the file — `cleanup` does that — and neither touches a computation already in flight, so a `get_or_compute` of a key being removed may still publish its value afterwards.
+
 ### TTL, expiry and disk space
+
+A TTL of `Duration::MAX` — or any TTL whose deadline would overflow the clock — **never expires**, on every tier and across reopens of a disk cache. Use it for entries that are invalidated by their key rather than by time.
 
 Expired entries are never served: once the TTL passes, the entry reads as a miss and the computation runs again. Reclaiming the *space* on disk is a separate matter — a disk-backed cache sweeps once in the background when it opens, and `cleanup` forces one at a moment of your choosing:
 

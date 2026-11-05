@@ -34,6 +34,13 @@ pub(super) trait Store: fmt::Debug + Send + Sync {
     /// instead of copying it, and a two-tier store can hand the same allocation to both tiers.
     fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()>;
 
+    /// Removes `key`. Returns whether a live entry was removed: `false` for a key that was absent or had expired.
+    fn remove(&self, key: &str) -> Result<bool>;
+
+    /// Removes every entry whose key `keep` refuses, and every expired one. Returns how many live entries `keep`
+    /// refused. `keep` sees each live key once, in no promised order.
+    fn retain(&self, keep: &mut dyn FnMut(&str) -> bool) -> Result<usize>;
+
     /// Reclaims the space held by entries whose TTL has elapsed. Stores with nothing to reclaim return `Ok(())`.
     fn cleanup(&self) -> Result<()>;
 

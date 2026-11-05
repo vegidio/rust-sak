@@ -31,6 +31,14 @@ impl Store for FailingStore {
         Err(MemoError::Io(std::io::Error::other("this store is broken on purpose")))
     }
 
+    fn remove(&self, _key: &str) -> Result<bool> {
+        Err(MemoError::Io(std::io::Error::other("this store is broken on purpose")))
+    }
+
+    fn retain(&self, _keep: &mut dyn FnMut(&str) -> bool) -> Result<usize> {
+        Err(MemoError::Io(std::io::Error::other("this store is broken on purpose")))
+    }
+
     fn cleanup(&self) -> Result<()> {
         Ok(())
     }
@@ -71,6 +79,14 @@ impl Store for CountingStore {
     fn set(&self, key: &str, value: Arc<[u8]>, ttl: Duration) -> Result<()> {
         self.sets.fetch_add(1, Ordering::Relaxed);
         self.inner.set(key, value, ttl)
+    }
+
+    fn remove(&self, key: &str) -> Result<bool> {
+        self.inner.remove(key)
+    }
+
+    fn retain(&self, keep: &mut dyn FnMut(&str) -> bool) -> Result<usize> {
+        self.inner.retain(keep)
     }
 
     fn cleanup(&self) -> Result<()> {

@@ -237,12 +237,69 @@ impl Memo {
 
     /// Writes raw bytes under `key`, to be served for at most `ttl`.
     ///
+    /// A `ttl` of [`Duration::MAX`] — or any TTL whose deadline would overflow the clock — never expires, on every
+    /// tier and across reopens of a disk cache.
+    ///
     /// # Errors
     ///
     /// Returns [`MemoError::NotAdmitted`] if the cache declined the write — a zero `ttl`, or a value larger than the
     /// whole memory budget — and [`MemoError::Storage`] if the store failed.
     pub fn set_bytes(&self, key: &str, value: &[u8], ttl: Duration) -> Result<()> {
         self.store.set(key, Arc::from(value), ttl)
+    }
+
+    /// Removes the entry under `key`, from every tier. Returns whether a live entry was removed: `false` for a key
+    /// that was absent or had already expired.
+    ///
+    /// On disk the removal is committed durably, whatever [`CacheOpts::flush_every`] asks for. It does not touch the
+    /// computations in flight, so a [`get_or_compute`](Memo::get_or_compute) of the same key that is already running
+    /// may still publish its value afterwards — the ordinary race of any cache.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use rust_sak::memo::{CacheOpts, Memo};
+    ///
+    /// let memo = Memo::memory(CacheOpts::new())?;
+    /// memo.set_bytes("k", b"v", Duration::MAX)?;
+    ///
+    /// assert!(memo.remove("k")?);
+    /// assert!(!memo.remove("k")?);
+    /// assert_eq!(memo.get_bytes("k")?, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoError::Storage`] if the store fails.
+    pub fn remove(&self, key: &str) -> Result<bool> {
+        self.store.remove(key)
+    }
+
+    /// Keeps only the entries whose key `keep` accepts, and drops every expired one. Returns how many live entries
+    /// `keep` refused, and so were removed.
+    ///
+    /// `keep` sees each live key once, in no promised order. On disk the whole pass is one write transaction,
+    /// committed durably, and a pass that removes nothing writes nothing. Like [`remove`](Memo::remove), it does not
+    /// touch the computations in flight. It does not compact the file: [`cleanup`](Memo::cleanup) does that.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use rust_sak::memo::{CacheOpts, Memo};
+    ///
+    /// let memo = Memo::memory(CacheOpts::new())?;
+    /// memo.set_bytes("v1:a", b"a", Duration::MAX)?;
+    /// memo.set_bytes("v2:b", b"b", Duration::MAX)?;
+    ///
+    /// assert_eq!(memo.retain(|key| key.starts_with("v2:"))?, 1);
+    /// assert_eq!(memo.get_bytes("v1:a")?, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoError::Storage`] if the store fails. On disk nothing is removed then.
+    pub fn retain(&self, mut keep: impl FnMut(&str) -> bool) -> Result<usize> {
+        self.store.retain(&mut keep)
     }
 
     /// Returns the value cached under `key`, running `compute` only when there is not one.
@@ -269,6 +326,9 @@ impl Memo {
     /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    ///
+    /// A `ttl` of [`Duration::MAX`] — or any TTL whose deadline would overflow the clock — never expires, on every
+    /// tier and across reopens of a disk cache.
     ///
     /// This method blocks. Calling it from inside an async task can park a runtime worker for as long as `compute`
     /// takes — use [`get_or_compute_async`](Memo::get_or_compute_async) there, or `tokio::task::spawn_blocking`.

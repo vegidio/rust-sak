@@ -112,6 +112,31 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn remove(&self, key: &str) -> Result<bool> {
+        let removed = self.cache.remove(key);
+
+        // An entry past its deadline that housekeeping has not reaped yet was already a miss to every reader.
+        Ok(removed.is_some_and(|entry| entry.expires_at.is_none_or(|at| at > Instant::now())))
+    }
+
+    fn retain(&self, keep: &mut dyn FnMut(&str) -> bool) -> Result<usize> {
+        // moka's iterator already skips expired entries, and housekeeping drops them; only the refused ones are
+        // collected, then invalidated once the iteration is over.
+        let refused: Vec<_> = self
+            .cache
+            .iter()
+            .filter(|(key, _)| !keep(key.as_str()))
+            .map(|(key, _)| key)
+            .collect();
+
+        for key in &refused {
+            self.cache.invalidate(key.as_str());
+        }
+        self.cache.run_pending_tasks();
+
+        Ok(refused.len())
+    }
+
     fn cleanup(&self) -> Result<()> {
         // Nothing is on disk to reclaim; draining the pending work is all there is to do.
         self.cache.run_pending_tasks();

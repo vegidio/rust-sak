@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +78,32 @@ impl Store for CompositeStore {
             // a disk failure is the one that actually loses the data.
             (Err(disk), Err(_)) => Err(disk),
         }
+    }
+
+    fn remove(&self, key: &str) -> Result<bool> {
+        // Disk first: it is the tier that would serve the key again after a restart. Memory is always visited, so a
+        // failing disk cannot leave the key served from the front tier.
+        let disk = self.disk.remove(key);
+        let memory = self.memory.remove(key)?;
+
+        Ok(disk? || memory)
+    }
+
+    fn retain(&self, keep: &mut dyn FnMut(&str) -> bool) -> Result<usize> {
+        // The disk tier holds every live entry, so it alone asks `keep`, and its count is the cache's. Memory then
+        // keeps exactly what disk kept, so `keep` sees each key once and a memory copy of a refused or expired disk
+        // entry cannot outlive it.
+        let mut kept = HashSet::new();
+        let removed = self.disk.retain(&mut |key| {
+            let verdict = keep(key);
+            if verdict {
+                kept.insert(key.to_owned());
+            }
+            verdict
+        })?;
+        self.memory.retain(&mut |key| kept.contains(key))?;
+
+        Ok(removed)
     }
 
     fn cleanup(&self) -> Result<()> {

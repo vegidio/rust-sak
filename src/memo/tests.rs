@@ -822,6 +822,218 @@ fn a_path_without_a_file_name_is_rejected() {
     assert!(matches!(err, MemoError::Io(_)), "unexpected error: {err:?}");
 }
 
+// --- Removal ---
+
+/// A fresh store of each tier, behind the trait, with whatever keeps its directory alive.
+fn every_tier() -> Vec<(&'static str, Arc<dyn Store>, Option<TempDir>)> {
+    let disk = TempDir::new().unwrap();
+    let both = TempDir::new().unwrap();
+
+    vec![
+        ("memory", Arc::new(MemoryStore::new(CacheOpts::new())), None),
+        (
+            "disk",
+            DiskStore::open(disk.path(), CacheOpts::new()).unwrap(),
+            Some(disk),
+        ),
+        (
+            "memory + disk",
+            Arc::new(CompositeStore::open(both.path(), CacheOpts::new(), LONG).unwrap()),
+            Some(both),
+        ),
+    ]
+}
+
+#[test]
+fn remove_reports_whether_a_live_entry_was_there_on_every_tier() {
+    for (tier, store, _dir) in every_tier() {
+        store.set("k", bytes(b"v"), LONG).unwrap();
+
+        assert!(store.remove("k").unwrap(), "{tier}: a present key");
+        assert!(store.get("k").unwrap().is_none(), "{tier}: the key is gone");
+        assert!(!store.remove("k").unwrap(), "{tier}: an absent key");
+        assert!(!store.remove("never").unwrap(), "{tier}: a key never written");
+    }
+}
+
+#[test]
+fn remove_on_an_empty_disk_store_is_false() {
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+
+    assert!(!store.remove("k").unwrap());
+}
+
+#[test]
+fn remove_empties_both_tiers_of_a_two_tier_cache() {
+    let dir = TempDir::new().unwrap();
+    let composite = CompositeStore::open(dir.path(), CacheOpts::new(), LONG).unwrap();
+    composite.set("k", bytes(b"v"), LONG).unwrap();
+
+    assert!(composite.remove("k").unwrap());
+
+    assert!(composite.memory.get("k").unwrap().is_none());
+    assert!(composite.disk.get("k").unwrap().is_none());
+}
+
+#[test]
+fn retain_removes_the_refused_and_the_expired_keys_on_every_tier() {
+    for (tier, store, _dir) in every_tier() {
+        store.set("a", bytes(b"1"), LONG).unwrap();
+        store.set("b", bytes(b"2"), LONG).unwrap();
+        store.set("c", bytes(b"3"), LONG).unwrap();
+        store.set("stale", bytes(b"4"), SHORT).unwrap();
+        std::thread::sleep(EXPIRED);
+
+        let mut seen = Vec::new();
+        let removed = store
+            .retain(&mut |key| {
+                seen.push(key.to_owned());
+                key != "a" && key != "c"
+            })
+            .unwrap();
+
+        seen.sort();
+        assert_eq!(seen, ["a", "b", "c"], "{tier}: each live key is seen once");
+        assert_eq!(removed, 2, "{tier}: the refused keys are counted");
+        assert!(store.get("a").unwrap().is_none(), "{tier}");
+        assert!(store.get("c").unwrap().is_none(), "{tier}");
+        assert!(store.get("stale").unwrap().is_none(), "{tier}");
+        assert_eq!(store.get("b").unwrap().unwrap().value.as_ref(), b"2", "{tier}");
+    }
+}
+
+#[test]
+fn retain_drops_expired_records_from_the_disk_file() {
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+    store.set("fresh", bytes(b"v"), LONG).unwrap();
+    store.set("stale", bytes(b"v"), SHORT).unwrap();
+    std::thread::sleep(EXPIRED);
+
+    assert_eq!(store.retain(&mut |_| true).unwrap(), 0);
+    assert_eq!(store.record_count().unwrap(), 1);
+}
+
+#[test]
+fn retain_that_keeps_everything_removes_nothing_and_writes_nothing() {
+    for (tier, store, _dir) in every_tier() {
+        store.set("a", bytes(b"1"), LONG).unwrap();
+        store.set("b", bytes(b"2"), LONG).unwrap();
+
+        assert_eq!(store.retain(&mut |_| true).unwrap(), 0, "{tier}");
+        assert!(store.get("a").unwrap().is_some(), "{tier}");
+        assert!(store.get("b").unwrap().is_some(), "{tier}");
+    }
+
+    let dir = TempDir::new().unwrap();
+    let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+    store.set("a", bytes(b"1"), LONG).unwrap();
+    let before = store.durable_writes();
+
+    store.retain(&mut |_| true).unwrap();
+    assert_eq!(store.durable_writes(), before, "nothing was committed");
+}
+
+#[test]
+fn retain_empties_both_tiers_of_a_two_tier_cache() {
+    let dir = TempDir::new().unwrap();
+    let composite = CompositeStore::open(dir.path(), CacheOpts::new(), LONG).unwrap();
+    composite.set("a", bytes(b"1"), LONG).unwrap();
+    composite.set("b", bytes(b"2"), LONG).unwrap();
+
+    assert_eq!(composite.retain(&mut |key| key == "b").unwrap(), 1);
+
+    assert!(composite.memory.get("a").unwrap().is_none());
+    assert!(composite.disk.get("a").unwrap().is_none());
+    assert!(composite.memory.get("b").unwrap().is_some());
+    assert!(composite.disk.get("b").unwrap().is_some());
+}
+
+#[test]
+fn removals_survive_a_reopen_of_the_disk_cache() {
+    for two_tier in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let open = || {
+            if two_tier {
+                Memo::memory_disk(dir.path(), CacheOpts::new(), LONG).unwrap()
+            } else {
+                Memo::disk(dir.path(), CacheOpts::new()).unwrap()
+            }
+        };
+
+        {
+            let memo = open();
+            for key in ["a", "b", "c"] {
+                memo.set_bytes(key, b"v", LONG).unwrap();
+            }
+            assert!(memo.remove("a").unwrap());
+            assert_eq!(memo.retain(|key| key != "b").unwrap(), 1);
+        }
+
+        let reopened = open();
+        assert_eq!(reopened.get_bytes("a").unwrap(), None, "two tiers: {two_tier}");
+        assert_eq!(reopened.get_bytes("b").unwrap(), None, "two tiers: {two_tier}");
+        assert_eq!(
+            reopened.get_bytes("c").unwrap(),
+            Some(b"v".to_vec()),
+            "two tiers: {two_tier}"
+        );
+    }
+}
+
+#[test]
+fn remove_and_retain_surface_a_store_failure() {
+    let memo = Memo::with_store(Arc::new(FailingStore::default()));
+
+    assert!(memo.remove("k").is_err());
+    assert!(memo.retain(|_| true).is_err());
+}
+
+// --- A TTL of Duration::MAX ---
+
+#[test]
+fn a_duration_max_entry_never_expires_in_memory() {
+    let store = MemoryStore::new(CacheOpts::new());
+    store.set("k", bytes(b"v"), Duration::MAX).unwrap();
+
+    store.cleanup().unwrap();
+
+    let entry = store.get("k").unwrap().expect("still served after the sweep");
+    assert_eq!(entry.remaining, None, "no deadline");
+}
+
+#[test]
+fn a_duration_max_entry_never_expires_on_disk_and_survives_a_reopen() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+        store.set("k", bytes(b"v"), Duration::MAX).unwrap();
+        store.cleanup().unwrap();
+    }
+
+    let store = DiskStore::open(dir.path(), CacheOpts::new()).unwrap();
+    store.cleanup().unwrap();
+    let entry = store.get("k").unwrap().expect("still served after a reopen");
+    assert_eq!(entry.remaining, None, "no deadline");
+}
+
+#[test]
+fn a_duration_max_entry_never_expires_on_a_two_tier_cache() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let memo = Memo::memory_disk(dir.path(), CacheOpts::new(), LONG).unwrap();
+        memo.set_bytes("k", b"v", Duration::MAX).unwrap();
+        memo.cleanup().unwrap();
+        assert_eq!(memo.get_bytes("k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    let memo = Memo::memory_disk(dir.path(), CacheOpts::new(), LONG).unwrap();
+    assert_eq!(memo.get_bytes("k").unwrap(), Some(b"v".to_vec()));
+}
+
 // --- Cleanup ---
 
 #[test]
